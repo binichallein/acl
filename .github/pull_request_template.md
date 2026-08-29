@@ -21,4 +21,3 @@
 - [ ] No credentials, protected benchmark contents, or large artifacts are committed.
 - [ ] Configuration, versions, and seeds are recorded where relevant.
 - [ ] Official and derived benchmark results remain clearly separated.
-

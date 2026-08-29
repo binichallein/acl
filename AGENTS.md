@@ -8,4 +8,3 @@
 - Use AppWorld through an external adapter layer; do not redistribute decrypted protected bundles.
 - Report official BFCL v4 and derived BFCL-Shift results separately.
 - Run formatting, linting, unit, contract, and smoke tests before requesting review.
-

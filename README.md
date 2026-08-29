@@ -17,4 +17,3 @@ The project is in the environment-validation and pilot-design phase. Results and
 - Keep official BFCL results separate from any derived `BFCL-Shift` evaluation.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
-

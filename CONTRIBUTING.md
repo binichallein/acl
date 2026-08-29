@@ -23,4 +23,3 @@ New behavior follows red-green-refactor: add a failing test, verify the expected
 ## Security and data handling
 
 Never commit API keys, SSH material, tokens, decrypted AppWorld bundles, protected task data, model weights, or raw user data. Use `.env` locally and provide only `.env.example` with placeholder values.
-
