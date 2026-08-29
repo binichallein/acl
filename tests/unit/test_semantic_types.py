@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable, ItemsView, Mapping, ValuesView
 from dataclasses import FrozenInstanceError
 from datetime import datetime
 from inspect import signature
@@ -76,9 +76,7 @@ class _IdentityAdapter(SemanticAdapter):
             raise ValueError("surface_call.arguments must be a mapping")
         return (SemanticAction(name=name, arguments=arguments),)
 
-    def semantic_to_base_calls(
-        self, action: SemanticAction
-    ) -> tuple[Mapping[str, JSONValue], ...]:
+    def semantic_to_base_calls(self, action: SemanticAction) -> tuple[Mapping[str, JSONValue], ...]:
         self._require_known_action(action)
         return ({"name": action.name, "arguments": action.arguments},)
 
@@ -134,9 +132,7 @@ class _MergeAdapter(SemanticAdapter):
             SemanticAction("send_message", {"recipient": recipient, "text": text}),
         )
 
-    def semantic_to_base_calls(
-        self, action: SemanticAction
-    ) -> tuple[Mapping[str, JSONValue], ...]:
+    def semantic_to_base_calls(self, action: SemanticAction) -> tuple[Mapping[str, JSONValue], ...]:
         if action.name == "create_event":
             return ({"name": "calendar.create", "arguments": action.arguments},)
         if action.name == "send_message":
@@ -275,6 +271,199 @@ def test_all_semantic_dataclasses_take_deep_immutable_snapshots() -> None:
         action.arguments["query"] = "changed"  # type: ignore[index]
     with pytest.raises(AttributeError):
         action.arguments["filters"].append("changed")  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("operation", ["assign", "delete"])
+def test_frozen_json_mapping_rejects_slot_mutation(operation: str) -> None:
+    arguments = SemanticAction("search", {"query": "alpha"}).arguments
+    attribute = "_items"
+
+    with pytest.raises(AttributeError):
+        if operation == "assign":
+            setattr(arguments, attribute, ())
+        else:
+            delattr(arguments, attribute)
+
+
+def test_frozen_json_mapping_methods_reject_noncanonical_raw_items() -> None:
+    arguments = SemanticAction("search", {"query": "alpha"}).arguments
+
+    class CallbackTuple(tuple[object, ...]):
+        fired = False
+
+        def __iter__(self):
+            self.fired = True
+            return super().__iter__()
+
+    injected = CallbackTuple((("query", "changed"),))
+    object.__setattr__(arguments, "_items", injected)
+
+    with pytest.raises(ValueError, match="state"):
+        dict(arguments)
+    assert injected.fired is False
+
+
+def test_frozen_json_mapping_full_iteration_avoids_per_key_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping_type = type(SemanticAction("seed", {}).arguments)
+    original_getitem = mapping_type.__getitem__
+    lookup_calls = 0
+
+    def counted_getitem(mapping: object, key: str) -> JSONValue:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return original_getitem(mapping, key)
+
+    monkeypatch.setattr(mapping_type, "__getitem__", counted_getitem)
+
+    arguments = SemanticAction(
+        "search",
+        {f"key-{index:04d}": index for index in range(256)},
+    ).arguments
+    assert len(tuple(arguments.items())) == 256
+    assert len(tuple(arguments.values())) == 256
+    assert canonical_json_bytes(arguments).startswith(b'{"key-0000":0')
+    assert lookup_calls == 0
+
+
+def test_frozen_json_mapping_length_does_not_scan_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = SemanticAction(
+        "search",
+        {f"key-{index:04d}": index for index in range(256)},
+    ).arguments
+    mapping_type = type(arguments)
+    original_raw_items = mapping_type._raw_items
+    scan_calls = 0
+
+    def counted_raw_items(mapping: object) -> tuple[tuple[str, JSONValue], ...]:
+        nonlocal scan_calls
+        scan_calls += 1
+        return original_raw_items(mapping)
+
+    monkeypatch.setattr(mapping_type, "_raw_items", counted_raw_items)
+
+    assert len(arguments) == 256
+    assert scan_calls == 0
+
+
+def test_frozen_json_mapping_dict_conversion_performs_one_linear_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {f"key-{index:04d}": index for index in range(256)}
+    arguments = SemanticAction("search", expected).arguments
+    mapping_type = type(arguments)
+    original_getitem = mapping_type.__getitem__
+    original_raw_items = mapping_type._raw_items
+    lookup_calls = 0
+    scan_calls = 0
+
+    def counted_getitem(mapping: object, key: str) -> JSONValue:
+        nonlocal lookup_calls
+        lookup_calls += 1
+        return original_getitem(mapping, key)
+
+    def counted_raw_items(mapping: object) -> tuple[tuple[str, JSONValue], ...]:
+        nonlocal scan_calls
+        scan_calls += 1
+        return original_raw_items(mapping)
+
+    monkeypatch.setattr(mapping_type, "__getitem__", counted_getitem)
+    monkeypatch.setattr(mapping_type, "_raw_items", counted_raw_items)
+
+    assert dict(arguments) == expected
+    assert lookup_calls == len(expected)
+    assert scan_calls == 1
+
+
+def test_frozen_json_mapping_hides_and_rejects_tampered_lookup_index() -> None:
+    arguments = SemanticAction(
+        "search",
+        {"query": "alpha", "limit": 2},
+    ).arguments
+
+    with pytest.raises(AttributeError):
+        _ = arguments._index  # type: ignore[attr-defined]
+
+    index = object.__getattribute__(arguments, "_index")
+    assert type(index) is dict
+    index["query"] = 1
+
+    assert types_module._is_frozen_mapping(arguments) is False
+    with pytest.raises(ValueError, match="state"):
+        _ = arguments["query"]
+
+
+def test_frozen_json_mapping_shape_check_does_not_invoke_tampered_index_keys() -> None:
+    arguments = SemanticAction("search", {"query": "alpha"}).arguments
+
+    class CallbackKey(str):
+        fired = False
+
+        def __hash__(self) -> int:
+            self.fired = True
+            return super().__hash__()
+
+        def __eq__(self, other: object) -> bool:
+            self.fired = True
+            return super().__eq__(other)
+
+    callback_key = CallbackKey("query")
+    index = object.__getattribute__(arguments, "_index")
+    index.clear()
+    index[callback_key] = 0
+    callback_key.fired = False
+
+    assert types_module._is_frozen_mapping(arguments) is False
+    assert callback_key.fired is False
+
+
+def test_frozen_json_mapping_shape_check_does_not_call_rebindable_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = SemanticAction("search", {"query": "alpha"}).arguments
+    mapping_type = type(arguments)
+    method_called = False
+
+    def callback(_: object) -> tuple[tuple[str, JSONValue], ...]:
+        nonlocal method_called
+        method_called = True
+        raise AssertionError("shape validation invoked a rebound method")
+
+    monkeypatch.setattr(mapping_type, "_raw_items", callback)
+
+    assert types_module._is_frozen_mapping(arguments) is True
+    assert method_called is False
+
+
+def test_frozen_json_mapping_preserves_standard_view_behavior() -> None:
+    arguments = SemanticAction(
+        "search",
+        {"query": "alpha", "limit": 2},
+    ).arguments
+    items = arguments.items()
+    values = arguments.values()
+
+    assert isinstance(items, ItemsView)
+    assert isinstance(values, ValuesView)
+    assert items == {("query", "alpha"), ("limit", 2)}
+    assert list(values) == ["alpha", 2]
+    with pytest.raises(TypeError):
+        _ = items[0]  # type: ignore[index]
+
+
+def test_frozen_json_mapping_repr_is_stable_readable_and_address_free() -> None:
+    arguments = SemanticAction(
+        "search",
+        {"query": "alpha", "options": {"limit": 2}},
+    ).arguments
+
+    assert repr(arguments) == (
+        "FrozenJSONMapping({'query': 'alpha', 'options': FrozenJSONMapping({'limit': 2})})"
+    )
+    assert "0x" not in repr(arguments)
 
 
 @pytest.mark.parametrize(

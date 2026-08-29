@@ -1,0 +1,790 @@
+"""Episode trace, physical-effect, and score behavioral contracts."""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Protocol, cast
+
+from toolshift.adapters.semantic import SemanticAdapter
+from toolshift.contracts._common import (
+    ContractDiagnostic,
+    LayerContractResult,
+    _actions_equal,
+    _diagnostic,
+    _fingerprint_parts,
+    _make_layer_result,
+    _require_safe_identifier,
+    _require_sha256,
+    _snapshot_actions,
+)
+from toolshift.contracts._schema import schema_fingerprint
+from toolshift.contracts.denotation import (
+    DenotationCase,
+    _denotation_case_has_canonical_shape,
+    _validate_denotation_case,
+)
+from toolshift.types import (
+    ExecutionTrace,
+    JSONValue,
+    SemanticAction,
+    _execution_trace_has_canonical_shape,
+    _freeze_json_root,
+    _is_frozen_json,
+    canonical_json_bytes,
+)
+
+
+def base_call_fingerprint(call: Mapping[str, JSONValue]) -> str:
+    """Return the contract fingerprint for one physical base call."""
+
+    return hashlib.sha256(canonical_json_bytes(call)).hexdigest()
+
+
+def _snapshot_trace(value: object, context: str) -> ExecutionTrace:
+    if not _execution_trace_has_canonical_shape(value):
+        raise ValueError(f"{context} must be an ExecutionTrace")
+    trace = cast(ExecutionTrace, value)
+    actions = _snapshot_actions(trace.semantic_actions, f"{context} semantic actions")
+    rebuilt = ExecutionTrace(trace.surface_calls, actions, trace.base_calls)
+    if trace != rebuilt:
+        raise ValueError(f"{context} has been mutated")
+    return rebuilt
+
+
+def _call_sequences_equal(
+    first: tuple[Mapping[str, JSONValue], ...],
+    second: tuple[Mapping[str, JSONValue], ...],
+) -> bool:
+    return len(first) == len(second) and all(
+        canonical_json_bytes(left) == canonical_json_bytes(right)
+        for left, right in zip(first, second, strict=True)
+    )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class PhysicalCallEffect:
+    """Opaque effect evidence aligned to one indexed physical base call."""
+
+    call_index: int
+    base_call_fingerprint: str
+    effect_digest: str
+    _snapshot_fingerprint: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.call_index) is not int:
+            raise ValueError("call_index must be a nonnegative integer")
+        if self.call_index < 0:
+            raise ValueError("call_index must be a nonnegative integer")
+        object.__setattr__(
+            self,
+            "base_call_fingerprint",
+            _require_sha256(self.base_call_fingerprint, "base_call_fingerprint"),
+        )
+        object.__setattr__(
+            self,
+            "effect_digest",
+            _require_safe_identifier(self.effect_digest, "effect_digest"),
+        )
+        object.__setattr__(
+            self,
+            "_snapshot_fingerprint",
+            _fingerprint_parts(
+                b"toolshift.physical-effect.v1",
+                [
+                    canonical_json_bytes(self.call_index),
+                    canonical_json_bytes(self.base_call_fingerprint),
+                    canonical_json_bytes(self.effect_digest),
+                ],
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class TraceCase:
+    """Safe identifiers for one paired reference and candidate trace."""
+
+    case_id: str
+    episode_id: str
+    _snapshot_fingerprint: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "case_id",
+            _require_safe_identifier(self.case_id, "case_id"),
+        )
+        object.__setattr__(
+            self,
+            "episode_id",
+            _require_safe_identifier(self.episode_id, "episode_id"),
+        )
+        object.__setattr__(
+            self,
+            "_snapshot_fingerprint",
+            _fingerprint_parts(
+                b"toolshift.trace-case.v1",
+                [
+                    canonical_json_bytes(self.case_id),
+                    canonical_json_bytes(self.episode_id),
+                ],
+            ),
+        )
+
+
+def _physical_effect_has_canonical_shape(value: object) -> bool:
+    if type(value) is not PhysicalCallEffect:
+        return False
+    effect = cast(PhysicalCallEffect, value)
+    return (
+        type(object.__getattribute__(effect, "call_index")) is int
+        and type(object.__getattribute__(effect, "base_call_fingerprint")) is str
+        and type(object.__getattribute__(effect, "effect_digest")) is str
+        and type(object.__getattribute__(effect, "_snapshot_fingerprint")) is str
+    )
+
+
+def _trace_case_has_canonical_shape(value: object) -> bool:
+    if type(value) is not TraceCase:
+        return False
+    case = cast(TraceCase, value)
+    return all(
+        type(object.__getattribute__(case, name)) is str
+        for name in ("case_id", "episode_id", "_snapshot_fingerprint")
+    )
+
+
+def _snapshot_effect(value: object, context: str) -> PhysicalCallEffect:
+    if not _physical_effect_has_canonical_shape(value):
+        raise ValueError(f"{context} must contain only PhysicalCallEffect values")
+    effect = cast(PhysicalCallEffect, value)
+    rebuilt = PhysicalCallEffect(
+        effect.call_index,
+        effect.base_call_fingerprint,
+        effect.effect_digest,
+    )
+    snapshot_fingerprint = _require_sha256(
+        effect._snapshot_fingerprint,
+        "physical_effect_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+        raise ValueError(f"{context} contains mutated effect evidence")
+    return rebuilt
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class TraceEvidence:
+    """Provider evidence for reconstructed trace, score, and physical effects."""
+
+    reference_trace: ExecutionTrace
+    candidate_trace: ExecutionTrace
+    candidate_steps: tuple[DenotationCase, ...]
+    reference_score: JSONValue
+    candidate_score: JSONValue
+    reference_effects: tuple[PhysicalCallEffect, ...]
+    candidate_effects: tuple[PhysicalCallEffect, ...]
+    _snapshot_fingerprint: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        reference_trace = _snapshot_trace(self.reference_trace, "reference_trace")
+        candidate_trace = _snapshot_trace(self.candidate_trace, "candidate_trace")
+        if not isinstance(self.candidate_steps, (list, tuple)):
+            raise ValueError("candidate_steps must be a list or tuple")
+        candidate_steps = tuple(_validate_denotation_case(step) for step in self.candidate_steps)
+        reference_score = _freeze_json_root(self.reference_score, "reference_score")
+        candidate_score = _freeze_json_root(self.candidate_score, "candidate_score")
+        if not isinstance(self.reference_effects, (list, tuple)):
+            raise ValueError("reference_effects must be a list or tuple")
+        if not isinstance(self.candidate_effects, (list, tuple)):
+            raise ValueError("candidate_effects must be a list or tuple")
+        reference_effects = tuple(
+            _snapshot_effect(effect, "reference_effects") for effect in self.reference_effects
+        )
+        candidate_effects = tuple(
+            _snapshot_effect(effect, "candidate_effects") for effect in self.candidate_effects
+        )
+        object.__setattr__(self, "reference_trace", reference_trace)
+        object.__setattr__(self, "candidate_trace", candidate_trace)
+        object.__setattr__(self, "candidate_steps", candidate_steps)
+        object.__setattr__(self, "reference_score", reference_score)
+        object.__setattr__(self, "candidate_score", candidate_score)
+        object.__setattr__(self, "reference_effects", reference_effects)
+        object.__setattr__(self, "candidate_effects", candidate_effects)
+
+        parts = [
+            canonical_json_bytes(reference_trace.surface_calls),
+            canonical_json_bytes(reference_trace.base_calls),
+            canonical_json_bytes(candidate_trace.surface_calls),
+            canonical_json_bytes(candidate_trace.base_calls),
+            canonical_json_bytes(reference_score),
+            canonical_json_bytes(candidate_score),
+        ]
+        for trace in (reference_trace, candidate_trace):
+            parts.append(canonical_json_bytes(len(trace.semantic_actions)))
+            for action in trace.semantic_actions:
+                parts.extend(
+                    (canonical_json_bytes(action.name), canonical_json_bytes(action.arguments))
+                )
+        parts.extend(bytes.fromhex(step._snapshot_fingerprint) for step in candidate_steps)
+        parts.extend(bytes.fromhex(effect._snapshot_fingerprint) for effect in reference_effects)
+        parts.extend(bytes.fromhex(effect._snapshot_fingerprint) for effect in candidate_effects)
+        object.__setattr__(
+            self,
+            "_snapshot_fingerprint",
+            _fingerprint_parts(b"toolshift.trace-evidence.v1", parts),
+        )
+
+
+class TraceEvidenceProvider(Protocol):
+    """Obtain trace, score, and physical-effect evidence for one case."""
+
+    def __call__(self, case: TraceCase) -> TraceEvidence:
+        """Return complete paired trace evidence."""
+
+        ...
+
+
+def _trace_evidence_has_canonical_shape(value: object) -> bool:
+    if type(value) is not TraceEvidence:
+        return False
+    evidence = cast(TraceEvidence, value)
+    candidate_steps = object.__getattribute__(evidence, "candidate_steps")
+    reference_effects = object.__getattribute__(evidence, "reference_effects")
+    candidate_effects = object.__getattribute__(evidence, "candidate_effects")
+    return (
+        _execution_trace_has_canonical_shape(object.__getattribute__(evidence, "reference_trace"))
+        and _execution_trace_has_canonical_shape(
+            object.__getattribute__(evidence, "candidate_trace")
+        )
+        and type(candidate_steps) is tuple
+        and all(_denotation_case_has_canonical_shape(step) for step in candidate_steps)
+        and _is_frozen_json(object.__getattribute__(evidence, "reference_score"))
+        and _is_frozen_json(object.__getattribute__(evidence, "candidate_score"))
+        and type(reference_effects) is tuple
+        and all(_physical_effect_has_canonical_shape(effect) for effect in reference_effects)
+        and type(candidate_effects) is tuple
+        and all(_physical_effect_has_canonical_shape(effect) for effect in candidate_effects)
+        and type(object.__getattribute__(evidence, "_snapshot_fingerprint")) is str
+    )
+
+
+def _validate_trace_case(value: object) -> TraceCase:
+    if not _trace_case_has_canonical_shape(value):
+        raise ValueError("cases must contain only TraceCase values")
+    case = cast(TraceCase, value)
+    rebuilt = TraceCase(case.case_id, case.episode_id)
+    snapshot_fingerprint = _require_sha256(
+        case._snapshot_fingerprint,
+        "trace_case_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+        raise ValueError("trace case has been mutated")
+    return case
+
+
+def _validate_trace_evidence(value: object) -> TraceEvidence:
+    if not _trace_evidence_has_canonical_shape(value):
+        raise ValueError("provider must return TraceEvidence")
+    evidence = cast(TraceEvidence, value)
+    rebuilt = TraceEvidence(
+        evidence.reference_trace,
+        evidence.candidate_trace,
+        evidence.candidate_steps,
+        evidence.reference_score,
+        evidence.candidate_score,
+        evidence.reference_effects,
+        evidence.candidate_effects,
+    )
+    snapshot_fingerprint = _require_sha256(
+        evidence._snapshot_fingerprint,
+        "trace_evidence_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+        raise ValueError("trace evidence has been mutated")
+    return evidence
+
+
+def _validate_step_structure(step: DenotationCase) -> bool:
+    if len(step.expected_actions) != len(step.expected_base_call_groups):
+        return False
+    if len(step.expected_actions) != len(step.base_observation_groups):
+        return False
+    return all(group for group in step.expected_base_call_groups) and all(
+        len(observations) == len(calls)
+        for calls, observations in zip(
+            step.expected_base_call_groups,
+            step.base_observation_groups,
+            strict=True,
+        )
+    )
+
+
+def _check_effect_alignment(
+    *,
+    side: str,
+    case_id: str,
+    base_calls: tuple[Mapping[str, JSONValue], ...],
+    effects: tuple[PhysicalCallEffect, ...],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    if len(effects) != len(base_calls):
+        diagnostics.append(
+            _diagnostic(
+                f"trace.{side}_effect_count",
+                f"{side.title()} effect count must equal physical call count",
+                case_id,
+            )
+        )
+    for index, (call, effect) in enumerate(zip(base_calls, effects, strict=False)):
+        if effect.call_index != index or effect.base_call_fingerprint != base_call_fingerprint(
+            call
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    f"trace.{side}_effect_alignment",
+                    f"{side.title()} effects must align with indexed base calls",
+                    case_id,
+                )
+            )
+
+
+def _collect_trace_cases(
+    cases: object,
+    diagnostics: list[ContractDiagnostic],
+) -> list[TraceCase]:
+    if type(cases) not in (list, tuple):
+        diagnostics.append(
+            _diagnostic(
+                "trace.invalid_cases",
+                "Trace cases must be an exact built-in list or tuple",
+            )
+        )
+        raw_cases: tuple[object, ...] = ()
+    else:
+        raw_cases = tuple(cases)
+    if not raw_cases:
+        diagnostics.append(_diagnostic("trace.empty_cases", "Trace cases must not be empty"))
+
+    valid_cases: list[TraceCase] = []
+    for raw_case in raw_cases:
+        try:
+            valid_cases.append(_validate_trace_case(raw_case))
+        except Exception:
+            case_id = getattr(raw_case, "case_id", "suite")
+            try:
+                case_id = _require_safe_identifier(case_id, "case_id")
+            except ValueError:
+                case_id = "suite"
+            diagnostics.append(
+                _diagnostic("trace.invalid_case", "Trace case validation failed", case_id)
+            )
+    case_ids = [case.case_id for case in valid_cases]
+    episode_ids = [case.episode_id for case in valid_cases]
+    if len(case_ids) != len(set(case_ids)):
+        diagnostics.append(
+            _diagnostic("trace.duplicate_case", "Trace case identifiers must be unique")
+        )
+    if len(episode_ids) != len(set(episode_ids)):
+        diagnostics.append(
+            _diagnostic("trace.duplicate_episode", "Trace episode identifiers must be unique")
+        )
+    return valid_cases
+
+
+def _collect_verified_steps(
+    verified_cases: object,
+    diagnostics: list[ContractDiagnostic],
+) -> tuple[dict[str, DenotationCase], tuple[tuple[DenotationCase, str], ...], bool]:
+    verified_by_id: dict[str, DenotationCase] = {}
+    verified_snapshots: list[tuple[DenotationCase, str]] = []
+    container_is_exact = type(verified_cases) in (list, tuple)
+    if not container_is_exact:
+        diagnostics.append(
+            _diagnostic(
+                "trace.invalid_verified_steps",
+                "Verified denotation cases must be an exact built-in list or tuple",
+            )
+        )
+        return verified_by_id, (), False
+
+    for raw_step in verified_cases:
+        try:
+            step = _validate_denotation_case(raw_step)
+        except Exception:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.invalid_verified_step",
+                    "Verified denotation case validation failed",
+                )
+            )
+            continue
+        if step.case_id in verified_by_id:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.duplicate_verified_step",
+                    "Verified denotation identifiers must be unique",
+                )
+            )
+        else:
+            verified_by_id[step.case_id] = step
+        verified_snapshots.append((step, step._snapshot_fingerprint))
+    return verified_by_id, tuple(verified_snapshots), True
+
+
+def _verified_steps_match(
+    snapshots: tuple[tuple[DenotationCase, str], ...],
+) -> bool:
+    for step, entry_fingerprint in snapshots:
+        try:
+            current = _validate_denotation_case(step)
+            current_fingerprint = _require_sha256(
+                current._snapshot_fingerprint,
+                "denotation_case_fingerprint",
+            )
+        except Exception:
+            return False
+        if current is not step or current_fingerprint != entry_fingerprint:
+            return False
+    return True
+
+
+def _reconstruct_candidate_trace(
+    case: TraceCase,
+    evidence: TraceEvidence,
+    verified_by_id: dict[str, DenotationCase],
+    diagnostics: list[ContractDiagnostic],
+) -> ExecutionTrace:
+    reconstructed_surface: list[Mapping[str, JSONValue]] = []
+    reconstructed_actions: list[SemanticAction] = []
+    reconstructed_base: list[Mapping[str, JSONValue]] = []
+    for step in evidence.candidate_steps:
+        registered = verified_by_id.get(step.case_id)
+        if registered is not step:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.unverified_step",
+                    "Candidate trace contains an unverified denotation object",
+                    case.case_id,
+                )
+            )
+        if not _validate_step_structure(step):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.invalid_step_structure",
+                    "Candidate denotation step has invalid group structure",
+                    case.case_id,
+                )
+            )
+        reconstructed_surface.append(step.surface_call)
+        reconstructed_actions.extend(step.expected_actions)
+        for group in step.expected_base_call_groups:
+            reconstructed_base.extend(group)
+    return ExecutionTrace(
+        reconstructed_surface,
+        reconstructed_actions,
+        reconstructed_base,
+    )
+
+
+def _check_reconstructed_channels(
+    case: TraceCase,
+    reconstructed: ExecutionTrace,
+    candidate: ExecutionTrace,
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    if not _call_sequences_equal(reconstructed.surface_calls, candidate.surface_calls):
+        diagnostics.append(
+            _diagnostic(
+                "trace.surface_reconstruction_mismatch",
+                "Reconstructed surface calls differ from candidate trace",
+                case.case_id,
+            )
+        )
+    if not _actions_equal(reconstructed.semantic_actions, candidate.semantic_actions):
+        diagnostics.append(
+            _diagnostic(
+                "trace.semantic_reconstruction_mismatch",
+                "Reconstructed semantic actions differ from candidate trace",
+                case.case_id,
+            )
+        )
+    if not _call_sequences_equal(reconstructed.base_calls, candidate.base_calls):
+        diagnostics.append(
+            _diagnostic(
+                "trace.base_reconstruction_mismatch",
+                "Reconstructed base calls differ from candidate trace",
+                case.case_id,
+            )
+        )
+
+
+def _check_canonical_trace_semantics(
+    adapter: SemanticAdapter,
+    case: TraceCase,
+    evidence: TraceEvidence,
+    reconstructed: ExecutionTrace,
+    binding_matches: Callable[[], bool],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    variant_rebound = False
+    try:
+        try:
+            reference_semantics = adapter.canonicalize_trace(evidence.reference_trace)
+        finally:
+            if not binding_matches():
+                variant_rebound = True
+        try:
+            candidate_semantics = adapter.canonicalize_trace(evidence.candidate_trace)
+        finally:
+            if not binding_matches():
+                variant_rebound = True
+        if not isinstance(reference_semantics, tuple) or not isinstance(candidate_semantics, tuple):
+            raise ValueError("canonical semantics must be tuples")
+        reference_semantics = _snapshot_actions(
+            reference_semantics,
+            "reference canonical semantics",
+        )
+        candidate_semantics = _snapshot_actions(
+            candidate_semantics,
+            "candidate canonical semantics",
+        )
+        if (
+            not _actions_equal(candidate_semantics, reconstructed.semantic_actions)
+            or not _actions_equal(
+                candidate_semantics,
+                evidence.candidate_trace.semantic_actions,
+            )
+            or not _actions_equal(
+                reference_semantics,
+                evidence.reference_trace.semantic_actions,
+            )
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.canonical_semantic_channel_mismatch",
+                    "Candidate canonical semantics differ from reconstructed actions",
+                    case.case_id,
+                )
+            )
+        if not _actions_equal(reference_semantics, candidate_semantics):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.semantic_mismatch",
+                    "Reference and candidate canonical semantics differ",
+                    case.case_id,
+                )
+            )
+    except Exception:
+        diagnostics.append(
+            _diagnostic(
+                "trace.canonicalization_exception",
+                "Trace canonicalization raised or returned malformed actions",
+                case.case_id,
+            )
+        )
+    if variant_rebound:
+        diagnostics.append(
+            _diagnostic(
+                "trace.variant_rebound",
+                "Adapter variant changed during trace canonicalization",
+                case.case_id,
+            )
+        )
+
+
+def _check_trace_effects_and_score(
+    case: TraceCase,
+    evidence: TraceEvidence,
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    if not _call_sequences_equal(
+        evidence.reference_trace.base_calls,
+        evidence.candidate_trace.base_calls,
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "trace.base_call_mismatch",
+                "Reference and candidate base call order differs",
+                case.case_id,
+            )
+        )
+    _check_effect_alignment(
+        side="reference",
+        case_id=case.case_id,
+        base_calls=evidence.reference_trace.base_calls,
+        effects=evidence.reference_effects,
+        diagnostics=diagnostics,
+    )
+    _check_effect_alignment(
+        side="candidate",
+        case_id=case.case_id,
+        base_calls=evidence.candidate_trace.base_calls,
+        effects=evidence.candidate_effects,
+        diagnostics=diagnostics,
+    )
+    if len(evidence.reference_effects) == len(evidence.candidate_effects) and any(
+        (
+            reference.call_index != candidate.call_index
+            or reference.base_call_fingerprint != candidate.base_call_fingerprint
+            or reference.effect_digest != candidate.effect_digest
+        )
+        for reference, candidate in zip(
+            evidence.reference_effects,
+            evidence.candidate_effects,
+            strict=True,
+        )
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "trace.effect_mismatch",
+                "Reference and candidate physical effects differ",
+                case.case_id,
+            )
+        )
+    if canonical_json_bytes(evidence.reference_score) != canonical_json_bytes(
+        evidence.candidate_score
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "trace.score_mismatch",
+                "Reference and candidate scores differ",
+                case.case_id,
+            )
+        )
+
+
+def _check_trace_case(
+    adapter: SemanticAdapter,
+    case: TraceCase,
+    provider: TraceEvidenceProvider,
+    verified_by_id: dict[str, DenotationCase],
+    verified_snapshots: tuple[tuple[DenotationCase, str], ...],
+    binding_matches: Callable[[], bool],
+    fingerprint_parts: list[bytes],
+    diagnostics: list[ContractDiagnostic],
+) -> int:
+    try:
+        evidence = _validate_trace_evidence(provider(case))
+    except Exception:
+        diagnostics.append(
+            _diagnostic(
+                "trace.provider_exception",
+                "Trace evidence provider raised or returned malformed evidence",
+                case.case_id,
+            )
+        )
+        fingerprint_parts.append(b"provider-error")
+        if not _verified_steps_match(verified_snapshots):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.verified_step_mutated",
+                    "Verified denotation content changed during trace evidence collection",
+                    case.case_id,
+                )
+            )
+        return 0
+    if not _verified_steps_match(verified_snapshots):
+        diagnostics.append(
+            _diagnostic(
+                "trace.verified_step_mutated",
+                "Verified denotation content changed during trace evidence collection",
+                case.case_id,
+            )
+        )
+    fingerprint_parts.append(bytes.fromhex(evidence._snapshot_fingerprint))
+    if not evidence.candidate_steps:
+        diagnostics.append(
+            _diagnostic(
+                "trace.empty_steps",
+                "Candidate trace must contain a verified surface step",
+                case.case_id,
+            )
+        )
+    reconstructed = _reconstruct_candidate_trace(
+        case,
+        evidence,
+        verified_by_id,
+        diagnostics,
+    )
+    _check_reconstructed_channels(
+        case,
+        reconstructed,
+        evidence.candidate_trace,
+        diagnostics,
+    )
+    _check_canonical_trace_semantics(
+        adapter,
+        case,
+        evidence,
+        reconstructed,
+        binding_matches,
+        diagnostics,
+    )
+    _check_trace_effects_and_score(case, evidence, diagnostics)
+    return len(evidence.candidate_steps)
+
+
+def check_trace_contract(
+    adapter: SemanticAdapter,
+    cases: list[TraceCase] | tuple[TraceCase, ...],
+    provider: TraceEvidenceProvider,
+    verified_denotation_cases: list[DenotationCase] | tuple[DenotationCase, ...],
+) -> LayerContractResult:
+    """Verify exact built-in list or tuple inputs without rerunning step mappings.
+
+    Candidate steps must be the same objects as already-verified denotation cases;
+    their identity and snapshots are checked around provider execution. Rebuilt
+    surface, semantic, and base channels, physical effects, and JSON-typed score
+    evidence must match the reference trace exactly and in order.
+    """
+
+    diagnostics: list[ContractDiagnostic] = []
+    try:
+        adapter_variant_fingerprint = schema_fingerprint(adapter.variant)
+    except Exception:
+        adapter_variant_fingerprint = None
+        diagnostics.append(_diagnostic("trace.invalid_adapter", "Adapter validation failed"))
+
+    def adapter_binding_matches() -> bool:
+        if adapter_variant_fingerprint is None:
+            return False
+        try:
+            return schema_fingerprint(adapter.variant) == adapter_variant_fingerprint
+        except Exception:
+            return False
+
+    valid_cases = _collect_trace_cases(cases, diagnostics)
+    verified_by_id, verified_snapshots, verified_container_is_exact = _collect_verified_steps(
+        verified_denotation_cases, diagnostics
+    )
+    fingerprint_parts = [bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases]
+    surface_steps_run = 0
+    provider_cases = valid_cases if verified_container_is_exact else ()
+    for case in provider_cases:
+        surface_steps_run += _check_trace_case(
+            adapter,
+            case,
+            provider,
+            verified_by_id,
+            verified_snapshots,
+            adapter_binding_matches,
+            fingerprint_parts,
+            diagnostics,
+        )
+    return _make_layer_result(
+        "trace",
+        _fingerprint_parts(b"toolshift.trace-suite.v1", fingerprint_parts),
+        surface_steps_run,
+        diagnostics,
+    )
+
+
+__all__ = [
+    "PhysicalCallEffect",
+    "TraceCase",
+    "TraceEvidence",
+    "TraceEvidenceProvider",
+    "base_call_fingerprint",
+    "check_trace_contract",
+]
