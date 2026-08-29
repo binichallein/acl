@@ -251,6 +251,25 @@ def test_appworld_manifest_records_official_verification_results() -> None:
     }
 
 
+def test_appworld_runbook_freezes_replay_gate_runtime_safety() -> None:
+    runbook = _read_appworld_runbook()
+    normalized_blocks = [_normalize_shell(block) for block in _bash_blocks(runbook)]
+
+    assert "must run from the pinned AppWorld checkout" in runbook
+    assert "fresh AppWorld instance" in runbook
+    assert "load_state()" in runbook
+    assert "double time-freezer" in runbook
+    assert "TOOLSHIFT_RUN_APPWORLD_SMOKE=1" in runbook
+    assert "scripts/verify_appworld_replay.py" in runbook
+    assert "--output" in runbook
+    assert "--max-tasks" not in runbook
+    assert any(
+        "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY "
+        "http_proxy https_proxy all_proxy no_proxy" in block
+        for block in normalized_blocks
+    )
+
+
 def test_appworld_manifest_limits_warnings_and_unresolved_claims() -> None:
     manifest = _load_manifest("appworld-ml2.yaml")
 

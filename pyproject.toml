@@ -25,6 +25,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
+markers = [
+    "appworld: opt-in integration tests requiring the pinned external AppWorld runtime",
+]
 
 [tool.ruff]
 target-version = "py310"
