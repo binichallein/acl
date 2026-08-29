@@ -16,9 +16,10 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from toolshift.types import manifest_sha256
@@ -30,7 +31,7 @@ MIN_GATE_TASKS = 100
 OFFICIAL_SPLIT_COUNTS = {"dev": 57, "train": 90}
 OFFICIAL_TASK_COUNT = sum(OFFICIAL_SPLIT_COUNTS.values())
 _ALLOWED_SPLITS = frozenset(OFFICIAL_SPLIT_COUNTS)
-_TRACEBACK_MARKER = "Traceback (most recent call last):"
+_EXECUTION_FAILURE_PREFIX = "Execution failed. Traceback:"
 _EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -58,9 +59,19 @@ class ReplayStage(str, Enum):
 class TaskSet:
     """Validated task identifiers retained only inside the execution process."""
 
-    task_ids: tuple[str, ...]
-    split_counts: tuple[tuple[str, int], ...]
-    task_set_sha256: str
+    task_ids_by_split: Mapping[str, Sequence[str]]
+    task_ids: tuple[str, ...] = field(init=False)
+    split_counts: tuple[tuple[str, int], ...] = field(init=False)
+    task_set_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        normalized, task_ids, split_counts, fingerprint = _derive_task_set_fields(
+            self.task_ids_by_split
+        )
+        object.__setattr__(self, "task_ids_by_split", normalized)
+        object.__setattr__(self, "task_ids", task_ids)
+        object.__setattr__(self, "split_counts", split_counts)
+        object.__setattr__(self, "task_set_sha256", fingerprint)
 
     @property
     def split_names(self) -> tuple[str, ...]:
@@ -81,16 +92,48 @@ class ReplayRun:
     exception_type: str | None = None
 
     def __post_init__(self) -> None:
+        self._validate_integrity()
+
+    def _validate_integrity(self) -> None:
+        for field_name in (
+            "initial_state_sha256",
+            "final_state_sha256",
+            "evaluator_sha256",
+            "trace_sha256",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{field_name} must be text or None")
+        if not isinstance(self.oracle_success, bool):
+            raise ValueError("oracle_success must be a boolean")
+        if not isinstance(self.execution_failed, bool):
+            raise ValueError("execution_failed must be a boolean")
+        if self.failure_stage is not None and not isinstance(
+            self.failure_stage, ReplayStage
+        ):
+            raise ValueError("failure_stage must be a ReplayStage or None")
         if self.exception_type is not None and _EXCEPTION_TYPE_PATTERN.fullmatch(
             self.exception_type
         ) is None:
             raise ValueError("exception_type must be a payload-free class name")
+        if self.execution_failed and self.oracle_success:
+            raise ValueError("failed replay runs cannot set oracle_success=True")
         if self.execution_failed and self.failure_stage is None:
             raise ValueError("failed replay runs must identify a lifecycle stage")
         if not self.execution_failed and (
             self.failure_stage is not None or self.exception_type is not None
         ):
             raise ValueError("successful replay runs cannot contain failure metadata")
+        if not self.execution_failed and any(
+            getattr(self, field_name) is None
+            for field_name in (
+                "initial_state_sha256",
+                "final_state_sha256",
+                "evaluator_sha256",
+                "trace_sha256",
+            )
+        ):
+            raise ValueError("completed replay runs require all four fingerprints")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,11 +143,16 @@ class TaskReplayResult:
     runs: tuple[ReplayRun, ...]
 
     def __post_init__(self) -> None:
-        runs = tuple(self.runs)
+        try:
+            runs = tuple(self.runs)
+        except TypeError as error:
+            raise ValueError("runs must be an iterable of ReplayRun values") from error
         if len(runs) < 2:
             raise ValueError("a task replay requires at least two fresh runs")
         if any(not isinstance(run, ReplayRun) for run in runs):
             raise ValueError("runs must contain only ReplayRun values")
+        for run in runs:
+            run._validate_integrity()
         object.__setattr__(self, "runs", runs)
 
     def _all_match(self, field_name: str) -> bool:
@@ -136,6 +184,20 @@ class TaskReplayResult:
         )
 
     @property
+    def is_consistent(self) -> bool:
+        """Return true only when every required channel agrees without failures."""
+
+        return (
+            self.initial_state_matches
+            and self.final_state_matches
+            and self.evaluator_matches
+            and self.trace_matches
+            and self.all_oracles_succeeded
+            and self.execution_failure_count == 0
+            and self.exception_count == 0
+        )
+
+    @property
     def execution_failure_count(self) -> int:
         return sum(run.execution_failed for run in self.runs)
 
@@ -162,6 +224,7 @@ class ReplaySummary:
     final_state_match_rate: float
     evaluator_match_rate: float
     trace_match_rate: float
+    task_consistency_rate: float
     oracle_success_rate: float
     execution_failure_count: int
     exception_count: int
@@ -189,6 +252,7 @@ class ReplaySummary:
             "final_state_match_rate": self.final_state_match_rate,
             "evaluator_match_rate": self.evaluator_match_rate,
             "trace_match_rate": self.trace_match_rate,
+            "task_consistency_rate": self.task_consistency_rate,
             "oracle_success_rate": self.oracle_success_rate,
             "execution_failure_count": self.execution_failure_count,
             "exception_count": self.exception_count,
@@ -208,9 +272,14 @@ def _validate_task_id(task_id: object) -> str:
     return task_id
 
 
-def build_task_set(task_ids_by_split: Mapping[str, Sequence[str]]) -> TaskSet:
-    """Validate train/dev IDs and produce an order-stable private task set."""
-
+def _derive_task_set_fields(
+    task_ids_by_split: Mapping[str, Sequence[str]],
+) -> tuple[
+    Mapping[str, Sequence[str]],
+    tuple[str, ...],
+    tuple[tuple[str, int], ...],
+    str,
+]:
     if not isinstance(task_ids_by_split, Mapping) or not task_ids_by_split:
         raise ValueError("task split mapping must be non-empty")
     split_names = tuple(sorted(task_ids_by_split))
@@ -239,14 +308,41 @@ def build_task_set(task_ids_by_split: Mapping[str, Sequence[str]]) -> TaskSet:
         split_name: list(normalized_by_split[split_name])
         for split_name in split_names
     }
-    return TaskSet(
-        task_ids=sorted_task_ids,
-        split_counts=tuple(
-            (split_name, len(normalized_by_split[split_name]))
-            for split_name in split_names
-        ),
-        task_set_sha256=manifest_sha256(fingerprint_payload),
+    split_counts = tuple(
+        (split_name, len(normalized_by_split[split_name]))
+        for split_name in split_names
     )
+    return (
+        MappingProxyType(dict(normalized_by_split)),
+        sorted_task_ids,
+        split_counts,
+        manifest_sha256(fingerprint_payload),
+    )
+
+
+def _require_task_set_integrity(task_set: object) -> TaskSet:
+    if not isinstance(task_set, TaskSet):
+        raise ValueError("task_set must be a validated TaskSet")
+    try:
+        normalized, task_ids, split_counts, fingerprint = _derive_task_set_fields(
+            task_set.task_ids_by_split
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("task set integrity validation failed") from error
+    if (
+        dict(task_set.task_ids_by_split) != dict(normalized)
+        or task_set.task_ids != task_ids
+        or task_set.split_counts != split_counts
+        or task_set.task_set_sha256 != fingerprint
+    ):
+        raise ValueError("task set integrity validation failed")
+    return task_set
+
+
+def build_task_set(task_ids_by_split: Mapping[str, Sequence[str]]) -> TaskSet:
+    """Validate train/dev IDs and produce an order-stable private task set."""
+
+    return TaskSet(task_ids_by_split)
 
 
 def canonical_state_sha256(models: Any) -> str:
@@ -291,7 +387,7 @@ def canonical_state_sha256(models: Any) -> str:
                 record_id, record_hash = row
                 if isinstance(record_id, bool) or not isinstance(record_id, int):
                     raise ValueError("record IDs must be integers")
-                if not isinstance(record_hash, str) or not record_hash:
+                if not isinstance(record_hash, str) or not record_hash.strip():
                     raise ValueError("record hashes must be non-empty strings")
                 normalized_rows.append((record_id, record_hash))
             rows = sorted(normalized_rows)
@@ -330,23 +426,67 @@ def evaluator_sha256(tracker: Any) -> str:
 
 
 def _trace_sha256(requests: Any) -> str:
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("AppWorld request trace must be a non-empty list")
+    for request in requests:
+        if not isinstance(request, Mapping):
+            raise ValueError("AppWorld request trace items must be mappings")
+        method = request.get("method")
+        url = request.get("url")
+        data = request.get("data")
+        if not isinstance(method, str) or not method.strip():
+            raise ValueError("AppWorld request method must be non-blank text")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("AppWorld request URL must be non-blank text")
+        if not isinstance(data, Mapping):
+            raise ValueError("AppWorld request data must be a mapping")
     return manifest_sha256(requests)
 
 
 @contextmanager
+def managed_appworld_context(appworld_class: type[Any], **kwargs: object) -> Any:
+    """Manage one instance with class-level cleanup only as a failure fallback."""
+
+    close_all = getattr(appworld_class, "close_all", None)
+    if not callable(close_all):
+        raise ValueError("AppWorld class must provide close_all")
+    try:
+        world = appworld_class(**kwargs)
+    except BaseException:
+        try:
+            close_all()
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                "AppWorld global cleanup failed after constructor failure"
+            ) from cleanup_error
+        raise
+
+    try:
+        yield world
+    finally:
+        try:
+            world.close()
+        except BaseException:
+            try:
+                close_all()
+            except BaseException as cleanup_error:
+                raise RuntimeError(
+                    "AppWorld global cleanup failed after instance close failure"
+                ) from cleanup_error
+            raise
+
+
+@contextmanager
 def appworld_world_context(**kwargs: object) -> Any:
-    """Create and always close one lazily imported AppWorld instance."""
+    """Lazily import AppWorld and delegate to its guarded lifecycle manager."""
 
     try:
         from appworld import AppWorld
     except (ImportError, ModuleNotFoundError) as error:
         raise RuntimeError("AppWorld runtime dependency is unavailable") from error
 
-    world = AppWorld(**kwargs)
-    try:
+    with managed_appworld_context(AppWorld, **kwargs) as world:
         yield world
-    finally:
-        world.close()
 
 
 def _exception_type(error: Exception) -> str:
@@ -391,7 +531,9 @@ def _execute_single_replay(
             execution_output = world.execute(
                 compiled_solution_code + "\nsolution(apis, requester)"
             )
-            if isinstance(execution_output, str) and _TRACEBACK_MARKER in execution_output:
+            if not isinstance(execution_output, str):
+                raise ValueError("AppWorld execute output must be text")
+            if execution_output.startswith(_EXECUTION_FAILURE_PREFIX):
                 execution_failed = True
                 failure_stage = ReplayStage.EXECUTE_ORACLE
             else:
@@ -493,6 +635,27 @@ def _is_official_gate_protocol(
     )
 
 
+def _require_replay_results_integrity(
+    results: object,
+    *,
+    repetitions: int,
+) -> tuple[TaskReplayResult, ...]:
+    if isinstance(results, (str, bytes)) or not isinstance(results, Sequence):
+        raise ValueError("results must be a sequence of TaskReplayResult values")
+    validated: list[TaskReplayResult] = []
+    for result in results:
+        if not isinstance(result, TaskReplayResult):
+            raise ValueError("results must contain only TaskReplayResult values")
+        if not isinstance(result.runs, tuple) or len(result.runs) != repetitions:
+            raise ValueError("replay result integrity validation failed")
+        try:
+            TaskReplayResult(result.runs)
+        except (TypeError, ValueError) as error:
+            raise ValueError("replay result integrity validation failed") from error
+        validated.append(result)
+    return tuple(validated)
+
+
 def summarize_replays(
     task_set: TaskSet,
     results: Sequence[TaskReplayResult],
@@ -504,16 +667,14 @@ def summarize_replays(
 ) -> ReplaySummary:
     """Aggregate anonymous task results under the preregistered Gate 0a rule."""
 
-    if not isinstance(task_set, TaskSet):
-        raise ValueError("task_set must be a validated TaskSet")
+    task_set = _require_task_set_integrity(task_set)
     if not isinstance(mode, ReplayMode):
         raise ValueError("mode must be a ReplayMode")
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
+    results = _require_replay_results_integrity(results, repetitions=repetitions)
     if len(results) != len(task_set.task_ids):
         raise ValueError("one anonymous result is required for every task")
-    if any(len(result.runs) != repetitions for result in results):
-        raise ValueError("all task results must use the declared repetitions")
 
     task_count = len(results)
     episode_count = task_count * repetitions
@@ -521,6 +682,7 @@ def summarize_replays(
     final_match_rate = _rate([result.final_state_matches for result in results])
     evaluator_match_rate = _rate([result.evaluator_matches for result in results])
     trace_match_rate = _rate([result.trace_matches for result in results])
+    task_consistency_rate = _rate([result.is_consistent for result in results])
     execution_failure_count = sum(
         result.execution_failure_count for result in results
     )
@@ -542,6 +704,7 @@ def summarize_replays(
         and final_match_rate >= 0.99
         and evaluator_match_rate >= 0.99
         and trace_match_rate >= 0.99
+        and task_consistency_rate >= 0.99
         and oracle_success_rate == 1.0
         and execution_failure_count == 0
         and exception_count == 0
@@ -569,6 +732,7 @@ def summarize_replays(
         final_state_match_rate=final_match_rate,
         evaluator_match_rate=evaluator_match_rate,
         trace_match_rate=trace_match_rate,
+        task_consistency_rate=task_consistency_rate,
         oracle_success_rate=oracle_success_rate,
         execution_failure_count=execution_failure_count,
         exception_count=exception_count,
@@ -595,6 +759,7 @@ def run_replay_verification(
 ) -> ReplaySummary:
     """Run replay groups serially, or explicitly as non-gate exploratory work."""
 
+    task_set = _require_task_set_integrity(task_set)
     if workers == 1:
         results = [
             run_task_repetitions(
@@ -798,6 +963,7 @@ __all__ = [
     "exit_code_for_summary",
     "load_appworld_task_set",
     "main",
+    "managed_appworld_context",
     "require_pinned_appworld_revision",
     "run_replay_verification",
     "run_task_repetitions",

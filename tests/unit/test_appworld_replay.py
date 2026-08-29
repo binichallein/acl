@@ -7,6 +7,7 @@ from contextlib import AbstractContextManager
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -17,6 +18,7 @@ from toolshift.benchmarks.appworld_replay import (
     ReplayRun,
     ReplayStage,
     TaskReplayResult,
+    TaskSet,
     build_task_set,
     canonical_state_sha256,
     evaluator_sha256,
@@ -142,8 +144,8 @@ def test_state_projection_sorts_records_by_native_id_then_record_hash() -> None:
 
 @pytest.mark.parametrize(
     "row",
-    [("1", "hash-a"), (True, "hash-a"), (1, "")],
-    ids=["string-id", "boolean-id", "empty-record-hash"],
+    [("1", "hash-a"), (True, "hash-a"), (1, ""), (1, " \t\n")],
+    ids=["string-id", "boolean-id", "empty-record-hash", "blank-record-hash"],
 )
 def test_state_projection_fails_closed_on_pinned_record_hash_contract_drift(
     row: tuple[object, object],
@@ -190,15 +192,34 @@ def test_evaluator_digest_covers_score_fields_and_only_counts_no_op_failures() -
 
 
 class _FakeRequester:
-    def __init__(self) -> None:
-        self.requests: list[dict[str, object]] = []
+    def __init__(self, requests: object) -> None:
+        self.requests = requests
+
+
+def _valid_request_trace() -> list[dict[str, object]]:
+    return [
+        {
+            "method": "POST",
+            "url": "/notes",
+            "data": {"title": "unit-test"},
+        }
+    ]
 
 
 class _FakeWorld:
-    def __init__(self, serial: int, *, traceback_output: bool = False) -> None:
+    def __init__(
+        self,
+        serial: int,
+        *,
+        execution_output: object = "ok",
+        request_trace: object | None = None,
+    ) -> None:
         self.serial = serial
         self.closed = False
-        self.traceback_output = traceback_output
+        self.execution_output = execution_output
+        self.request_trace_after_execute = (
+            _valid_request_trace() if request_trace is None else request_trace
+        )
         self.models = _FakeModels(
             {"notes": ["Note", "NoteModelHash"]},
             {
@@ -206,7 +227,7 @@ class _FakeWorld:
                 ("notes", "NoteModelHash"): [(1, "cache")],
             },
         )
-        self.requester = _FakeRequester()
+        self.requester = _FakeRequester([])
         self.task = SimpleNamespace(
             ground_truth=SimpleNamespace(
                 compiled_solution_code="def solution(apis, requester): return None"
@@ -215,14 +236,12 @@ class _FakeWorld:
         self.executed_code: str | None = None
         self.evaluate_calls: list[bool] = []
 
-    def execute(self, code: str) -> str:
+    def execute(self, code: str) -> object:
         self.executed_code = code
-        if self.traceback_output:
-            return "Traceback (most recent call last): redacted"
+        if self.execution_output != "ok":
+            return self.execution_output
         self.models._rows[("notes", "Note")] = [(1, "terminal")]
-        self.requester.requests.append(
-            {"method": "notes.create", "arguments": {"title": "unit-test"}}
-        )
+        self.requester.requests = self.request_trace_after_execute
         return "ok"
 
     def evaluate(self, *, suppress_errors: bool) -> _FakeTracker:
@@ -242,8 +261,15 @@ class _WorldContext(AbstractContextManager[_FakeWorld]):
 
 
 class _RecordingFactory:
-    def __init__(self, *, traceback_run: int | None = None, raise_run: int | None = None) -> None:
-        self.traceback_run = traceback_run
+    def __init__(
+        self,
+        *,
+        execution_outputs: dict[int, object] | None = None,
+        request_traces: dict[int, object] | None = None,
+        raise_run: int | None = None,
+    ) -> None:
+        self.execution_outputs = execution_outputs or {}
+        self.request_traces = request_traces or {}
         self.raise_run = raise_run
         self.calls: list[dict[str, object]] = []
         self.worlds: list[_FakeWorld] = []
@@ -253,9 +279,118 @@ class _RecordingFactory:
         self.calls.append(dict(kwargs))
         if serial == self.raise_run:
             raise RuntimeError("sensitive exception payload")
-        world = _FakeWorld(serial, traceback_output=serial == self.traceback_run)
+        world = _FakeWorld(
+            serial,
+            execution_output=self.execution_outputs.get(serial, "ok"),
+            request_trace=self.request_traces.get(serial),
+        )
         self.worlds.append(world)
         return _WorldContext(world)
+
+
+def _lifecycle_appworld_class(
+    *,
+    constructor_error: Exception | None = None,
+    close_error: Exception | None = None,
+    close_all_error: Exception | None = None,
+) -> type[object]:
+    class LifecycleAppWorld:
+        instances: ClassVar[list[LifecycleAppWorld]] = []
+        constructor_calls = 0
+        close_all_calls = 0
+
+        def __init__(self, **kwargs: object) -> None:
+            type(self).constructor_calls += 1
+            self.kwargs = kwargs
+            self.close_calls = 0
+            if constructor_error is not None:
+                raise constructor_error
+            type(self).instances.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if close_error is not None:
+                raise close_error
+
+        @classmethod
+        def close_all(cls) -> None:
+            cls.close_all_calls += 1
+            if close_all_error is not None:
+                raise close_all_error
+
+    return LifecycleAppWorld
+
+
+def test_managed_appworld_context_closes_once_after_normal_body() -> None:
+    appworld_class = _lifecycle_appworld_class()
+
+    with replay_module.managed_appworld_context(
+        appworld_class,
+        task_id="train-task-unit",
+    ) as world:
+        assert world.kwargs == {"task_id": "train-task-unit"}
+
+    assert world.close_calls == 1
+    assert appworld_class.close_all_calls == 0
+
+
+def test_managed_appworld_context_closes_once_after_body_exception() -> None:
+    appworld_class = _lifecycle_appworld_class()
+
+    with (
+        pytest.raises(LookupError, match="body failed"),
+        replay_module.managed_appworld_context(appworld_class),
+    ):
+        raise LookupError("body failed")
+
+    assert appworld_class.instances[0].close_calls == 1
+    assert appworld_class.close_all_calls == 0
+
+
+def test_managed_appworld_context_uses_close_all_after_constructor_failure() -> None:
+    appworld_class = _lifecycle_appworld_class(
+        constructor_error=LookupError("constructor failed")
+    )
+
+    with (
+        pytest.raises(LookupError, match="constructor failed"),
+        replay_module.managed_appworld_context(appworld_class),
+    ):
+        pytest.fail("constructor failure must prevent context entry")
+
+    assert appworld_class.constructor_calls == 1
+    assert appworld_class.close_all_calls == 1
+
+
+def test_managed_appworld_context_falls_back_after_close_failure_without_double_close() -> None:
+    appworld_class = _lifecycle_appworld_class(close_error=LookupError("close failed"))
+
+    with (
+        pytest.raises(LookupError, match="close failed"),
+        replay_module.managed_appworld_context(appworld_class),
+    ):
+        pass
+
+    assert appworld_class.instances[0].close_calls == 1
+    assert appworld_class.close_all_calls == 1
+
+
+def test_managed_appworld_context_surfaces_failed_close_all_fallback() -> None:
+    appworld_class = _lifecycle_appworld_class(
+        close_error=LookupError("close failed"),
+        close_all_error=RuntimeError("close_all failed"),
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="global cleanup failed") as error,
+        replay_module.managed_appworld_context(appworld_class),
+    ):
+        pass
+
+    assert type(error.value.__cause__) is RuntimeError
+    assert type(error.value.__cause__.__context__) is LookupError
+    assert appworld_class.instances[0].close_calls == 1
+    assert appworld_class.close_all_calls == 1
 
 
 def test_repetitions_use_fresh_worlds_exact_runtime_options_and_context_cleanup() -> None:
@@ -323,7 +458,11 @@ def test_traceback_and_exception_fail_closed_without_exposing_payloads() -> None
         "train-task-unit",
         seed=100,
         repetitions=3,
-        world_context_factory=_RecordingFactory(traceback_run=1),
+        world_context_factory=_RecordingFactory(
+            execution_outputs={
+                1: "Execution failed. Traceback:\nTimeoutError: sensitive payload"
+            }
+        ),
     )
     exception_result = run_task_repetitions(
         "train-task-unit",
@@ -341,6 +480,71 @@ def test_traceback_and_exception_fail_closed_without_exposing_payloads() -> None
     assert exception_result.runs[1].exception_type == "RuntimeError"
     assert "sensitive" not in repr(exception_result)
     assert exception_result.final_state_matches is False
+
+
+@pytest.mark.parametrize(
+    "unsafe_output",
+    [{"unexpected": "mapping"}, ["unexpected", "list"], None],
+    ids=["mapping", "list", "none"],
+)
+def test_non_string_execute_output_fails_closed_as_unsafe_shape(
+    unsafe_output: object,
+) -> None:
+    factory = _RecordingFactory(execution_outputs={1: unsafe_output})
+
+    result = run_task_repetitions(
+        "train-task-unit",
+        seed=100,
+        repetitions=3,
+        world_context_factory=factory,
+    )
+
+    failed_run = result.runs[1]
+    assert failed_run.execution_failed is True
+    assert failed_run.failure_stage is ReplayStage.EXECUTE_ORACLE
+    assert failed_run.exception_type == "ValueError"
+    assert factory.worlds[1].evaluate_calls == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_trace",
+    [
+        [],
+        "not-a-list",
+        ["not-a-request"],
+        [{"method": "", "url": "/notes", "data": {}}],
+        [{"method": "POST", "url": "  ", "data": {}}],
+        [{"method": "POST", "url": "/notes", "data": []}],
+        [{"method": "POST", "url": "/notes"}],
+    ],
+    ids=[
+        "empty",
+        "non-list",
+        "non-mapping-item",
+        "blank-method",
+        "blank-url",
+        "non-mapping-data",
+        "missing-data",
+    ],
+)
+def test_native_request_trace_must_be_nonempty_and_match_pinned_shape(
+    unsafe_trace: object,
+) -> None:
+    factory = _RecordingFactory(request_traces={1: unsafe_trace})
+
+    result = run_task_repetitions(
+        "train-task-unit",
+        seed=100,
+        repetitions=3,
+        world_context_factory=factory,
+    )
+
+    failed_run = result.runs[1]
+    assert failed_run.execution_failed is True
+    assert failed_run.failure_stage is ReplayStage.TRACE_FINGERPRINT
+    assert failed_run.exception_type == "ValueError"
+    assert factory.worlds[1].evaluate_calls == []
+    assert result.is_consistent is False
 
 
 def _run(
@@ -366,6 +570,15 @@ def _run(
     )
 
 
+def test_failed_replay_run_cannot_claim_oracle_success() -> None:
+    with pytest.raises(ValueError, match="oracle_success"):
+        _run(
+            success=True,
+            execution_failed=True,
+            failure_stage=ReplayStage.EXECUTE_ORACLE,
+        )
+
+
 def _task_result(*runs: ReplayRun) -> TaskReplayResult:
     return TaskReplayResult(runs=tuple(runs))
 
@@ -380,6 +593,32 @@ def test_task_replay_result_takes_an_immutable_snapshot_of_runs() -> None:
     assert len(result.runs) == 2
     with pytest.raises(FrozenInstanceError):
         result.runs = ()  # type: ignore[misc]
+
+
+def test_summary_rejects_non_task_results_and_forged_run_shapes() -> None:
+    task_set = build_task_set({"train": ["train-task-unit"]})
+
+    with pytest.raises(ValueError, match="TaskReplayResult"):
+        summarize_replays(
+            task_set,
+            [object()],  # type: ignore[list-item]
+            mode=ReplayMode.SMOKE,
+            seed=100,
+            repetitions=2,
+            workers=1,
+        )
+
+    forged_result = _task_result(_run(), _run())
+    object.__setattr__(forged_result.runs[0], "execution_failed", True)
+    with pytest.raises(ValueError, match="replay result integrity"):
+        summarize_replays(
+            task_set,
+            [forged_result],
+            mode=ReplayMode.SMOKE,
+            seed=100,
+            repetitions=2,
+            workers=1,
+        )
 
 
 def _official_task_set() -> object:
@@ -402,6 +641,53 @@ def test_task_set_rejects_held_out_empty_duplicate_and_overlapping_ids() -> None
         build_task_set({"train": ["same", "same"]})
     with pytest.raises(ValueError, match="unique"):
         build_task_set({"train": ["same"], "dev": ["same"]})
+
+
+def test_direct_task_set_construction_derives_a_deep_immutable_snapshot() -> None:
+    train_ids = ["train-b", "train-a"]
+    source = {"train": train_ids}
+
+    task_set = TaskSet(source)
+    train_ids.append("train-c")
+    source["dev"] = ["dev-a"]
+
+    assert task_set.task_ids == ("train-a", "train-b")
+    assert task_set.split_counts == (("train", 2),)
+    assert tuple(task_set.task_ids_by_split["train"]) == ("train-a", "train-b")
+    with pytest.raises(TypeError):
+        task_set.task_ids_by_split["dev"] = ("dev-a",)  # type: ignore[index]
+
+
+def test_direct_task_set_construction_rejects_duplicate_ids() -> None:
+    with pytest.raises(ValueError, match="unique"):
+        TaskSet({"train": ["same"], "dev": ["same"]})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "forged_value"),
+    [
+        ("task_ids", ("forged",)),
+        ("split_counts", (("dev", 57), ("train", 90))),
+        ("task_set_sha256", "0" * 64),
+    ],
+    ids=["task-ids", "split-counts", "fingerprint"],
+)
+def test_summary_rejects_low_level_task_set_forgery(
+    field_name: str,
+    forged_value: object,
+) -> None:
+    task_set = TaskSet({"train": ["train-task-unit"]})
+    object.__setattr__(task_set, field_name, forged_value)
+
+    with pytest.raises(ValueError, match="integrity"):
+        summarize_replays(
+            task_set,
+            [_task_result(_run(), _run())],
+            mode=ReplayMode.SMOKE,
+            seed=100,
+            repetitions=2,
+            workers=1,
+        )
 
 
 def test_task_set_is_sorted_and_fingerprint_is_order_stable() -> None:
@@ -431,6 +717,7 @@ def test_formal_summary_passes_only_for_complete_fixed_official_protocol() -> No
     assert summary.final_state_match_rate == 1.0
     assert summary.evaluator_match_rate == 1.0
     assert summary.trace_match_rate == 1.0
+    assert summary.task_consistency_rate == 1.0
     assert summary.oracle_success_rate == 1.0
     assert summary.execution_failure_count == 0
     assert summary.exception_count == 0
@@ -524,6 +811,33 @@ def test_one_mismatch_of_147_passes_point_99_but_two_mismatches_fail() -> None:
     assert one.gate_passed is True
     assert two.final_state_match_rate == pytest.approx(145 / 147)
     assert two.gate_passed is False
+
+
+def test_joint_task_consistency_rejects_disjoint_channel_mismatches() -> None:
+    task_set = _official_task_set()
+    matched = _task_result(_run(), _run(), _run())
+    final_mismatch = _task_result(_run(), _run(final="changed"), _run())
+    evaluator_mismatch = _task_result(
+        _run(),
+        _run(evaluator="changed"),
+        _run(),
+    )
+    trace_mismatch = _task_result(_run(), _run(trace="changed"), _run())
+
+    summary = summarize_replays(
+        task_set,
+        [final_mismatch, evaluator_mismatch, trace_mismatch, *([matched] * 144)],
+        mode=ReplayMode.GATE,
+        seed=100,
+        repetitions=3,
+        workers=1,
+    )
+
+    assert summary.final_state_match_rate == pytest.approx(146 / 147)
+    assert summary.evaluator_match_rate == pytest.approx(146 / 147)
+    assert summary.trace_match_rate == pytest.approx(146 / 147)
+    assert summary.task_consistency_rate == pytest.approx(144 / 147)
+    assert summary.gate_passed is False
 
 
 def test_exception_and_initial_state_mismatch_always_fail_gate() -> None:

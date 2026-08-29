@@ -102,6 +102,9 @@ AppWorld APIs, evaluates it, and closes the world through a context manager. Do 
 `load_state()` for this gate: the pinned revision can create a double time-freezer when
 state loading is combined with repeated world lifecycles. A fresh-world reset avoids
 that compatibility issue and tests the lifecycle used by later paired rollouts.
+Each successful repetition must contain at least one native request with the pinned
+`method`/`url`/`data` shape. The verifier hashes that private request list in memory and
+persists only its aggregate consistency rate.
 
 Supply the ToolShift checkout only at runtime. Clear every proxy-related variable
 before either smoke or formal execution so localhost AppWorld services are never
@@ -144,7 +147,10 @@ TOOLSHIFT_RUN_APPWORLD_SMOKE=1 \
 
 The formal command is intentionally fixed to all 90 train and 57 dev tasks, seed 100,
 three fresh worlds per task, and one worker. A formal report is Gate-evaluable only
-under that complete 147-task protocol. The explicit smoke runs one train task twice;
+under that complete 147-task protocol. Its `task_consistency_rate` is a task-level AND
+over initial state, final state, evaluator, private request trace, oracle success, and
+zero execution failures; it must be at least 99%. The explicit smoke runs one train task
+twice;
 exit code zero means only that create, fresh reset, native oracle execution, evaluation,
 and close completed consistently. A smoke report always has `gate_evaluable=false` and
 `gate_passed=false`.

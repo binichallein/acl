@@ -37,6 +37,8 @@ def test_pinned_appworld_fresh_world_oracle_lifecycle() -> None:
     assert summary.task_count == 1
     assert summary.episode_count == 2
     assert summary.initial_state_match_rate == 1.0
+    assert summary.trace_match_rate == 1.0
+    assert summary.task_consistency_rate == 1.0
     assert summary.oracle_success_rate == 1.0
     assert summary.execution_failure_count == 0
     assert summary.exception_count == 0
