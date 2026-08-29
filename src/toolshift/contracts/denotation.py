@@ -13,6 +13,7 @@ from toolshift.contracts.schema import (
     _diagnostic,
     _fingerprint_parts,
     _make_layer_result,
+    _require_sha256,
     _snapshot_actions,
     _snapshot_call,
     schema_fingerprint,
@@ -160,7 +161,11 @@ def _validate_denotation_case(value: object) -> DenotationCase:
         case.base_observation_groups,
         case.expected_surface_observation,
     )
-    if case._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        case._snapshot_fingerprint,
+        "denotation_case_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("denotation case has been mutated")
     return case
 

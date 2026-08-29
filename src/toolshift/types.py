@@ -30,7 +30,7 @@ def _require_utf8_text(value: str, context: str) -> str:
 
 
 def _require_non_blank_string(value: object, context: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise ValueError(f"{context} must be a non-blank string")
     return _require_utf8_text(value, context)
 
@@ -41,18 +41,18 @@ def _freeze_json(
     active: set[int],
     container_depth: int,
 ) -> JSONValue:
-    if value is None or isinstance(value, bool):
+    if value is None or type(value) is bool:
         return value
-    if isinstance(value, str):
+    if type(value) is str:
         return _require_utf8_text(value, context)
-    if isinstance(value, int):
+    if type(value) is int:
         if not -_MAX_SAFE_INTEGER <= value <= _MAX_SAFE_INTEGER:
             raise ValueError(
                 f"{context} must be an integer in the I-JSON safe range "
                 f"[-{_MAX_SAFE_INTEGER}, {_MAX_SAFE_INTEGER}]"
             )
         return value
-    if isinstance(value, float):
+    if type(value) is float:
         if not math.isfinite(value):
             raise ValueError(f"{context} must be a finite float")
         return value
@@ -73,7 +73,7 @@ def _freeze_json(
         try:
             frozen: dict[str, JSONValue] = {}
             for key, item in value.items():
-                if not isinstance(key, str):
+                if type(key) is not str:
                     raise ValueError(f"{context} has non-string key: {key!r}")
                 _require_utf8_text(key, f"{context} mapping key {key!r}")
                 frozen[key] = _freeze_json(
@@ -213,7 +213,7 @@ class SurfaceToolSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _require_non_blank_string(self.name, "name"))
-        if not isinstance(self.description, str):
+        if type(self.description) is not str:
             raise ValueError("description must be a string")
         _require_utf8_text(self.description, "description")
         input_schema = _freeze_mapping(self.input_schema, "input_schema")

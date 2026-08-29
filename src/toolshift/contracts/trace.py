@@ -66,7 +66,7 @@ class PhysicalCallEffect:
     _snapshot_fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if isinstance(self.call_index, bool) or not isinstance(self.call_index, int):
+        if type(self.call_index) is not int:
             raise ValueError("call_index must be a nonnegative integer")
         if self.call_index < 0:
             raise ValueError("call_index must be a nonnegative integer")
@@ -135,7 +135,11 @@ def _snapshot_effect(value: object, context: str) -> PhysicalCallEffect:
         effect.base_call_fingerprint,
         effect.effect_digest,
     )
-    if effect._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        effect._snapshot_fingerprint,
+        "physical_effect_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError(f"{context} contains mutated effect evidence")
     return rebuilt
 
@@ -225,7 +229,11 @@ def _validate_trace_case(value: object) -> TraceCase:
         raise ValueError("cases must contain only TraceCase values")
     case = cast(TraceCase, value)
     rebuilt = TraceCase(case.case_id, case.episode_id)
-    if case._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        case._snapshot_fingerprint,
+        "trace_case_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("trace case has been mutated")
     return case
 
@@ -243,7 +251,11 @@ def _validate_trace_evidence(value: object) -> TraceEvidence:
         evidence.reference_effects,
         evidence.candidate_effects,
     )
-    if evidence._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        evidence._snapshot_fingerprint,
+        "trace_evidence_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("trace evidence has been mutated")
     return evidence
 
@@ -351,6 +363,7 @@ def check_trace_contract(
         )
 
     verified_by_id: dict[str, DenotationCase] = {}
+    verified_snapshots: list[tuple[DenotationCase, str]] = []
     if not isinstance(verified_denotation_cases, (list, tuple)):
         diagnostics.append(
             _diagnostic(
@@ -379,6 +392,21 @@ def check_trace_contract(
                 )
             else:
                 verified_by_id[step.case_id] = step
+            verified_snapshots.append((step, step._snapshot_fingerprint))
+
+    def verified_steps_match() -> bool:
+        for step, entry_fingerprint in verified_snapshots:
+            try:
+                current = _validate_denotation_case(step)
+                current_fingerprint = _require_sha256(
+                    current._snapshot_fingerprint,
+                    "denotation_case_fingerprint",
+                )
+            except Exception:
+                return False
+            if current is not step or current_fingerprint != entry_fingerprint:
+                return False
+        return True
 
     fingerprint_parts = [
         bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases
@@ -396,7 +424,23 @@ def check_trace_contract(
                 )
             )
             fingerprint_parts.append(b"provider-error")
+            if not verified_steps_match():
+                diagnostics.append(
+                    _diagnostic(
+                        "trace.verified_step_mutated",
+                        "Verified denotation content changed during trace evidence collection",
+                        case.case_id,
+                    )
+                )
             continue
+        if not verified_steps_match():
+            diagnostics.append(
+                _diagnostic(
+                    "trace.verified_step_mutated",
+                    "Verified denotation content changed during trace evidence collection",
+                    case.case_id,
+                )
+            )
         fingerprint_parts.append(bytes.fromhex(evidence._snapshot_fingerprint))
         surface_steps_run += len(evidence.candidate_steps)
         if not evidence.candidate_steps:

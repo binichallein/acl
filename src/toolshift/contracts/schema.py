@@ -29,25 +29,25 @@ _INVALID_SUITE_SEQUENCE = object()
 
 
 def _require_safe_identifier(value: object, context: str) -> str:
-    if not isinstance(value, str) or _SAFE_IDENTIFIER.fullmatch(value) is None:
+    if type(value) is not str or _SAFE_IDENTIFIER.fullmatch(value) is None:
         raise ValueError(f"{context} must be a non-blank payload-safe identifier")
     return value
 
 
 def _require_safe_message(value: object) -> str:
-    if not isinstance(value, str) or _SAFE_MESSAGE.fullmatch(value) is None:
+    if type(value) is not str or _SAFE_MESSAGE.fullmatch(value) is None:
         raise ValueError("message must be non-blank payload-safe text")
     return value
 
 
 def _require_sha256(value: object, context: str = "fingerprint") -> str:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
         raise ValueError(f"{context} must be a lowercase SHA256 digest")
     return value
 
 
 def _require_non_blank_text(value: object, context: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise ValueError(f"{context} must be a non-blank string")
     try:
         value.encode("utf-8")
@@ -99,7 +99,7 @@ def _validate_schema_variant(variant: object) -> SchemaVariant:
     if type(variant) is not SchemaVariant:
         raise ValueError("variant must be a SchemaVariant")
     typed = cast(SchemaVariant, variant)
-    if not isinstance(typed.tools, tuple):
+    if type(typed.tools) is not tuple:
         raise ValueError("variant contains mutated tools")
     rebuilt_tools: list[SurfaceToolSpec] = []
     for tool in typed.tools:
@@ -149,10 +149,10 @@ class LayerContractResult:
     LAYERS: ClassVar[tuple[str, ...]] = _LAYERS
 
     def __post_init__(self) -> None:
-        if self.layer not in self.LAYERS:
+        if type(self.layer) is not str or self.layer not in self.LAYERS:
             raise ValueError("layer must be schema, denotation, state, or trace")
         object.__setattr__(self, "fingerprint", _require_sha256(self.fingerprint))
-        if isinstance(self.checks_run, bool) or not isinstance(self.checks_run, int):
+        if type(self.checks_run) is not int:
             raise ValueError("checks_run must be a nonnegative integer")
         if self.checks_run < 0:
             raise ValueError("checks_run must be a nonnegative integer")
@@ -204,8 +204,12 @@ def _validate_layer_result(
     if type(value) is not LayerContractResult:
         raise ValueError("results must contain only LayerContractResult values")
     result = cast(LayerContractResult, value)
-    if not isinstance(result.diagnostics, tuple):
+    if type(result.diagnostics) is not tuple:
         raise ValueError("layer result diagnostics have been mutated")
+    snapshot_fingerprint = _require_sha256(
+        result._snapshot_fingerprint,
+        "layer_snapshot_fingerprint",
+    )
     diagnostics = tuple(_validate_diagnostic(item) for item in result.diagnostics)
     rebuilt = LayerContractResult(
         result.layer,
@@ -213,13 +217,17 @@ def _validate_layer_result(
         result.checks_run,
         diagnostics,
     )
-    if result._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("layer result has been mutated")
-    if require_attested and (
-        result._attestation is not _LAYER_ATTESTATION
-        or result._sealed_snapshot_fingerprint != result._snapshot_fingerprint
-    ):
-        raise ValueError("layer result is not checker-attested")
+    if require_attested:
+        if result._attestation is not _LAYER_ATTESTATION:
+            raise ValueError("layer result is not checker-attested")
+        sealed_fingerprint = _require_sha256(
+            result._sealed_snapshot_fingerprint,
+            "sealed_layer_snapshot_fingerprint",
+        )
+        if sealed_fingerprint != snapshot_fingerprint:
+            raise ValueError("layer result is not checker-attested")
     return result
 
 
@@ -323,6 +331,10 @@ _EVALUATED_SUITES: weakref.WeakKeyDictionary[
 
 
 def _admission_snapshot_fingerprint(suite: ContractSuiteResult) -> str:
+    aggregate_fingerprint = _require_sha256(
+        suite.fingerprint,
+        "aggregate_fingerprint",
+    )
     state_episodes = _require_sha256(
         suite._state_episode_fingerprint,
         "state_episode_fingerprint",
@@ -334,7 +346,7 @@ def _admission_snapshot_fingerprint(suite: ContractSuiteResult) -> str:
     return _fingerprint_parts(
         b"toolshift.admission-snapshot.v1",
         [
-            bytes.fromhex(suite.fingerprint),
+            bytes.fromhex(aggregate_fingerprint),
             bytes.fromhex(state_episodes),
             bytes.fromhex(trace_episodes),
         ],
@@ -392,7 +404,11 @@ def _validate_schema_probe(value: object) -> SchemaProbe:
         probe.surface_call,
         probe.expected_actions,
     )
-    if probe._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        probe._snapshot_fingerprint,
+        "schema_probe_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("probe has been mutated")
     return probe
 
@@ -478,7 +494,7 @@ def check_schema_contract(
             valid_probes.append(_validate_schema_probe(raw_probe))
         except Exception:
             case_id = getattr(raw_probe, "case_id", "suite")
-            if not isinstance(case_id, str) or _SAFE_IDENTIFIER.fullmatch(case_id) is None:
+            if type(case_id) is not str or _SAFE_IDENTIFIER.fullmatch(case_id) is None:
                 case_id = "suite"
             diagnostics.append(
                 _diagnostic("schema.invalid_probe", "Schema probe validation failed", case_id)
@@ -617,12 +633,113 @@ def _episode_fingerprint(values: Sequence[str]) -> str:
 
 
 def _freeze_suite_sequence(value: object) -> object:
-    if not isinstance(value, (list, tuple)):
-        return value
+    if type(value) not in (list, tuple):
+        return _INVALID_SUITE_SEQUENCE
     try:
         return tuple(value)
     except Exception:
         return _INVALID_SUITE_SEQUENCE
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryCaseSnapshot:
+    value: object
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryCaseGroup:
+    snapshots: tuple[_EntryCaseSnapshot, ...]
+    validator: Callable[[object], object]
+    all_valid: bool
+    capture_episode_ids: bool
+    episode_ids: tuple[str, ...] | None
+
+
+def _capture_entry_case_group(
+    value: object,
+    expected_type: type[object],
+    validator: Callable[[object], object],
+    *,
+    capture_episode_ids: bool = False,
+) -> _EntryCaseGroup:
+    if type(value) is not tuple:
+        return _EntryCaseGroup((), validator, False, capture_episode_ids, None)
+    snapshots: list[_EntryCaseSnapshot] = []
+    all_valid = True
+    for raw_case in value:
+        if type(raw_case) is not expected_type:
+            all_valid = False
+            continue
+        try:
+            fingerprint = _require_sha256(
+                object.__getattribute__(raw_case, "_snapshot_fingerprint"),
+                "case_snapshot_fingerprint",
+            )
+        except Exception:
+            all_valid = False
+            continue
+        snapshots.append(_EntryCaseSnapshot(raw_case, fingerprint))
+    return _EntryCaseGroup(
+        tuple(snapshots),
+        validator,
+        all_valid,
+        capture_episode_ids,
+        None,
+    )
+
+
+def _validate_entry_case_group(group: _EntryCaseGroup) -> _EntryCaseGroup:
+    all_valid = group.all_valid
+    episode_ids: list[str] = []
+    for snapshot in group.snapshots:
+        try:
+            validated = group.validator(snapshot.value)
+            current_fingerprint = _require_sha256(
+                validated._snapshot_fingerprint,
+                "case_snapshot_fingerprint",
+            )
+            if (
+                validated is not snapshot.value
+                or current_fingerprint != snapshot.fingerprint
+            ):
+                raise ValueError("case validation changed entry snapshot")
+            if group.capture_episode_ids:
+                episode_ids.append(
+                    _require_safe_identifier(validated.episode_id, "episode_id")
+                )
+        except Exception:
+            all_valid = False
+    frozen_episode_ids = (
+        tuple(episode_ids) if group.capture_episode_ids and all_valid else None
+    )
+    return _EntryCaseGroup(
+        group.snapshots,
+        group.validator,
+        all_valid,
+        group.capture_episode_ids,
+        frozen_episode_ids,
+    )
+
+
+def _entry_case_groups_match(groups: Sequence[_EntryCaseGroup]) -> bool:
+    matches = True
+    for group in groups:
+        if not group.all_valid:
+            matches = False
+        for snapshot in group.snapshots:
+            try:
+                current = group.validator(snapshot.value)
+                current_fingerprint = _require_sha256(
+                    current._snapshot_fingerprint,
+                    "case_snapshot_fingerprint",
+                )
+            except Exception:
+                matches = False
+                continue
+            if current is not snapshot.value or current_fingerprint != snapshot.fingerprint:
+                matches = False
+    return matches
 
 
 def evaluate_contract_suite(
@@ -637,14 +754,51 @@ def evaluate_contract_suite(
 ) -> ContractSuiteResult:
     """Run all four layers and return a sealed, non-short-circuiting suite result."""
 
-    from toolshift.contracts.denotation import check_denotation_contract
-    from toolshift.contracts.state import _validate_state_case, check_state_contract
-    from toolshift.contracts.trace import _validate_trace_case, check_trace_contract
+    from toolshift.contracts.denotation import (
+        DenotationCase,
+        _validate_denotation_case,
+        check_denotation_contract,
+    )
+    from toolshift.contracts.state import (
+        StateCase,
+        _validate_state_case,
+        check_state_contract,
+    )
+    from toolshift.contracts.trace import (
+        TraceCase,
+        _validate_trace_case,
+        check_trace_contract,
+    )
 
     schema_probes = cast(Sequence[SchemaProbe], _freeze_suite_sequence(schema_probes))
     denotation_cases = cast(Sequence[object], _freeze_suite_sequence(denotation_cases))
     state_cases = cast(Sequence[object], _freeze_suite_sequence(state_cases))
     trace_cases = cast(Sequence[object], _freeze_suite_sequence(trace_cases))
+
+    raw_entry_case_groups = (
+        _capture_entry_case_group(
+            schema_probes,
+            SchemaProbe,
+            _validate_schema_probe,
+        ),
+        _capture_entry_case_group(
+            denotation_cases,
+            DenotationCase,
+            _validate_denotation_case,
+        ),
+        _capture_entry_case_group(
+            state_cases,
+            StateCase,
+            _validate_state_case,
+            capture_episode_ids=True,
+        ),
+        _capture_entry_case_group(
+            trace_cases,
+            TraceCase,
+            _validate_trace_case,
+            capture_episode_ids=True,
+        ),
+    )
 
     try:
         _validate_schema_variant(variant)
@@ -654,41 +808,100 @@ def evaluate_contract_suite(
         supplied_variant_valid = False
         variant_fingerprint = hashlib.sha256(b"toolshift.schema.invalid").hexdigest()
 
-    schema_result = _run_suite_checker(
-        "schema",
-        variant_fingerprint,
-        lambda: check_schema_contract(variant, adapter, schema_probes),
-    )
-    denotation_result = _run_suite_checker(
-        "denotation",
-        hashlib.sha256(b"toolshift.denotation.checker-error").hexdigest(),
-        lambda: check_denotation_contract(adapter, denotation_cases),
-    )
-    state_result = _run_suite_checker(
-        "state",
-        hashlib.sha256(b"toolshift.state.checker-error").hexdigest(),
-        lambda: check_state_contract(state_cases, state_provider),
-    )
-    trace_result = _run_suite_checker(
-        "trace",
-        hashlib.sha256(b"toolshift.trace.checker-error").hexdigest(),
-        lambda: check_trace_contract(
-            adapter,
-            trace_cases,
-            trace_provider,
-            denotation_cases,
-        ),
+    try:
+        adapter_entry_fingerprint = schema_fingerprint(adapter.variant)
+    except Exception:
+        adapter_entry_fingerprint = None
+
+    entry_case_groups = tuple(
+        _validate_entry_case_group(group) for group in raw_entry_case_groups
     )
 
-    try:
-        variant_binding_matches = (
-            supplied_variant_valid
-            and schema_fingerprint(variant) == variant_fingerprint
-            and schema_fingerprint(adapter.variant) == variant_fingerprint
+    def adapter_binding_matches() -> bool:
+        try:
+            return (
+                supplied_variant_valid
+                and adapter_entry_fingerprint == variant_fingerprint
+                and schema_fingerprint(variant) == variant_fingerprint
+                and schema_fingerprint(adapter.variant) == variant_fingerprint
+            )
+        except Exception:
+            return False
+
+    case_snapshot_mismatch_detected = False
+    variant_binding_mismatch_detected = False
+
+    def guard_layer_result(result: LayerContractResult) -> LayerContractResult:
+        nonlocal case_snapshot_mismatch_detected
+        nonlocal variant_binding_mismatch_detected
+        extra_diagnostics: list[ContractDiagnostic] = []
+        binding_matches = adapter_binding_matches()
+        case_snapshots_match = _entry_case_groups_match(entry_case_groups)
+        if not binding_matches:
+            variant_binding_mismatch_detected = True
+        if not case_snapshots_match:
+            case_snapshot_mismatch_detected = True
+        if case_snapshot_mismatch_detected:
+            extra_diagnostics.append(
+                _diagnostic(
+                    "suite.case_snapshot_mismatch",
+                    "Entry case validation or content stability failed",
+                )
+            )
+        if variant_binding_mismatch_detected:
+            extra_diagnostics.append(
+                _diagnostic(
+                    "suite.variant_binding_mismatch",
+                    "Adapter binding changed during contract evaluation",
+                )
+            )
+        if not extra_diagnostics:
+            return result
+        return _make_layer_result(
+            result.layer,
+            result.fingerprint,
+            result.checks_run,
+            (*result.diagnostics, *extra_diagnostics),
         )
-    except Exception:
-        variant_binding_matches = False
-    if not variant_binding_matches:
+
+    schema_result = guard_layer_result(
+        _run_suite_checker(
+            "schema",
+            variant_fingerprint,
+            lambda: check_schema_contract(variant, adapter, schema_probes),
+        )
+    )
+    denotation_result = guard_layer_result(
+        _run_suite_checker(
+            "denotation",
+            hashlib.sha256(b"toolshift.denotation.checker-error").hexdigest(),
+            lambda: check_denotation_contract(adapter, denotation_cases),
+        )
+    )
+    state_result = guard_layer_result(
+        _run_suite_checker(
+            "state",
+            hashlib.sha256(b"toolshift.state.checker-error").hexdigest(),
+            lambda: check_state_contract(state_cases, state_provider),
+        )
+    )
+    trace_result = guard_layer_result(
+        _run_suite_checker(
+            "trace",
+            hashlib.sha256(b"toolshift.trace.checker-error").hexdigest(),
+            lambda: check_trace_contract(
+                adapter,
+                trace_cases,
+                trace_provider,
+                denotation_cases,
+            ),
+        )
+    )
+
+    if variant_binding_mismatch_detected and not any(
+        diagnostic.code == "suite.variant_binding_mismatch"
+        for diagnostic in schema_result.diagnostics
+    ):
         schema_result = _make_layer_result(
             "schema",
             schema_result.fingerprint,
@@ -702,26 +915,20 @@ def evaluate_contract_suite(
             ),
         )
 
-    try:
-        if not isinstance(state_cases, (list, tuple)):
-            raise ValueError("state cases must be finite")
-        state_episode_fingerprint = _episode_fingerprint(
-            [_validate_state_case(case).episode_id for case in state_cases]
-        )
-    except Exception:
+    state_episode_ids = entry_case_groups[2].episode_ids
+    if state_episode_ids is None:
         state_episode_fingerprint = hashlib.sha256(
             b"toolshift.state-episodes.invalid"
         ).hexdigest()
-    try:
-        if not isinstance(trace_cases, (list, tuple)):
-            raise ValueError("trace cases must be finite")
-        trace_episode_fingerprint = _episode_fingerprint(
-            [_validate_trace_case(case).episode_id for case in trace_cases]
-        )
-    except Exception:
+    else:
+        state_episode_fingerprint = _episode_fingerprint(state_episode_ids)
+    trace_episode_ids = entry_case_groups[3].episode_ids
+    if trace_episode_ids is None:
         trace_episode_fingerprint = hashlib.sha256(
             b"toolshift.trace-episodes.invalid"
         ).hexdigest()
+    else:
+        trace_episode_fingerprint = _episode_fingerprint(trace_episode_ids)
     if state_episode_fingerprint != trace_episode_fingerprint:
         trace_result = _make_layer_result(
             "trace",
@@ -780,49 +987,110 @@ def _validate_suite_result(
     if type(value) is not ContractSuiteResult:
         raise ValueError("suite_result must be a ContractSuiteResult")
     suite = cast(ContractSuiteResult, value)
-    if not isinstance(suite.results, tuple):
+    if type(suite.results) is not tuple:
         raise ValueError("suite results have been mutated")
+    current_schema_fingerprint = _require_sha256(
+        suite.schema_fingerprint,
+        "schema_fingerprint",
+    )
+    current_aggregate_fingerprint = _require_sha256(
+        suite.fingerprint,
+        "aggregate_fingerprint",
+    )
+    for result in suite.results:
+        _validate_layer_result(result, require_attested=require_attested)
     if tuple(result.layer for result in suite.results) != _LAYERS:
         raise ValueError("suite result order has been mutated")
+    current_result_snapshots = tuple(
+        _require_sha256(
+            result._snapshot_fingerprint,
+            "layer_snapshot_fingerprint",
+        )
+        for result in suite.results
+    )
+
     provenance = _EVALUATED_SUITES.get(suite) if require_attested else None
     if require_attested and provenance is None:
         raise ValueError("suite result is not evaluator-attested or issued")
-    if provenance is not None and (
-        len(suite.results) != len(provenance.results)
-        or any(
-            current is not issued
-            for current, issued in zip(
-                suite.results,
-                provenance.results,
-                strict=True,
-            )
+    if provenance is not None:
+        if type(provenance.results) is not tuple or type(
+            provenance.result_snapshots
+        ) is not tuple:
+            raise ValueError("suite external provenance has been mutated")
+        provenance_result_snapshots = tuple(
+            _require_sha256(value, "provenance_layer_snapshot_fingerprint")
+            for value in provenance.result_snapshots
         )
-        or tuple(result._snapshot_fingerprint for result in suite.results)
-        != provenance.result_snapshots
-        or suite.schema_fingerprint != provenance.schema_fingerprint
-        or suite.fingerprint != provenance.aggregate_fingerprint
-        or suite._state_episode_fingerprint
-        != provenance.state_episode_fingerprint
-        or suite._trace_episode_fingerprint
-        != provenance.trace_episode_fingerprint
-        or suite._admission_snapshot_fingerprint
-        != provenance.admission_snapshot_fingerprint
-    ):
-        raise ValueError("suite fingerprint or external provenance has been mutated")
-    for result in suite.results:
-        _validate_layer_result(result, require_attested=require_attested)
-    rebuilt = ContractSuiteResult(suite.schema_fingerprint, suite.results)
-    if suite.fingerprint != rebuilt.fingerprint:
+        provenance_schema_fingerprint = _require_sha256(
+            provenance.schema_fingerprint,
+            "provenance_schema_fingerprint",
+        )
+        provenance_aggregate_fingerprint = _require_sha256(
+            provenance.aggregate_fingerprint,
+            "provenance_aggregate_fingerprint",
+        )
+        provenance_state_episodes = _require_sha256(
+            provenance.state_episode_fingerprint,
+            "provenance_state_episode_fingerprint",
+        )
+        provenance_trace_episodes = _require_sha256(
+            provenance.trace_episode_fingerprint,
+            "provenance_trace_episode_fingerprint",
+        )
+        provenance_admission_snapshot = _require_sha256(
+            provenance.admission_snapshot_fingerprint,
+            "provenance_admission_snapshot_fingerprint",
+        )
+        current_state_episodes = _require_sha256(
+            suite._state_episode_fingerprint,
+            "state_episode_fingerprint",
+        )
+        current_trace_episodes = _require_sha256(
+            suite._trace_episode_fingerprint,
+            "trace_episode_fingerprint",
+        )
+        current_admission_snapshot = _require_sha256(
+            suite._admission_snapshot_fingerprint,
+            "admission_snapshot_fingerprint",
+        )
+        if (
+            len(suite.results) != len(provenance.results)
+            or any(
+                current is not issued
+                for current, issued in zip(
+                    suite.results,
+                    provenance.results,
+                    strict=True,
+                )
+            )
+            or current_result_snapshots != provenance_result_snapshots
+            or current_schema_fingerprint != provenance_schema_fingerprint
+            or current_aggregate_fingerprint != provenance_aggregate_fingerprint
+            or current_state_episodes != provenance_state_episodes
+            or current_trace_episodes != provenance_trace_episodes
+            or current_admission_snapshot != provenance_admission_snapshot
+        ):
+            raise ValueError("suite fingerprint or external provenance has been mutated")
+
+    rebuilt = ContractSuiteResult(current_schema_fingerprint, suite.results)
+    if current_aggregate_fingerprint != rebuilt.fingerprint:
         raise ValueError("suite fingerprint does not match its results")
-    if require_attested and (
-        suite._attestation is not _SUITE_ATTESTATION
-        or suite._sealed_fingerprint != suite.fingerprint
-    ):
-        raise ValueError("suite result is not evaluator-attested")
-    if require_attested and (
-        suite._admission_snapshot_fingerprint != _admission_snapshot_fingerprint(suite)
-    ):
-        raise ValueError("suite admission provenance has been mutated")
+    if require_attested:
+        sealed_fingerprint = _require_sha256(
+            suite._sealed_fingerprint,
+            "sealed_aggregate_fingerprint",
+        )
+        current_admission_snapshot = _require_sha256(
+            suite._admission_snapshot_fingerprint,
+            "admission_snapshot_fingerprint",
+        )
+        if (
+            suite._attestation is not _SUITE_ATTESTATION
+            or sealed_fingerprint != current_aggregate_fingerprint
+        ):
+            raise ValueError("suite result is not evaluator-attested")
+        if current_admission_snapshot != _admission_snapshot_fingerprint(suite):
+            raise ValueError("suite admission provenance has been mutated")
     return suite
 
 

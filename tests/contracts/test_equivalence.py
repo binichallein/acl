@@ -405,6 +405,116 @@ class _DenotationListSwapAdapter(_IdentityAdapter):
         return super().surface_to_semantic(surface_call)
 
 
+class _AlwaysEqualDigest(str):
+    __hash__ = str.__hash__
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+
+def _replace_denotation_case_content(
+    target: DenotationCase,
+    replacement: DenotationCase,
+) -> None:
+    for name in (
+        "case_id",
+        "surface_call",
+        "expected_actions",
+        "expected_base_call_groups",
+        "base_observation_groups",
+        "expected_surface_observation",
+        "_snapshot_fingerprint",
+    ):
+        object.__setattr__(target, name, getattr(replacement, name))
+
+
+def _replace_state_case_content(target: StateCase, replacement: StateCase) -> None:
+    for name in ("case_id", "episode_id", "_snapshot_fingerprint"):
+        object.__setattr__(target, name, getattr(replacement, name))
+
+
+def _replace_trace_case_content(target: TraceCase, replacement: TraceCase) -> None:
+    for name in ("case_id", "episode_id", "_snapshot_fingerprint"):
+        object.__setattr__(target, name, getattr(replacement, name))
+
+
+def _replace_variant_content(
+    target: SchemaVariant,
+    replacement: SchemaVariant,
+) -> None:
+    for name in (
+        "variant_id",
+        "tools",
+        "manifest",
+        "_manifest_canonical",
+    ):
+        object.__setattr__(target, name, getattr(replacement, name))
+
+
+class _LayerBoundaryVariantAdapter(_IdentityAdapter):
+    def __init__(
+        self,
+        original: SchemaVariant,
+        intermediate: SchemaVariant,
+    ) -> None:
+        super().__init__(original)
+        self._original_variant = original
+        self._intermediate_variant = intermediate
+        self._serve_intermediate = False
+        self._intermediate_reads = 0
+
+    def begin_intermediate_window(self) -> None:
+        self._serve_intermediate = True
+        self._intermediate_reads = 0
+
+    @property
+    def variant(self) -> SchemaVariant:
+        if self._serve_intermediate:
+            self._intermediate_reads += 1
+            if self._intermediate_reads <= 3:
+                return self._intermediate_variant
+        return self._original_variant
+
+
+def test_identity_and_json_text_fields_require_builtin_strings() -> None:
+    class RangeMaskingInt(int):
+        def __ge__(self, other: object) -> bool:
+            return True
+
+        def __le__(self, other: object) -> bool:
+            return True
+
+    with pytest.raises(ValueError, match="name"):
+        SemanticAction(_AlwaysEqualDigest("search"), {})
+    with pytest.raises(ValueError, match="name"):
+        SurfaceToolSpec(
+            _AlwaysEqualDigest("search"),
+            "Search documents",
+            {"type": "object"},
+        )
+    with pytest.raises(ValueError, match="description"):
+        SurfaceToolSpec(
+            "search",
+            _AlwaysEqualDigest("Search documents"),
+            {"type": "object"},
+        )
+    with pytest.raises(ValueError, match="variant_id"):
+        SchemaVariant(
+            _AlwaysEqualDigest("identity-v1"),
+            [_tool()],
+            {"operator": "identity"},
+        )
+    with pytest.raises(ValueError, match=r"unsupported|exact|string"):
+        canonical_json_bytes(_AlwaysEqualDigest("value"))
+    with pytest.raises(ValueError, match=r"key|string"):
+        canonical_json_bytes({_AlwaysEqualDigest("key"): "value"})
+    with pytest.raises(ValueError, match=r"unsupported|integer|range"):
+        canonical_json_bytes(RangeMaskingInt(2**60))
+
+
 def test_schema_fingerprint_covers_variant_and_ordered_full_tool_specs() -> None:
     first = SchemaVariant(
         variant_id="identity-v1",
@@ -1688,6 +1798,115 @@ def test_suite_freezes_denotation_identity_before_adapter_can_swap_input_list() 
     }
 
 
+def test_suite_rejects_sequence_subclass_before_it_can_change_entry_baseline() -> None:
+    variant, adapter, probe, step, state_case, trace_case, _ = (
+        _identity_suite_components()
+    )
+    replacement_call = _surface_call(value="beta")
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [SemanticAction("search", {"value": "beta"})],
+        [[replacement_call]],
+        [[{"items": [2]}]],
+        {"items": [2]},
+    )
+
+    class MutatingProbeList(list[SchemaProbe]):
+        def __iter__(self):
+            _replace_denotation_case_content(step, replacement)
+            return super().__iter__()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        trace = ExecutionTrace(
+            [step.surface_call],
+            step.expected_actions,
+            step.expected_base_call_groups[0],
+        )
+        effect = _effect(step.expected_base_call_groups[0][0])
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        MutatingProbeList([probe]),
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_SEQUENCE_SUBCLASS_ENTRY_REWRITE")
+    assert step.surface_call == _surface_call()
+
+
+def test_suite_captures_all_entry_digests_before_validating_any_case() -> None:
+    variant, adapter, probe, step, state_case, trace_case, _ = (
+        _identity_suite_components()
+    )
+    replacement_call = _surface_call(value="beta")
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [SemanticAction("search", {"value": "beta"})],
+        [[replacement_call]],
+        [[{"items": [2]}]],
+        {"items": [2]},
+    )
+
+    class MutatingCall(Mapping[str, JSONValue]):
+        def __init__(self, values: Mapping[str, JSONValue]) -> None:
+            self._values = values
+
+        def __getitem__(self, key: str) -> JSONValue:
+            return self._values[key]
+
+        def __iter__(self):
+            _replace_denotation_case_content(step, replacement)
+            return iter(self._values)
+
+        def __len__(self) -> int:
+            return len(self._values)
+
+    object.__setattr__(probe, "surface_call", MutatingCall(probe.surface_call))
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        trace = ExecutionTrace(
+            [step.surface_call],
+            step.expected_actions,
+            step.expected_base_call_groups[0],
+        )
+        effect = _effect(step.expected_base_call_groups[0][0])
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_SEQUENTIAL_ENTRY_BASELINE_REWRITE")
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for result in suite.results for item in result.diagnostics
+    }
+
+
 def test_suite_freezes_checked_state_episode_before_provider_can_swap_list() -> None:
     variant, adapter, probe, step, _, _, _ = _identity_suite_components()
     checked_state_case = StateCase("state-checked-episode", "episode-checked")
@@ -1769,6 +1988,755 @@ def test_suite_conversion_exceptions_still_return_all_four_layer_results() -> No
     assert all(result.diagnostics for result in suite.results)
     assert "/private" not in diagnostic_text
     assert "919" not in diagnostic_text
+
+
+def test_nonexact_episode_identifiers_fail_closed_without_exception_text() -> None:
+    class ExplodingIdentifier(str):
+        def __lt__(self, other: object) -> bool:
+            raise RuntimeError("identifier payload /private/episodes 777")
+
+    variant, adapter, probe, step, _, _, trace_evidence = (
+        _identity_suite_components()
+    )
+    state_cases = [
+        StateCase("state-id-first", "episode-a"),
+        StateCase("state-id-second", "episode-b"),
+    ]
+    trace_cases = [
+        TraceCase("trace-id-first", "episode-a"),
+        TraceCase("trace-id-second", "episode-b"),
+    ]
+    for case in (*state_cases, *trace_cases):
+        object.__setattr__(
+            case,
+            "episode_id",
+            ExplodingIdentifier(case.episode_id),
+        )
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        state_cases,
+        lambda _: _state_evidence(),
+        trace_cases,
+        lambda _: trace_evidence,
+    )
+
+    assert tuple(result.layer for result in suite.results) == (
+        "schema",
+        "denotation",
+        "state",
+        "trace",
+    )
+    assert suite.passed is False
+    diagnostic_text = " ".join(
+        f"{item.code} {item.message} {item.case_id}"
+        for result in suite.results
+        for item in result.diagnostics
+    )
+    assert "/private" not in diagnostic_text
+    assert "777" not in diagnostic_text
+
+
+def test_suite_rejects_denotation_content_changed_between_layers() -> None:
+    variant = _variant()
+    adapter = _IdentityAdapter(variant)
+    action = SemanticAction("search", {"value": "alpha"})
+    call = _surface_call()
+    step = DenotationCase(
+        "denotation-cross-layer",
+        call,
+        [action],
+        [[call]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+    replacement_action = SemanticAction("delete_all", {})
+    replacement_call = {"name": "delete_all", "arguments": {}}
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [replacement_action],
+        [[replacement_call]],
+        [[{"deleted": True}]],
+        {"deleted": True},
+    )
+
+    def state_provider(_: StateCase) -> StateEvidence:
+        _replace_denotation_case_content(step, replacement)
+        return _state_evidence()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        trace = ExecutionTrace(
+            [step.surface_call],
+            step.expected_actions,
+            step.expected_base_call_groups[0],
+        )
+        effect = _effect(step.expected_base_call_groups[0][0])
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [SchemaProbe("schema-cross-layer", "search", call, [action])],
+        [step],
+        [StateCase("state-cross-layer", "episode-cross-layer")],
+        state_provider,
+        [TraceCase("trace-cross-layer", "episode-cross-layer")],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_CROSS_LAYER_CASE_CONTENT")
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for item in suite.results[2].diagnostics
+    }
+
+
+def test_sha256_subclass_cannot_mask_changed_entry_content() -> None:
+    variant = _variant()
+    adapter = _IdentityAdapter(variant)
+    action = SemanticAction("search", {"value": "alpha"})
+    call = _surface_call()
+    step = DenotationCase(
+        "denotation-digest-subclass",
+        call,
+        [action],
+        [[call]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+    entry_fingerprint = step._snapshot_fingerprint
+    replacement_call = {"name": "delete_all", "arguments": {}}
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [SemanticAction("delete_all", {})],
+        [[replacement_call]],
+        [[{"deleted": True}]],
+        {"deleted": True},
+    )
+
+    def state_provider(_: StateCase) -> StateEvidence:
+        _replace_denotation_case_content(step, replacement)
+        object.__setattr__(
+            step,
+            "_snapshot_fingerprint",
+            _AlwaysEqualDigest(entry_fingerprint),
+        )
+        return _state_evidence()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        trace = ExecutionTrace(
+            [step.surface_call],
+            step.expected_actions,
+            step.expected_base_call_groups[0],
+        )
+        effect = _effect(step.expected_base_call_groups[0][0])
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [SchemaProbe("schema-digest-subclass", "search", call, [action])],
+        [step],
+        [StateCase("state-digest-subclass", "episode-digest-subclass")],
+        state_provider,
+        [TraceCase("trace-digest-subclass", "episode-digest-subclass")],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_NONEXACT_SHA256_VALUE")
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for item in suite.results[2].diagnostics
+    }
+
+
+def test_direct_checkers_reject_nonexact_private_digest_values() -> None:
+    variant = _variant()
+    action = SemanticAction("search", {"value": "alpha"})
+    call = _surface_call()
+
+    probe = SchemaProbe("schema-nonexact-digest", "search", call, [action])
+    object.__setattr__(
+        probe,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(probe._snapshot_fingerprint),
+    )
+    schema_result = check_schema_contract(variant, _IdentityAdapter(variant), [probe])
+
+    denotation_case = DenotationCase(
+        "denotation-nonexact-digest",
+        call,
+        [action],
+        [[call]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+    object.__setattr__(
+        denotation_case,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(denotation_case._snapshot_fingerprint),
+    )
+    denotation_result = check_denotation_contract(
+        _IdentityAdapter(variant),
+        [denotation_case],
+    )
+
+    state_case = StateCase("state-nonexact-digest", "episode-nonexact-digest")
+    object.__setattr__(
+        state_case,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(state_case._snapshot_fingerprint),
+    )
+    state_case_result = check_state_contract([state_case], lambda _: _state_evidence())
+    state_evidence = _state_evidence()
+    object.__setattr__(
+        state_evidence,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(state_evidence._snapshot_fingerprint),
+    )
+    state_evidence_result = check_state_contract(
+        [StateCase("state-evidence-digest", "episode-evidence-digest")],
+        lambda _: state_evidence,
+    )
+
+    step, trace_case, trace, effect = _single_step_trace_fixture()
+    trace_evidence = TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+    object.__setattr__(
+        trace_case,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(trace_case._snapshot_fingerprint),
+    )
+    trace_case_result = check_trace_contract(
+        _IdentityAdapter(variant),
+        [trace_case],
+        lambda _: trace_evidence,
+        [step],
+    )
+
+    step, trace_case, trace, effect = _single_step_trace_fixture()
+    trace_evidence = TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+    object.__setattr__(
+        trace_evidence,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(trace_evidence._snapshot_fingerprint),
+    )
+    trace_evidence_result = check_trace_contract(
+        _IdentityAdapter(variant),
+        [trace_case],
+        lambda _: trace_evidence,
+        [step],
+    )
+
+    step, trace_case, trace, effect = _single_step_trace_fixture()
+    trace_evidence = TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+    mutated_effect = trace_evidence.reference_effects[0]
+    object.__setattr__(
+        mutated_effect,
+        "_snapshot_fingerprint",
+        _AlwaysEqualDigest(mutated_effect._snapshot_fingerprint),
+    )
+    effect_result = check_trace_contract(
+        _IdentityAdapter(variant),
+        [trace_case],
+        lambda _: trace_evidence,
+        [step],
+    )
+
+    observed_codes = {
+        "schema": {item.code for item in schema_result.diagnostics},
+        "denotation": {item.code for item in denotation_result.diagnostics},
+        "state_case": {item.code for item in state_case_result.diagnostics},
+        "state_evidence": {item.code for item in state_evidence_result.diagnostics},
+        "trace_case": {item.code for item in trace_case_result.diagnostics},
+        "trace_evidence": {item.code for item in trace_evidence_result.diagnostics},
+        "effect": {item.code for item in effect_result.diagnostics},
+    }
+    expected_codes = {
+        "schema": "schema.invalid_probe",
+        "denotation": "denotation.invalid_case",
+        "state_case": "state.invalid_case",
+        "state_evidence": "state.provider_exception",
+        "trace_case": "trace.invalid_case",
+        "trace_evidence": "trace.provider_exception",
+        "effect": "trace.provider_exception",
+    }
+    assert {
+        name: expected
+        for name, expected in expected_codes.items()
+        if expected not in observed_codes[name]
+    } == {}
+
+
+def test_public_digest_and_identifier_subclasses_cannot_mask_mismatches() -> None:
+    state_case = StateCase("state-public-text", "episode-public-text")
+
+    def wrong_final_provider(_: StateCase) -> StateEvidence:
+        return _state_evidence(
+            candidate_final_sha256=_AlwaysEqualDigest("f" * 64),
+        )
+
+    def wrong_collateral_provider(_: StateCase) -> StateEvidence:
+        return _state_evidence(
+            candidate_collateral_digest=_AlwaysEqualDigest("collateral-extra"),
+        )
+
+    wrong_final = check_state_contract([state_case], wrong_final_provider)
+    wrong_collateral = check_state_contract([state_case], wrong_collateral_provider)
+
+    step, trace_case, trace, reference_effect = _single_step_trace_fixture()
+
+    def wrong_effect_provider(_: TraceCase) -> TraceEvidence:
+        candidate_effect = PhysicalCallEffect(
+            reference_effect.call_index,
+            reference_effect.base_call_fingerprint,
+            _AlwaysEqualDigest("effect-extra"),
+        )
+        return TraceEvidence(
+            trace,
+            trace,
+            [step],
+            1,
+            1,
+            [reference_effect],
+            [candidate_effect],
+        )
+
+    wrong_effect = check_trace_contract(
+        _IdentityAdapter(_variant()),
+        [trace_case],
+        wrong_effect_provider,
+        [step],
+    )
+
+    assert wrong_final.passed is False
+    assert wrong_collateral.passed is False
+    assert wrong_effect.passed is False
+
+
+def test_physical_call_index_subclass_cannot_mask_alignment_mismatch() -> None:
+    class AlwaysEqualIndex(int):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    step, trace_case, trace, effect = _single_step_trace_fixture()
+
+    def provider(_: TraceCase) -> TraceEvidence:
+        misaligned_effect = PhysicalCallEffect(
+            AlwaysEqualIndex(1),
+            effect.base_call_fingerprint,
+            effect.effect_digest,
+        )
+        return TraceEvidence(
+            trace,
+            trace,
+            [step],
+            1,
+            1,
+            [misaligned_effect],
+            [misaligned_effect],
+        )
+
+    result = check_trace_contract(
+        _IdentityAdapter(_variant()),
+        [trace_case],
+        provider,
+        [step],
+    )
+
+    assert result.passed is False
+
+
+def test_trace_provider_cannot_change_registered_step_content_in_place() -> None:
+    variant = _variant()
+    adapter = _IdentityAdapter(variant)
+    action = SemanticAction("search", {"value": "alpha"})
+    call = _surface_call()
+    step = DenotationCase(
+        "denotation-provider-mutation",
+        call,
+        [action],
+        [[call]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+    replacement_action = SemanticAction("delete_all", {})
+    replacement_call = {"name": "delete_all", "arguments": {}}
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [replacement_action],
+        [[replacement_call]],
+        [[{"deleted": True}]],
+        {"deleted": True},
+    )
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        _replace_denotation_case_content(step, replacement)
+        trace = ExecutionTrace(
+            [step.surface_call],
+            step.expected_actions,
+            step.expected_base_call_groups[0],
+        )
+        effect = _effect(step.expected_base_call_groups[0][0])
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [SchemaProbe("schema-provider-mutation", "search", call, [action])],
+        [step],
+        [StateCase("state-provider-mutation", "episode-provider-mutation")],
+        lambda _: _state_evidence(),
+        [TraceCase("trace-provider-mutation", "episode-provider-mutation")],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_PROVIDER_MUTATED_STEP")
+    assert "trace.verified_step_mutated" in {
+        item.code for item in suite.results[3].diagnostics
+    }
+
+
+def test_trace_provider_exception_still_checks_registered_step_content() -> None:
+    step, trace_case, _, _ = _single_step_trace_fixture()
+    replacement_call = {"name": "delete_all", "arguments": {}}
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [SemanticAction("delete_all", {})],
+        [[replacement_call]],
+        [[{"deleted": True}]],
+        {"deleted": True},
+    )
+
+    def provider(_: TraceCase) -> TraceEvidence:
+        _replace_denotation_case_content(step, replacement)
+        raise RuntimeError("provider payload /private/trace 779")
+
+    result = check_trace_contract(
+        _IdentityAdapter(_variant()),
+        [trace_case],
+        provider,
+        [step],
+    )
+    codes = {item.code for item in result.diagnostics}
+    diagnostic_text = " ".join(
+        f"{item.code} {item.message} {item.case_id}" for item in result.diagnostics
+    )
+
+    assert codes >= {"trace.provider_exception", "trace.verified_step_mutated"}
+    assert "/private" not in diagnostic_text
+    assert "779" not in diagnostic_text
+
+
+@pytest.mark.parametrize("mutated_layer", ["state", "trace"])
+def test_suite_rejects_provider_mutation_of_its_case_content(
+    mutated_layer: str,
+) -> None:
+    variant, adapter, probe, step, _, _, _ = _identity_suite_components()
+    checked_state = StateCase("state-provider-case", "episode-a")
+    replacement_state = StateCase("state-provider-case", "episode-b")
+    checked_trace = TraceCase("trace-provider-case", "episode-a")
+    replacement_trace = TraceCase("trace-provider-case", "episode-b")
+    state_cases = [
+        checked_state if mutated_layer == "state" else replacement_state
+    ]
+    trace_cases = [
+        replacement_trace if mutated_layer == "state" else checked_trace
+    ]
+
+    def state_provider(_: StateCase) -> StateEvidence:
+        if mutated_layer == "state":
+            _replace_state_case_content(checked_state, replacement_state)
+        return _state_evidence()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        if mutated_layer == "trace":
+            _replace_trace_case_content(checked_trace, replacement_trace)
+        call = step.surface_call
+        action = step.expected_actions[0]
+        trace = ExecutionTrace([call], [action], [call])
+        effect = _effect(call)
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        state_cases,
+        state_provider,
+        trace_cases,
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail(f"ADMITTED_MUTATED_{mutated_layer.upper()}_CASE")
+    layer_index = 2 if mutated_layer == "state" else 3
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for item in suite.results[layer_index].diagnostics
+    }
+
+
+def test_suite_checks_initial_variant_binding_after_each_layer() -> None:
+    variant, _, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    original_snapshot = SchemaVariant(
+        variant.variant_id,
+        variant.tools,
+        variant.manifest,
+    )
+    intermediate = SchemaVariant(
+        "intermediate-v1",
+        variant.tools,
+        {"operator": "intermediate", "seed": 11},
+    )
+    adapter = _LayerBoundaryVariantAdapter(variant, intermediate)
+
+    def state_provider(_: StateCase) -> StateEvidence:
+        _replace_variant_content(variant, intermediate)
+        adapter.begin_intermediate_window()
+        return _state_evidence()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        _replace_variant_content(variant, original_snapshot)
+        return trace_evidence
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        state_provider,
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_BETWEEN_LAYER_VARIANT_CHANGE")
+    assert "suite.variant_binding_mismatch" in {
+        item.code for item in suite.results[2].diagnostics
+    }
+
+
+def test_binding_check_side_effect_cannot_follow_final_case_validation() -> None:
+    variant, _, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    replacement_call = {"name": "delete_all", "arguments": {}}
+    replacement = DenotationCase(
+        step.case_id,
+        replacement_call,
+        [SemanticAction("delete_all", {})],
+        [[replacement_call]],
+        [[{"deleted": True}]],
+        {"deleted": True},
+    )
+
+    class SideEffectingBindingAdapter(_IdentityAdapter):
+        def __init__(self) -> None:
+            super().__init__(variant)
+            self.variant_reads_after_provider: int | None = None
+
+        @property
+        def variant(self) -> SchemaVariant:
+            if self.variant_reads_after_provider is not None:
+                self.variant_reads_after_provider += 1
+                if self.variant_reads_after_provider == 3:
+                    _replace_denotation_case_content(step, replacement)
+                    self.variant_reads_after_provider = None
+            return self._variant
+
+    adapter = SideEffectingBindingAdapter()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        adapter.variant_reads_after_provider = 0
+        return trace_evidence
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_MUTATION_AFTER_FINAL_CASE_VALIDATION")
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for item in suite.results[3].diagnostics
+    }
+
+
+def test_suite_never_admits_an_entry_case_repaired_after_snapshot() -> None:
+    variant = _variant()
+    action = SemanticAction("search", {"value": "alpha"})
+    call = _surface_call()
+    step = DenotationCase(
+        "denotation-invalid-at-entry",
+        call,
+        [action],
+        [[call]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+    replacement = DenotationCase(
+        step.case_id,
+        step.surface_call,
+        step.expected_actions,
+        step.expected_base_call_groups,
+        step.base_observation_groups,
+        step.expected_surface_observation,
+    )
+    object.__setattr__(step, "_snapshot_fingerprint", "a" * 64)
+
+    class RepairingAdapter(_IdentityAdapter):
+        def __init__(self) -> None:
+            super().__init__(variant)
+            self._repaired = False
+
+        def surface_to_semantic(
+            self, surface_call: Mapping[str, JSONValue]
+        ) -> tuple[SemanticAction, ...]:
+            if not self._repaired:
+                _replace_denotation_case_content(step, replacement)
+                self._repaired = True
+            return super().surface_to_semantic(surface_call)
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        trace = ExecutionTrace([call], [action], [call])
+        effect = _effect(call)
+        return TraceEvidence(trace, trace, [step], 1, 1, [effect], [effect])
+
+    suite = evaluate_contract_suite(
+        variant,
+        RepairingAdapter(),
+        [SchemaProbe("schema-repaired-entry", "search", call, [action])],
+        [step],
+        [StateCase("state-repaired-entry", "episode-repaired-entry")],
+        lambda _: _state_evidence(),
+        [TraceCase("trace-repaired-entry", "episode-repaired-entry")],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_REPAIRED_INVALID_ENTRY_CASE")
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for item in suite.results[0].diagnostics
+    }
+
+
+def test_suite_never_admits_a_state_case_repaired_after_snapshot() -> None:
+    variant, _, probe, step, _, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    state_case = StateCase("state-invalid-at-entry", trace_case.episode_id)
+    replacement = StateCase(state_case.case_id, state_case.episode_id)
+    object.__setattr__(state_case, "_snapshot_fingerprint", "a" * 64)
+
+    class RepairingAdapter(_IdentityAdapter):
+        def __init__(self) -> None:
+            super().__init__(variant)
+            self._repaired = False
+
+        def surface_to_semantic(
+            self, surface_call: Mapping[str, JSONValue]
+        ) -> tuple[SemanticAction, ...]:
+            if not self._repaired:
+                _replace_state_case_content(state_case, replacement)
+                self._repaired = True
+            return super().surface_to_semantic(surface_call)
+
+    suite = evaluate_contract_suite(
+        variant,
+        RepairingAdapter(),
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        lambda _: trace_evidence,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_REPAIRED_INVALID_STATE_CASE")
+    assert "suite.case_snapshot_mismatch" in {
+        item.code for item in suite.results[0].diagnostics
+    }
+
+
+def test_entry_snapshot_validation_checks_later_groups_after_invalid_entry() -> None:
+    class Entry:
+        _snapshot_fingerprint = "a" * 64
+
+    entry = Entry()
+    calls: list[object] = []
+
+    def reject(_: object) -> object:
+        raise ValueError("invalid entry")
+
+    def record(value: object) -> object:
+        calls.append(value)
+        return value
+
+    invalid_group = schema_contracts._validate_entry_case_group(
+        schema_contracts._capture_entry_case_group((object(),), Entry, reject)
+    )
+    valid_group = schema_contracts._validate_entry_case_group(
+        schema_contracts._capture_entry_case_group((entry,), Entry, record)
+    )
+    calls.clear()
+
+    assert schema_contracts._entry_case_groups_match(
+        (invalid_group, valid_group)
+    ) is False
+    assert calls == [entry]
 
 
 def test_suite_runs_all_four_layers_when_every_checker_raises(
@@ -2037,6 +3005,69 @@ def test_hard_admission_uses_external_provenance_for_evaluator_failure() -> None
 
     with pytest.raises(ValueError, match=r"provenance|mutated|issued"):
         require_dataset_admission(variant, suite)
+
+
+def test_external_provenance_rejects_nonexact_digest_values() -> None:
+    supplied_variant = _variant()
+    variant, suite = _evaluate_identity_components(
+        adapter_override=_BadSchemaAdapter(supplied_variant)
+    )
+    assert suite.passed is False
+
+    clean_results = tuple(
+        LayerContractResult(
+            result.layer,
+            result.fingerprint,
+            result.checks_run,
+            [],
+        )
+        for result in suite.results
+    )
+    aggregate = contract_suite_fingerprint(suite.schema_fingerprint, clean_results)
+    for result, clean in zip(suite.results, clean_results, strict=True):
+        disguised_snapshot = _AlwaysEqualDigest(clean._snapshot_fingerprint)
+        object.__setattr__(result, "diagnostics", ())
+        object.__setattr__(result, "_snapshot_fingerprint", disguised_snapshot)
+        object.__setattr__(
+            result,
+            "_sealed_snapshot_fingerprint",
+            disguised_snapshot,
+        )
+    object.__setattr__(suite, "fingerprint", aggregate)
+    admission_snapshot = schema_contracts._admission_snapshot_fingerprint(suite)
+    disguised_aggregate = _AlwaysEqualDigest(aggregate)
+    object.__setattr__(suite, "fingerprint", disguised_aggregate)
+    object.__setattr__(suite, "_sealed_fingerprint", disguised_aggregate)
+    object.__setattr__(
+        suite,
+        "_admission_snapshot_fingerprint",
+        _AlwaysEqualDigest(admission_snapshot),
+    )
+
+    with pytest.raises(ValueError, match=r"digest|fingerprint|provenance|mutated"):
+        _ = suite.passed
+    with pytest.raises(ValueError, match=r"digest|fingerprint|provenance|mutated"):
+        require_dataset_admission(variant, suite)
+
+
+def test_public_revalidation_rejects_tuple_subclasses_before_iteration() -> None:
+    class ExplodingTuple(tuple):
+        def __iter__(self):
+            raise RuntimeError("tuple payload /private/container 778")
+
+    result = LayerContractResult("schema", "a" * 64, 1, [])
+    object.__setattr__(result, "diagnostics", ExplodingTuple())
+    with pytest.raises(ValueError) as layer_error:
+        _ = result.passed
+    assert "/private" not in str(layer_error.value)
+    assert "778" not in str(layer_error.value)
+
+    _, suite = _evaluate_identity_components()
+    object.__setattr__(suite, "results", ExplodingTuple(suite.results))
+    with pytest.raises(ValueError) as suite_error:
+        _ = suite.passed
+    assert "/private" not in str(suite_error.value)
+    assert "778" not in str(suite_error.value)
 
 
 def test_suite_passed_revalidates_object_setattr_mutation() -> None:

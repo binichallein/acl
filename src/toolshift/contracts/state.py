@@ -111,7 +111,11 @@ def _validate_state_case(value: object) -> StateCase:
         raise ValueError("cases must contain only StateCase values")
     case = cast(StateCase, value)
     rebuilt = StateCase(case.case_id, case.episode_id)
-    if case._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        case._snapshot_fingerprint,
+        "state_case_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("state case has been mutated")
     return case
 
@@ -130,7 +134,11 @@ def _validate_state_evidence(value: object) -> StateEvidence:
         evidence.reference_collateral_digest,
         evidence.candidate_collateral_digest,
     )
-    if evidence._snapshot_fingerprint != rebuilt._snapshot_fingerprint:
+    snapshot_fingerprint = _require_sha256(
+        evidence._snapshot_fingerprint,
+        "state_evidence_snapshot_fingerprint",
+    )
+    if snapshot_fingerprint != rebuilt._snapshot_fingerprint:
         raise ValueError("state evidence has been mutated")
     return evidence
 
