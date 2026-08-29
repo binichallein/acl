@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
@@ -68,6 +69,19 @@ class _FakeModels(dict[str, _FakeAppModels]):
         assert self.clear_calls > 0, "cached record hashes must be cleared before lookup"
         self.lookups.append((app_name, model_name))
         return list(self._rows[(app_name, model_name)])
+
+
+class _RowSequence(Sequence[object]):
+    """Minimal non-list/tuple stand-in for AppWorld's database row shape."""
+
+    def __init__(self, *values: object) -> None:
+        self._values = values
+
+    def __getitem__(self, index: int | slice) -> object:
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 def _models(
@@ -142,6 +156,58 @@ def test_state_projection_sorts_records_by_native_id_then_record_hash() -> None:
     )
 
     assert canonical_state_sha256(models) == expected
+
+
+def test_state_projection_accepts_non_list_sequence_rows() -> None:
+    models = _FakeModels(
+        {"notes": ["Note"]},
+        {("notes", "Note"): [_RowSequence(1, "hash-a")]},  # type: ignore[list-item]
+    )
+    expected = manifest_sha256(
+        [
+            {
+                "app": "notes",
+                "models": [
+                    {"model": "Note", "records": [(1, "hash-a")]},
+                ],
+            }
+        ]
+    )
+
+    assert canonical_state_sha256(models) == expected
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _RowSequence(1),
+        _RowSequence(1, "hash-a", "extra"),
+        "ab",
+        b"ab",
+        bytearray(b"ab"),
+        {0: 1, 1: "hash-a"},
+        iter((1, "hash-a")),
+    ],
+    ids=[
+        "short-sequence",
+        "long-sequence",
+        "text",
+        "bytes",
+        "bytearray",
+        "mapping",
+        "iterator",
+    ],
+)
+def test_state_projection_rejects_malformed_or_unsafe_row_containers(
+    row: object,
+) -> None:
+    models = _FakeModels(
+        {"notes": ["Note"]},
+        {("notes", "Note"): [row]},  # type: ignore[list-item]
+    )
+
+    with pytest.raises(ValueError, match="pairs"):
+        canonical_state_sha256(models)
 
 
 @pytest.mark.parametrize(

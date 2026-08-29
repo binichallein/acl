@@ -565,7 +565,11 @@ def canonical_state_sha256(models: Any) -> str:
             raw_rows = ids_record_hashes(app_name, model_name)
             normalized_rows: list[tuple[object, object]] = []
             for row in raw_rows:
-                if not isinstance(row, (list, tuple)) or len(row) != 2:
+                if (
+                    isinstance(row, (str, bytes, bytearray, Mapping))
+                    or not isinstance(row, Sequence)
+                    or len(row) != 2
+                ):
                     raise ValueError("record hashes must contain (id, hash) pairs")
                 record_id, record_hash = row
                 if isinstance(record_id, bool) or not isinstance(record_id, int):
