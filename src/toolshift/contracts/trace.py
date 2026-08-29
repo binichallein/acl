@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from toolshift.adapters.semantic import SemanticAdapter
-from toolshift.contracts.denotation import DenotationCase, _validate_denotation_case
+from toolshift.contracts.denotation import (
+    DenotationCase,
+    _denotation_case_has_canonical_shape,
+    _validate_denotation_case,
+)
 from toolshift.contracts.schema import (
     LayerContractResult,
     _actions_equal,
@@ -24,7 +28,9 @@ from toolshift.types import (
     ExecutionTrace,
     JSONValue,
     SemanticAction,
+    _execution_trace_has_canonical_shape,
     _freeze_json_root,
+    _is_frozen_json,
     canonical_json_bytes,
 )
 
@@ -36,7 +42,7 @@ def base_call_fingerprint(call: Mapping[str, JSONValue]) -> str:
 
 
 def _snapshot_trace(value: object, context: str) -> ExecutionTrace:
-    if type(value) is not ExecutionTrace:
+    if not _execution_trace_has_canonical_shape(value):
         raise ValueError(f"{context} must be an ExecutionTrace")
     trace = cast(ExecutionTrace, value)
     actions = _snapshot_actions(trace.semantic_actions, f"{context} semantic actions")
@@ -126,8 +132,30 @@ class TraceCase:
         )
 
 
-def _snapshot_effect(value: object, context: str) -> PhysicalCallEffect:
+def _physical_effect_has_canonical_shape(value: object) -> bool:
     if type(value) is not PhysicalCallEffect:
+        return False
+    effect = cast(PhysicalCallEffect, value)
+    return (
+        type(object.__getattribute__(effect, "call_index")) is int
+        and type(object.__getattribute__(effect, "base_call_fingerprint")) is str
+        and type(object.__getattribute__(effect, "effect_digest")) is str
+        and type(object.__getattribute__(effect, "_snapshot_fingerprint")) is str
+    )
+
+
+def _trace_case_has_canonical_shape(value: object) -> bool:
+    if type(value) is not TraceCase:
+        return False
+    case = cast(TraceCase, value)
+    return all(
+        type(object.__getattribute__(case, name)) is str
+        for name in ("case_id", "episode_id", "_snapshot_fingerprint")
+    )
+
+
+def _snapshot_effect(value: object, context: str) -> PhysicalCallEffect:
+    if not _physical_effect_has_canonical_shape(value):
         raise ValueError(f"{context} must contain only PhysicalCallEffect values")
     effect = cast(PhysicalCallEffect, value)
     rebuilt = PhysicalCallEffect(
@@ -224,8 +252,42 @@ class TraceEvidenceProvider(Protocol):
         ...
 
 
+def _trace_evidence_has_canonical_shape(value: object) -> bool:
+    if type(value) is not TraceEvidence:
+        return False
+    evidence = cast(TraceEvidence, value)
+    candidate_steps = object.__getattribute__(evidence, "candidate_steps")
+    reference_effects = object.__getattribute__(evidence, "reference_effects")
+    candidate_effects = object.__getattribute__(evidence, "candidate_effects")
+    return (
+        _execution_trace_has_canonical_shape(
+            object.__getattribute__(evidence, "reference_trace")
+        )
+        and _execution_trace_has_canonical_shape(
+            object.__getattribute__(evidence, "candidate_trace")
+        )
+        and type(candidate_steps) is tuple
+        and all(
+            _denotation_case_has_canonical_shape(step) for step in candidate_steps
+        )
+        and _is_frozen_json(object.__getattribute__(evidence, "reference_score"))
+        and _is_frozen_json(object.__getattribute__(evidence, "candidate_score"))
+        and type(reference_effects) is tuple
+        and all(
+            _physical_effect_has_canonical_shape(effect)
+            for effect in reference_effects
+        )
+        and type(candidate_effects) is tuple
+        and all(
+            _physical_effect_has_canonical_shape(effect)
+            for effect in candidate_effects
+        )
+        and type(object.__getattribute__(evidence, "_snapshot_fingerprint")) is str
+    )
+
+
 def _validate_trace_case(value: object) -> TraceCase:
-    if type(value) is not TraceCase:
+    if not _trace_case_has_canonical_shape(value):
         raise ValueError("cases must contain only TraceCase values")
     case = cast(TraceCase, value)
     rebuilt = TraceCase(case.case_id, case.episode_id)
@@ -239,7 +301,7 @@ def _validate_trace_case(value: object) -> TraceCase:
 
 
 def _validate_trace_evidence(value: object) -> TraceEvidence:
-    if type(value) is not TraceEvidence:
+    if not _trace_evidence_has_canonical_shape(value):
         raise ValueError("provider must return TraceEvidence")
     evidence = cast(TraceEvidence, value)
     rebuilt = TraceEvidence(

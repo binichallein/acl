@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
+from types import MappingProxyType
 
 import pytest
 
@@ -1907,6 +1908,147 @@ def test_suite_captures_all_entry_digests_before_validating_any_case() -> None:
     }
 
 
+def test_entry_shape_check_never_invokes_injected_mapping_callback() -> None:
+    variant, adapter, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    rebound_variant = SchemaVariant(
+        "callback-rebound-v1",
+        variant.tools,
+        {"operator": "callback-rebound", "seed": 12},
+    )
+
+    class CallbackCall(Mapping[str, JSONValue]):
+        def __init__(self, values: Mapping[str, JSONValue]) -> None:
+            self._values = values
+            self.armed = False
+            self.fired = False
+
+        def __getitem__(self, key: str) -> JSONValue:
+            return self._values[key]
+
+        def __iter__(self):
+            if self.armed:
+                self.fired = True
+                adapter._variant = rebound_variant
+            return iter(self._values)
+
+        def __len__(self) -> int:
+            return len(self._values)
+
+    callback_call = CallbackCall(probe.surface_call)
+    object.__setattr__(probe, "surface_call", callback_call)
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        callback_call.armed = True
+        return trace_evidence
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_CALLBACK_CAPABLE_ENTRY_FIELD")
+    assert callback_call.fired is False
+    assert suite.passed is False
+
+
+def test_entry_shape_check_never_invokes_proxied_mapping_callback() -> None:
+    variant, adapter, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    rebound_variant = SchemaVariant(
+        "proxied-callback-v1",
+        variant.tools,
+        {"operator": "proxied-callback", "seed": 13},
+    )
+
+    class CallbackCall(Mapping[str, JSONValue]):
+        def __init__(self, values: Mapping[str, JSONValue]) -> None:
+            self._values = values
+            self.armed = False
+            self.fired = False
+
+        def __getitem__(self, key: str) -> JSONValue:
+            return self._values[key]
+
+        def __iter__(self):
+            if self.armed:
+                self.fired = True
+                adapter._variant = rebound_variant
+            return iter(self._values)
+
+        def __len__(self) -> int:
+            return len(self._values)
+
+    callback_call = CallbackCall(probe.surface_call)
+    object.__setattr__(probe, "surface_call", MappingProxyType(callback_call))
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        callback_call.armed = True
+        return trace_evidence
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_PROXIED_CALLBACK_ENTRY_FIELD")
+    assert callback_call.fired is False
+    assert suite.passed is False
+
+
+def test_action_shape_check_never_invokes_proxied_mapping_callback() -> None:
+    action = SemanticAction("search", {"value": "alpha"})
+
+    class CallbackArguments(Mapping[str, JSONValue]):
+        def __init__(self, values: Mapping[str, JSONValue]) -> None:
+            self._values = values
+            self.fired = False
+
+        def __getitem__(self, key: str) -> JSONValue:
+            return self._values[key]
+
+        def __iter__(self):
+            self.fired = True
+            return iter(self._values)
+
+        def __len__(self) -> int:
+            return len(self._values)
+
+    callback_arguments = CallbackArguments(action.arguments)
+    object.__setattr__(
+        action,
+        "arguments",
+        MappingProxyType(callback_arguments),
+    )
+
+    assert schema_contracts._semantic_action_has_canonical_shape(action) is False
+    assert callback_arguments.fired is False
+
+
 def test_suite_freezes_checked_state_episode_before_provider_can_swap_list() -> None:
     variant, adapter, probe, step, _, _, _ = _identity_suite_components()
     checked_state_case = StateCase("state-checked-episode", "episode-checked")
@@ -2606,6 +2748,58 @@ def test_binding_check_side_effect_cannot_follow_final_case_validation() -> None
     }
 
 
+def test_final_binding_check_uses_raw_adapter_slot_after_property_side_effect() -> None:
+    variant, _, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    replacement = SchemaVariant(
+        "getter-rebound-v1",
+        variant.tools,
+        {"operator": "getter-rebound", "seed": 14},
+    )
+
+    class SideEffectingGetterAdapter(_IdentityAdapter):
+        def __init__(self) -> None:
+            super().__init__(variant)
+            self.variant_reads_after_provider: int | None = None
+
+        @property
+        def variant(self) -> SchemaVariant:
+            current = self._variant
+            if self.variant_reads_after_provider is not None:
+                self.variant_reads_after_provider += 1
+                if self.variant_reads_after_provider == 3:
+                    self._variant = replacement
+                    self.variant_reads_after_provider = None
+            return current
+
+    adapter = SideEffectingGetterAdapter()
+
+    def trace_provider(_: TraceCase) -> TraceEvidence:
+        adapter.variant_reads_after_provider = 0
+        return trace_evidence
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        trace_provider,
+    )
+
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_PROPERTY_REBOUND_ADAPTER")
+    assert adapter._variant is replacement
+    assert suite.passed is False
+
+
 def test_suite_never_admits_an_entry_case_repaired_after_snapshot() -> None:
     variant = _variant()
     action = SemanticAction("search", {"value": "alpha"})
@@ -2726,10 +2920,14 @@ def test_entry_snapshot_validation_checks_later_groups_after_invalid_entry() -> 
         return value
 
     invalid_group = schema_contracts._validate_entry_case_group(
-        schema_contracts._capture_entry_case_group((object(),), Entry, reject)
+        schema_contracts._capture_entry_case_group(
+            (object(),), Entry, lambda _: True, reject
+        )
     )
     valid_group = schema_contracts._validate_entry_case_group(
-        schema_contracts._capture_entry_case_group((entry,), Entry, record)
+        schema_contracts._capture_entry_case_group(
+            (entry,), Entry, lambda _: True, record
+        )
     )
     calls.clear()
 

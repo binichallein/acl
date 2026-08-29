@@ -18,7 +18,15 @@ from toolshift.contracts.schema import (
     _snapshot_call,
     schema_fingerprint,
 )
-from toolshift.types import JSONValue, SemanticAction, _freeze_json_root, canonical_json_bytes
+from toolshift.types import (
+    JSONValue,
+    SemanticAction,
+    _freeze_json_root,
+    _is_frozen_json,
+    _is_frozen_mapping,
+    _semantic_action_has_canonical_shape,
+    canonical_json_bytes,
+)
 
 _BaseCallGroup: TypeAlias = tuple[Mapping[str, JSONValue], ...]
 _CompileRun: TypeAlias = tuple[tuple[_BaseCallGroup, ...], ...]
@@ -149,8 +157,42 @@ class DenotationCase:
         )
 
 
-def _validate_denotation_case(value: object) -> DenotationCase:
+def _denotation_case_has_canonical_shape(value: object) -> bool:
     if type(value) is not DenotationCase:
+        return False
+    case = cast(DenotationCase, value)
+    expected_actions = object.__getattribute__(case, "expected_actions")
+    base_call_groups = object.__getattribute__(case, "expected_base_call_groups")
+    observation_groups = object.__getattribute__(case, "base_observation_groups")
+    return (
+        type(object.__getattribute__(case, "case_id")) is str
+        and _is_frozen_mapping(object.__getattribute__(case, "surface_call"))
+        and type(expected_actions) is tuple
+        and all(
+            _semantic_action_has_canonical_shape(action)
+            for action in expected_actions
+        )
+        and type(base_call_groups) is tuple
+        and all(
+            type(group) is tuple
+            and all(_is_frozen_mapping(call) for call in group)
+            for group in base_call_groups
+        )
+        and type(observation_groups) is tuple
+        and all(
+            type(group) is tuple
+            and all(_is_frozen_json(observation) for observation in group)
+            for group in observation_groups
+        )
+        and _is_frozen_json(
+            object.__getattribute__(case, "expected_surface_observation")
+        )
+        and type(object.__getattribute__(case, "_snapshot_fingerprint")) is str
+    )
+
+
+def _validate_denotation_case(value: object) -> DenotationCase:
+    if not _denotation_case_has_canonical_shape(value):
         raise ValueError("cases must contain only DenotationCase values")
     case = cast(DenotationCase, value)
     rebuilt = DenotationCase(

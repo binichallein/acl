@@ -106,8 +106,38 @@ class StateEvidenceProvider(Protocol):
         ...
 
 
-def _validate_state_case(value: object) -> StateCase:
+def _state_case_has_canonical_shape(value: object) -> bool:
     if type(value) is not StateCase:
+        return False
+    case = cast(StateCase, value)
+    return all(
+        type(object.__getattribute__(case, name)) is str
+        for name in ("case_id", "episode_id", "_snapshot_fingerprint")
+    )
+
+
+def _state_evidence_has_canonical_shape(value: object) -> bool:
+    if type(value) is not StateEvidence:
+        return False
+    evidence = cast(StateEvidence, value)
+    return all(
+        type(object.__getattribute__(evidence, name)) is str
+        for name in (
+            "reference_initial_sha256",
+            "candidate_initial_sha256",
+            "reference_final_sha256",
+            "candidate_final_sha256",
+            "reference_post_reset_sha256",
+            "candidate_post_reset_sha256",
+            "reference_collateral_digest",
+            "candidate_collateral_digest",
+            "_snapshot_fingerprint",
+        )
+    )
+
+
+def _validate_state_case(value: object) -> StateCase:
+    if not _state_case_has_canonical_shape(value):
         raise ValueError("cases must contain only StateCase values")
     case = cast(StateCase, value)
     rebuilt = StateCase(case.case_id, case.episode_id)
@@ -121,7 +151,7 @@ def _validate_state_case(value: object) -> StateCase:
 
 
 def _validate_state_evidence(value: object) -> StateEvidence:
-    if type(value) is not StateEvidence:
+    if not _state_evidence_has_canonical_shape(value):
         raise ValueError("provider must return StateEvidence")
     evidence = cast(StateEvidence, value)
     rebuilt = StateEvidence(

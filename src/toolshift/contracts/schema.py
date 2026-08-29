@@ -16,6 +16,9 @@ from toolshift.types import (
     SemanticAction,
     SurfaceToolSpec,
     _freeze_mapping,
+    _is_frozen_mapping,
+    _schema_variant_has_canonical_shape,
+    _semantic_action_has_canonical_shape,
     canonical_json_bytes,
 )
 
@@ -26,6 +29,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LAYER_ATTESTATION = object()
 _SUITE_ATTESTATION = object()
 _INVALID_SUITE_SEQUENCE = object()
+_ADAPTER_VARIANT_SLOT = SemanticAdapter.__dict__["_variant"]
 
 
 def _require_safe_identifier(value: object, context: str) -> str:
@@ -56,6 +60,10 @@ def _require_non_blank_text(value: object, context: str) -> str:
     return value
 
 
+def _raw_adapter_variant(adapter: SemanticAdapter) -> object:
+    return _ADAPTER_VARIANT_SLOT.__get__(adapter, SemanticAdapter)
+
+
 def _fingerprint_parts(domain: bytes, parts: Sequence[bytes]) -> str:
     digest = hashlib.sha256(domain + b"\0")
     for part in parts:
@@ -64,7 +72,7 @@ def _fingerprint_parts(domain: bytes, parts: Sequence[bytes]) -> str:
 
 
 def _snapshot_action(value: object, context: str) -> SemanticAction:
-    if type(value) is not SemanticAction:
+    if not _semantic_action_has_canonical_shape(value):
         raise ValueError(f"{context} must contain only SemanticAction values")
     action = cast(SemanticAction, value)
     rebuilt = SemanticAction(action.name, action.arguments)
@@ -96,7 +104,7 @@ def _actions_equal(
 
 
 def _validate_schema_variant(variant: object) -> SchemaVariant:
-    if type(variant) is not SchemaVariant:
+    if not _schema_variant_has_canonical_shape(variant):
         raise ValueError("variant must be a SchemaVariant")
     typed = cast(SchemaVariant, variant)
     if type(typed.tools) is not tuple:
@@ -394,8 +402,26 @@ class SchemaProbe:
         )
 
 
-def _validate_schema_probe(value: object) -> SchemaProbe:
+def _schema_probe_has_canonical_shape(value: object) -> bool:
     if type(value) is not SchemaProbe:
+        return False
+    probe = cast(SchemaProbe, value)
+    expected_actions = object.__getattribute__(probe, "expected_actions")
+    return (
+        type(object.__getattribute__(probe, "case_id")) is str
+        and type(object.__getattribute__(probe, "surface_tool_name")) is str
+        and _is_frozen_mapping(object.__getattribute__(probe, "surface_call"))
+        and type(expected_actions) is tuple
+        and all(
+            _semantic_action_has_canonical_shape(action)
+            for action in expected_actions
+        )
+        and type(object.__getattribute__(probe, "_snapshot_fingerprint")) is str
+    )
+
+
+def _validate_schema_probe(value: object) -> SchemaProbe:
+    if not _schema_probe_has_canonical_shape(value):
         raise ValueError("probes must contain only SchemaProbe values")
     probe = cast(SchemaProbe, value)
     rebuilt = SchemaProbe(
@@ -455,8 +481,13 @@ def check_schema_contract(
         )
 
     try:
-        bound_fingerprint = schema_fingerprint(adapter.variant)
-        if validated_variant is None or bound_fingerprint != fingerprint:
+        public_bound_fingerprint = schema_fingerprint(adapter.variant)
+        raw_bound_fingerprint = schema_fingerprint(_raw_adapter_variant(adapter))
+        if (
+            validated_variant is None
+            or public_bound_fingerprint != fingerprint
+            or raw_bound_fingerprint != fingerprint
+        ):
             diagnostics.append(
                 _diagnostic("schema.variant_mismatch", "Adapter variant does not match schema")
             )
@@ -472,6 +503,8 @@ def check_schema_contract(
             return (
                 schema_fingerprint(variant) == fingerprint
                 and schema_fingerprint(adapter.variant) == fingerprint
+                and schema_fingerprint(_raw_adapter_variant(adapter))
+                == fingerprint
             )
         except Exception:
             return False
@@ -659,6 +692,7 @@ class _EntryCaseGroup:
 def _capture_entry_case_group(
     value: object,
     expected_type: type[object],
+    shape_validator: Callable[[object], bool],
     validator: Callable[[object], object],
     *,
     capture_episode_ids: bool = False,
@@ -672,6 +706,8 @@ def _capture_entry_case_group(
             all_valid = False
             continue
         try:
+            if not shape_validator(raw_case):
+                raise ValueError("case shape validation failed")
             fingerprint = _require_sha256(
                 object.__getattribute__(raw_case, "_snapshot_fingerprint"),
                 "case_snapshot_fingerprint",
@@ -756,16 +792,19 @@ def evaluate_contract_suite(
 
     from toolshift.contracts.denotation import (
         DenotationCase,
+        _denotation_case_has_canonical_shape,
         _validate_denotation_case,
         check_denotation_contract,
     )
     from toolshift.contracts.state import (
         StateCase,
+        _state_case_has_canonical_shape,
         _validate_state_case,
         check_state_contract,
     )
     from toolshift.contracts.trace import (
         TraceCase,
+        _trace_case_has_canonical_shape,
         _validate_trace_case,
         check_trace_contract,
     )
@@ -779,22 +818,26 @@ def evaluate_contract_suite(
         _capture_entry_case_group(
             schema_probes,
             SchemaProbe,
+            _schema_probe_has_canonical_shape,
             _validate_schema_probe,
         ),
         _capture_entry_case_group(
             denotation_cases,
             DenotationCase,
+            _denotation_case_has_canonical_shape,
             _validate_denotation_case,
         ),
         _capture_entry_case_group(
             state_cases,
             StateCase,
+            _state_case_has_canonical_shape,
             _validate_state_case,
             capture_episode_ids=True,
         ),
         _capture_entry_case_group(
             trace_cases,
             TraceCase,
+            _trace_case_has_canonical_shape,
             _validate_trace_case,
             capture_episode_ids=True,
         ),
@@ -809,21 +852,40 @@ def evaluate_contract_suite(
         variant_fingerprint = hashlib.sha256(b"toolshift.schema.invalid").hexdigest()
 
     try:
-        adapter_entry_fingerprint = schema_fingerprint(adapter.variant)
+        adapter_entry_variant = _raw_adapter_variant(adapter)
+        adapter_entry_fingerprint = schema_fingerprint(adapter_entry_variant)
     except Exception:
+        adapter_entry_variant = None
         adapter_entry_fingerprint = None
+
+    try:
+        adapter_public_entry_fingerprint = schema_fingerprint(adapter.variant)
+    except Exception:
+        adapter_public_entry_fingerprint = None
 
     entry_case_groups = tuple(
         _validate_entry_case_group(group) for group in raw_entry_case_groups
     )
 
-    def adapter_binding_matches() -> bool:
+    def adapter_public_binding_matches() -> bool:
         try:
+            return (
+                adapter_public_entry_fingerprint == variant_fingerprint
+                and schema_fingerprint(adapter.variant) == variant_fingerprint
+            )
+        except Exception:
+            return False
+
+    def adapter_raw_binding_matches() -> bool:
+        try:
+            current_adapter_variant = _raw_adapter_variant(adapter)
             return (
                 supplied_variant_valid
                 and adapter_entry_fingerprint == variant_fingerprint
+                and current_adapter_variant is adapter_entry_variant
                 and schema_fingerprint(variant) == variant_fingerprint
-                and schema_fingerprint(adapter.variant) == variant_fingerprint
+                and schema_fingerprint(current_adapter_variant)
+                == variant_fingerprint
             )
         except Exception:
             return False
@@ -835,9 +897,10 @@ def evaluate_contract_suite(
         nonlocal case_snapshot_mismatch_detected
         nonlocal variant_binding_mismatch_detected
         extra_diagnostics: list[ContractDiagnostic] = []
-        binding_matches = adapter_binding_matches()
+        public_binding_matches = adapter_public_binding_matches()
         case_snapshots_match = _entry_case_groups_match(entry_case_groups)
-        if not binding_matches:
+        raw_binding_matches = adapter_raw_binding_matches()
+        if not public_binding_matches or not raw_binding_matches:
             variant_binding_mismatch_detected = True
         if not case_snapshots_match:
             case_snapshot_mismatch_detected = True

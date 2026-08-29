@@ -277,6 +277,36 @@ def test_all_semantic_dataclasses_take_deep_immutable_snapshots() -> None:
         action.arguments["filters"].append("changed")  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize("operation", ["assign", "delete"])
+def test_frozen_json_mapping_rejects_slot_mutation(operation: str) -> None:
+    arguments = SemanticAction("search", {"query": "alpha"}).arguments
+    attribute = "_items"
+
+    with pytest.raises(AttributeError):
+        if operation == "assign":
+            setattr(arguments, attribute, ())
+        else:
+            delattr(arguments, attribute)
+
+
+def test_frozen_json_mapping_methods_reject_noncanonical_raw_items() -> None:
+    arguments = SemanticAction("search", {"query": "alpha"}).arguments
+
+    class CallbackTuple(tuple[object, ...]):
+        fired = False
+
+        def __iter__(self):
+            self.fired = True
+            return super().__iter__()
+
+    injected = CallbackTuple((("query", "changed"),))
+    object.__setattr__(arguments, "_items", injected)
+
+    with pytest.raises(ValueError, match="state"):
+        dict(arguments)
+    assert injected.fired is False
+
+
 @pytest.mark.parametrize(
     ("value", "context"),
     [

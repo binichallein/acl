@@ -5,9 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from types import MappingProxyType
 from typing import TypeAlias, cast
 
 JSONScalar: TypeAlias = bool | int | float | str | None
@@ -19,6 +18,42 @@ JSONValue: TypeAlias = (
 )
 _MAX_SAFE_INTEGER = 2**53 - 1
 _MAX_JSON_CONTAINER_DEPTH = 128
+
+
+class _FrozenJSONMapping(Mapping[str, JSONValue]):
+    """Private immutable mapping backed only by an exact tuple graph."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: tuple[tuple[str, JSONValue], ...]) -> None:
+        object.__setattr__(self, "_items", items)
+
+    def _raw_items(self) -> tuple[tuple[str, JSONValue], ...]:
+        items = object.__getattribute__(self, "_items")
+        if type(items) is not tuple:
+            raise ValueError("frozen mapping state is invalid")
+        for entry in items:
+            if type(entry) is not tuple or len(entry) != 2 or type(entry[0]) is not str:
+                raise ValueError("frozen mapping state is invalid")
+        return cast(tuple[tuple[str, JSONValue], ...], items)
+
+    def __getitem__(self, key: str) -> JSONValue:
+        for stored_key, value in self._raw_items():
+            if stored_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._raw_items())
+
+    def __len__(self) -> int:
+        return len(self._raw_items())
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("frozen JSON mappings are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("frozen JSON mappings are immutable")
 
 
 def _require_utf8_text(value: str, context: str) -> str:
@@ -82,7 +117,7 @@ def _freeze_json(
                     active,
                     container_depth + 1,
                 )
-            return MappingProxyType(frozen)
+            return _FrozenJSONMapping(tuple(frozen.items()))
         finally:
             active.remove(identity)
 
@@ -123,6 +158,61 @@ def _freeze_mapping(value: object, context: str) -> Mapping[str, JSONValue]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{context} must be a mapping")
     return cast(Mapping[str, JSONValue], _freeze_json_root(value, context))
+
+
+def _is_frozen_json(value: object) -> bool:
+    def visit(item: object, active: set[int], container_depth: int) -> bool:
+        if item is None or type(item) is bool:
+            return True
+        if type(item) is str:
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+            return True
+        if type(item) is int:
+            return -_MAX_SAFE_INTEGER <= item <= _MAX_SAFE_INTEGER
+        if type(item) is float:
+            return math.isfinite(item)
+        if type(item) not in (tuple, _FrozenJSONMapping):
+            return False
+        if container_depth >= _MAX_JSON_CONTAINER_DEPTH:
+            return False
+        identity = id(item)
+        if identity in active:
+            return False
+        active.add(identity)
+        try:
+            if type(item) is tuple:
+                return all(
+                    visit(child, active, container_depth + 1) for child in item
+                )
+            entries = object.__getattribute__(item, "_items")
+            if type(entries) is not tuple:
+                return False
+            keys: set[str] = set()
+            for entry in entries:
+                if type(entry) is not tuple or len(entry) != 2:
+                    return False
+                key = entry[0]
+                if type(key) is not str or key in keys:
+                    return False
+                try:
+                    key.encode("utf-8")
+                except UnicodeEncodeError:
+                    return False
+                keys.add(key)
+                if not visit(entry[1], active, container_depth + 1):
+                    return False
+            return True
+        finally:
+            active.remove(identity)
+
+    return visit(value, set(), 0)
+
+
+def _is_frozen_mapping(value: object) -> bool:
+    return type(value) is _FrozenJSONMapping and _is_frozen_json(value)
 
 
 def _freeze_call_sequence(
@@ -320,3 +410,62 @@ class ExecutionTrace:
             and self.semantic_actions == other.semantic_actions
             and self._base_calls_canonical == other._base_calls_canonical
         )
+
+
+def _semantic_action_has_canonical_shape(value: object) -> bool:
+    if type(value) is not SemanticAction:
+        return False
+    action = cast(SemanticAction, value)
+    return (
+        type(object.__getattribute__(action, "name")) is str
+        and _is_frozen_mapping(object.__getattribute__(action, "arguments"))
+        and type(object.__getattribute__(action, "_arguments_canonical")) is bytes
+    )
+
+
+def _surface_tool_spec_has_canonical_shape(value: object) -> bool:
+    if type(value) is not SurfaceToolSpec:
+        return False
+    tool = cast(SurfaceToolSpec, value)
+    return (
+        type(object.__getattribute__(tool, "name")) is str
+        and type(object.__getattribute__(tool, "description")) is str
+        and _is_frozen_mapping(object.__getattribute__(tool, "input_schema"))
+        and type(object.__getattribute__(tool, "_input_schema_canonical")) is bytes
+    )
+
+
+def _schema_variant_has_canonical_shape(value: object) -> bool:
+    if type(value) is not SchemaVariant:
+        return False
+    variant = cast(SchemaVariant, value)
+    tools = object.__getattribute__(variant, "tools")
+    return (
+        type(object.__getattribute__(variant, "variant_id")) is str
+        and type(tools) is tuple
+        and all(_surface_tool_spec_has_canonical_shape(tool) for tool in tools)
+        and _is_frozen_mapping(object.__getattribute__(variant, "manifest"))
+        and type(object.__getattribute__(variant, "_manifest_canonical")) is bytes
+    )
+
+
+def _execution_trace_has_canonical_shape(value: object) -> bool:
+    if type(value) is not ExecutionTrace:
+        return False
+    trace = cast(ExecutionTrace, value)
+    surface_calls = object.__getattribute__(trace, "surface_calls")
+    semantic_actions = object.__getattribute__(trace, "semantic_actions")
+    base_calls = object.__getattribute__(trace, "base_calls")
+    return (
+        type(surface_calls) is tuple
+        and all(_is_frozen_mapping(call) for call in surface_calls)
+        and type(semantic_actions) is tuple
+        and all(
+            _semantic_action_has_canonical_shape(action)
+            for action in semantic_actions
+        )
+        and type(base_calls) is tuple
+        and all(_is_frozen_mapping(call) for call in base_calls)
+        and type(object.__getattribute__(trace, "_surface_calls_canonical")) is bytes
+        and type(object.__getattribute__(trace, "_base_calls_canonical")) is bytes
+    )
