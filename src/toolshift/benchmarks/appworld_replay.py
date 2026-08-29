@@ -387,7 +387,7 @@ class ReplaySummary:
             and dict(self.split_counts) == OFFICIAL_SPLIT_COUNTS
             and self.task_count == OFFICIAL_TASK_COUNT
             and self.seed == FORMAL_SEED
-            and self.repetitions >= FORMAL_REPETITIONS
+            and self.repetitions == FORMAL_REPETITIONS
             and self.workers == 1
         )
         if self.gate_evaluable is not expected_gate_evaluable:
@@ -861,7 +861,7 @@ def _is_official_gate_protocol(
         and len(task_set.task_ids) == OFFICIAL_TASK_COUNT
         and dict(task_set.split_counts) == OFFICIAL_SPLIT_COUNTS
         and seed == FORMAL_SEED
-        and repetitions >= FORMAL_REPETITIONS
+        and repetitions == FORMAL_REPETITIONS
         and workers == 1
     )
 
@@ -1151,7 +1151,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--repetitions",
         type=int,
         default=FORMAL_REPETITIONS,
-        help="fresh worlds per task in formal mode (minimum: 3)",
+        help="fresh worlds per task in formal mode (exactly 3)",
     )
     return parser
 
@@ -1162,8 +1162,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
     if arguments.workers < 1:
         raise SystemExit("--workers must be at least 1")
-    if not arguments.smoke and arguments.repetitions < FORMAL_REPETITIONS:
-        raise SystemExit("formal replay requires at least 3 repetitions")
+    if not arguments.smoke and arguments.repetitions != FORMAL_REPETITIONS:
+        raise SystemExit("formal replay requires exactly 3 repetitions")
 
     require_pinned_appworld_revision(current_checkout_revision())
     task_set = load_appworld_task_set(smoke=arguments.smoke)

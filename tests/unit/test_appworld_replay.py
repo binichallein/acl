@@ -904,6 +904,54 @@ def test_formal_summary_passes_only_for_complete_fixed_official_protocol() -> No
     assert type(summary.episode_count) is int
 
 
+def test_four_repetitions_cannot_be_reported_as_preregistered_gate_evidence() -> None:
+    task_set = _official_task_set()
+    result = _task_result(_run(), _run(), _run(), _run())
+
+    summary = summarize_replays(
+        task_set,
+        [result] * 147,
+        mode=ReplayMode.GATE,
+        seed=100,
+        repetitions=4,
+        workers=1,
+    )
+
+    assert summary.episode_count == 588
+    assert summary.gate_evaluable is False
+    assert summary.gate_passed is False
+
+
+def test_summary_constructor_rejects_forged_four_repetition_gate_evidence() -> None:
+    summary = summarize_replays(
+        _official_task_set(),
+        [_task_result(_run(), _run(), _run())] * 147,
+        mode=ReplayMode.GATE,
+        seed=100,
+        repetitions=3,
+        workers=1,
+    )
+
+    with pytest.raises(ValueError, match="gate_evaluable"):
+        _reconstruct_summary(summary, repetitions=4, episode_count=588)
+
+
+def test_mutated_four_repetition_gate_is_rejected_at_public_boundary() -> None:
+    summary = summarize_replays(
+        _official_task_set(),
+        [_task_result(_run(), _run(), _run())] * 147,
+        mode=ReplayMode.GATE,
+        seed=100,
+        repetitions=3,
+        workers=1,
+    )
+    object.__setattr__(summary, "repetitions", 4)
+    object.__setattr__(summary, "episode_count", 588)
+
+    with pytest.raises(ValueError, match="gate_evaluable"):
+        exit_code_for_summary(summary)
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid_value", "message"),
     [
@@ -1335,6 +1383,27 @@ def test_cli_smoke_exit_zero_writes_non_gate_report(
     assert payload["mode"] == "smoke"
     assert payload["gate_evaluable"] is False
     assert payload["gate_passed"] is False
+
+
+def test_cli_rejects_four_formal_repetitions_before_runtime_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        replay_module,
+        "current_checkout_revision",
+        lambda: pytest.fail("runtime access must not occur"),
+    )
+
+    with pytest.raises(SystemExit, match="exactly 3 repetitions"):
+        replay_module.main(
+            [
+                "--output",
+                str(tmp_path / "formal.json"),
+                "--repetitions",
+                "4",
+            ]
+        )
 
 
 def test_cli_script_is_a_thin_delegating_entry_point() -> None:
