@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -34,6 +35,27 @@ _ALLOWED_SPLITS = frozenset(OFFICIAL_SPLIT_COUNTS)
 _EXECUTION_FAILURE_PREFIX = "Execution failed. Traceback:"
 _EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_CLEANUP_PHASES = frozenset(
+    {"constructor_close_all", "instance_close", "instance_close_all"}
+)
+
+
+class _AppWorldCleanupMarker(RuntimeError):
+    """Payload-free cleanup status attached to a preserved primary exception."""
+
+    def __init__(
+        self,
+        phase: str,
+        exception_type: str,
+        *,
+        fatal: bool,
+    ) -> None:
+        if phase not in _CLEANUP_PHASES:
+            raise ValueError("invalid cleanup phase")
+        if _EXCEPTION_TYPE_PATTERN.fullmatch(exception_type) is None:
+            raise ValueError("invalid cleanup exception type")
+        super().__init__(f"{phase}:{exception_type}")
+        self.fatal = fatal
 
 
 class ReplayMode(str, Enum):
@@ -239,9 +261,164 @@ class ReplaySummary:
     gate_passed: bool
     smoke_passed: bool
 
+    def __post_init__(self) -> None:
+        self._validate_integrity()
+
+    def _validate_integrity(self) -> None:
+        if not isinstance(self.mode, ReplayMode):
+            raise ValueError("mode must be a ReplayMode")
+        if self.pinned_appworld_commit != PINNED_APPWORLD_COMMIT:
+            raise ValueError("pinned_appworld_commit must match the fixed commit")
+        if (
+            not isinstance(self.splits, tuple)
+            or not self.splits
+            or tuple(sorted(self.splits)) != self.splits
+            or len(set(self.splits)) != len(self.splits)
+            or not set(self.splits).issubset(_ALLOWED_SPLITS)
+        ):
+            raise ValueError("splits must be a sorted train/dev tuple")
+        if (
+            not isinstance(self.task_set_sha256, str)
+            or _SHA256_PATTERN.fullmatch(self.task_set_sha256) is None
+        ):
+            raise ValueError("task_set_sha256 must be a lowercase SHA-256 fingerprint")
+
+        integer_minimums = {
+            "task_count": 1,
+            "repetitions": 2,
+            "episode_count": 1,
+            "seed": 0,
+            "workers": 1,
+            "execution_failure_count": 0,
+            "exception_count": 0,
+        }
+        for field_name, minimum in integer_minimums.items():
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(
+                    f"{field_name} must be an integer greater than or equal to {minimum}"
+                )
+
+        if not isinstance(self.split_counts, tuple):
+            raise ValueError("split_counts must be a tuple")
+        split_names: list[str] = []
+        split_total = 0
+        for item in self.split_counts:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError("split_counts must contain name/count pairs")
+            split_name, count = item
+            if split_name not in _ALLOWED_SPLITS:
+                raise ValueError("split_counts may contain only train/dev")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError("split_counts values must be positive integers")
+            split_names.append(split_name)
+            split_total += count
+        if tuple(split_names) != self.splits:
+            raise ValueError("split_counts names must exactly match splits")
+        if split_total != self.task_count:
+            raise ValueError("task_count must equal the split_counts total")
+        if self.episode_count != self.task_count * self.repetitions:
+            raise ValueError("episode_count must equal task_count times repetitions")
+        if self.execution_failure_count > self.episode_count:
+            raise ValueError("execution_failure_count cannot exceed episode_count")
+        if self.exception_count > self.execution_failure_count:
+            raise ValueError("exception_count cannot exceed execution_failure_count")
+
+        rate_fields = (
+            "initial_state_match_rate",
+            "final_state_match_rate",
+            "evaluator_match_rate",
+            "trace_match_rate",
+            "task_consistency_rate",
+            "oracle_success_rate",
+        )
+        for field_name in rate_fields:
+            value = getattr(self, field_name)
+            if type(value) is not float or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{field_name} must be a finite float in [0, 1]")
+        for field_name in (
+            "initial_state_match_rate",
+            "final_state_match_rate",
+            "evaluator_match_rate",
+            "trace_match_rate",
+            "oracle_success_rate",
+        ):
+            if self.task_consistency_rate > getattr(self, field_name):
+                raise ValueError(
+                    f"task_consistency_rate cannot exceed {field_name}"
+                )
+
+        if not isinstance(self.failure_counts, tuple):
+            raise ValueError("failure_counts must be a tuple")
+        failure_keys: list[str] = []
+        failure_total = 0
+        valid_stages = {stage.value for stage in ReplayStage}
+        for item in self.failure_counts:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError("failure_counts must contain key/count pairs")
+            failure_key, count = item
+            if not isinstance(failure_key, str):
+                raise ValueError("failure_counts keys must be text")
+            stage, separator, failure_kind = failure_key.partition(":")
+            if (
+                separator != ":"
+                or ":" in failure_kind
+                or stage not in valid_stages
+                or (
+                    failure_kind != "execution_traceback"
+                    and _EXCEPTION_TYPE_PATTERN.fullmatch(failure_kind) is None
+                )
+            ):
+                raise ValueError("failure_counts contains an unsafe key")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError("failure_counts values must be positive integers")
+            failure_keys.append(failure_key)
+            failure_total += count
+        if failure_keys != sorted(set(failure_keys)):
+            raise ValueError("failure_counts keys must be unique and sorted")
+        if failure_total != self.execution_failure_count:
+            raise ValueError("failure_counts must sum to execution_failure_count")
+
+        for field_name in ("gate_evaluable", "gate_passed", "smoke_passed"):
+            if type(getattr(self, field_name)) is not bool:
+                raise ValueError(f"{field_name} must be a boolean")
+        expected_gate_evaluable = (
+            self.mode is ReplayMode.GATE
+            and dict(self.split_counts) == OFFICIAL_SPLIT_COUNTS
+            and self.task_count == OFFICIAL_TASK_COUNT
+            and self.seed == FORMAL_SEED
+            and self.repetitions >= FORMAL_REPETITIONS
+            and self.workers == 1
+        )
+        if self.gate_evaluable is not expected_gate_evaluable:
+            raise ValueError("gate_evaluable does not match the fixed protocol")
+        metrics_pass = (
+            self.initial_state_match_rate == 1.0
+            and self.final_state_match_rate >= 0.99
+            and self.evaluator_match_rate >= 0.99
+            and self.trace_match_rate >= 0.99
+            and self.task_consistency_rate >= 0.99
+            and self.oracle_success_rate == 1.0
+            and self.execution_failure_count == 0
+            and self.exception_count == 0
+        )
+        if self.gate_passed is not (expected_gate_evaluable and metrics_pass):
+            raise ValueError("gate_passed does not match the fixed protocol and metrics")
+        expected_smoke_passed = (
+            self.mode is ReplayMode.SMOKE
+            and self.split_counts == (("train", 1),)
+            and self.seed == FORMAL_SEED
+            and self.repetitions == 2
+            and self.workers == 1
+            and metrics_pass
+        )
+        if self.smoke_passed is not expected_smoke_passed:
+            raise ValueError("smoke_passed does not match the fixed protocol and metrics")
+
     def to_dict(self) -> dict[str, object]:
         """Return the fixed aggregate report schema without raw task payloads."""
 
+        self._validate_integrity()
         return {
             "schema_version": 1,
             "mode": self.mode.value,
@@ -449,6 +626,52 @@ def _trace_sha256(requests: Any) -> str:
     return manifest_sha256(requests)
 
 
+def _cleanup_marker(
+    phase: str,
+    error: BaseException,
+    *,
+    fatal: bool,
+) -> _AppWorldCleanupMarker:
+    exception_type = type(error).__name__
+    if _EXCEPTION_TYPE_PATTERN.fullmatch(exception_type) is None:
+        exception_type = "BaseException"
+    return _AppWorldCleanupMarker(phase, exception_type, fatal=fatal)
+
+
+def _attempt_close_all(
+    close_all: Callable[[], object],
+    *,
+    phase: str,
+) -> _AppWorldCleanupMarker | None:
+    try:
+        close_all()
+    except BaseException as error:
+        return _cleanup_marker(phase, error, fatal=True)
+    return None
+
+
+def _attempt_world_cleanup(
+    world: Any,
+    close_all: Callable[[], object],
+) -> tuple[_AppWorldCleanupMarker | None, BaseException | None]:
+    try:
+        world.close()
+    except BaseException as error:
+        close_marker = _cleanup_marker("instance_close", error, fatal=False)
+        close_error = error
+    else:
+        return None, None
+    return (
+        _attempt_close_all(close_all, phase="instance_close_all") or close_marker,
+        close_error,
+    )
+
+
+def _has_fatal_cleanup_marker(error: BaseException) -> bool:
+    marker = error if isinstance(error, _AppWorldCleanupMarker) else error.__cause__
+    return isinstance(marker, _AppWorldCleanupMarker) and marker.fatal
+
+
 @contextmanager
 def managed_appworld_context(appworld_class: type[Any], **kwargs: object) -> Any:
     """Manage one instance with class-level cleanup only as a failure fallback."""
@@ -458,28 +681,28 @@ def managed_appworld_context(appworld_class: type[Any], **kwargs: object) -> Any
         raise ValueError("AppWorld class must provide close_all")
     try:
         world = appworld_class(**kwargs)
-    except BaseException:
-        try:
-            close_all()
-        except BaseException as cleanup_error:
-            raise RuntimeError(
-                "AppWorld global cleanup failed after constructor failure"
-            ) from cleanup_error
+    except BaseException as primary_error:
+        cleanup_marker = _attempt_close_all(
+            close_all,
+            phase="constructor_close_all",
+        )
+        if cleanup_marker is not None:
+            raise primary_error from cleanup_marker
         raise
 
     try:
         yield world
-    finally:
-        try:
-            world.close()
-        except BaseException:
-            try:
-                close_all()
-            except BaseException as cleanup_error:
-                raise RuntimeError(
-                    "AppWorld global cleanup failed after instance close failure"
-                ) from cleanup_error
-            raise
+    except BaseException as primary_error:
+        cleanup_marker, _ = _attempt_world_cleanup(world, close_all)
+        if cleanup_marker is not None:
+            raise primary_error from cleanup_marker
+        raise
+    else:
+        cleanup_marker, close_error = _attempt_world_cleanup(world, close_all)
+        if cleanup_marker is not None:
+            if not cleanup_marker.fatal and close_error is not None:
+                raise close_error
+            raise cleanup_marker
 
 
 @contextmanager
@@ -556,6 +779,8 @@ def _execute_single_replay(
 
             stage = ReplayStage.CLEANUP
     except Exception as error:
+        if _has_fatal_cleanup_marker(error):
+            raise
         return ReplayRun(
             initial_state_sha256=initial_digest,
             final_state_sha256=final_digest,
@@ -851,6 +1076,7 @@ def write_summary_json(path: str | Path, summary: ReplaySummary) -> None:
 
     if not isinstance(summary, ReplaySummary):
         raise ValueError("summary must be a ReplaySummary")
+    summary._validate_integrity()
     output_path = Path(path)
     if not output_path.name:
         raise ValueError("output path must name a JSON file")
@@ -890,6 +1116,9 @@ def write_summary_json(path: str | Path, summary: ReplaySummary) -> None:
 def exit_code_for_summary(summary: ReplaySummary) -> int:
     """Return success for a passed gate or lifecycle smoke, never for a failed gate."""
 
+    if not isinstance(summary, ReplaySummary):
+        raise ValueError("summary must be a ReplaySummary")
+    summary._validate_integrity()
     if summary.mode is ReplayMode.SMOKE:
         return 0 if summary.smoke_passed else 1
     if summary.mode is ReplayMode.GATE:

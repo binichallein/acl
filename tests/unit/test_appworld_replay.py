@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import AbstractContextManager
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -18,6 +18,7 @@ from toolshift.benchmarks.appworld_replay import (
     ReplayMode,
     ReplayRun,
     ReplayStage,
+    ReplaySummary,
     TaskReplayResult,
     TaskSet,
     build_task_set,
@@ -291,9 +292,9 @@ class _RecordingFactory:
 
 def _lifecycle_appworld_class(
     *,
-    constructor_error: Exception | None = None,
-    close_error: Exception | None = None,
-    close_all_error: Exception | None = None,
+    constructor_error: BaseException | None = None,
+    close_error: BaseException | None = None,
+    close_all_error: BaseException | None = None,
 ) -> type[object]:
     class LifecycleAppWorld:
         instances: ClassVar[list[LifecycleAppWorld]] = []
@@ -383,14 +384,103 @@ def test_managed_appworld_context_surfaces_failed_close_all_fallback() -> None:
     )
 
     with (
-        pytest.raises(RuntimeError, match="global cleanup failed") as error,
+        pytest.raises(RuntimeError, match="instance_close_all") as error,
         replay_module.managed_appworld_context(appworld_class),
     ):
         pass
 
-    assert type(error.value.__cause__) is RuntimeError
-    assert type(error.value.__cause__.__context__) is LookupError
+    assert "RuntimeError" in str(error.value)
+    assert "sensitive payload" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
     assert appworld_class.instances[0].close_calls == 1
+    assert appworld_class.close_all_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("failure_source", "primary_type"),
+    [
+        ("constructor", LookupError),
+        ("constructor", KeyboardInterrupt),
+        ("body", LookupError),
+        ("body", KeyboardInterrupt),
+    ],
+)
+def test_managed_context_preserves_primary_base_exception_when_cleanup_also_fails(
+    failure_source: str,
+    primary_type: type[BaseException],
+) -> None:
+    primary = primary_type("primary sensitive payload")
+    constructor_error = primary if failure_source == "constructor" else None
+    close_error = (
+        RuntimeError("instance cleanup sensitive payload")
+        if failure_source == "body"
+        else None
+    )
+    appworld_class = _lifecycle_appworld_class(
+        constructor_error=constructor_error,
+        close_error=close_error,
+        close_all_error=RuntimeError("global cleanup sensitive payload"),
+    )
+
+    with (
+        pytest.raises(primary_type) as caught,
+        replay_module.managed_appworld_context(appworld_class),
+    ):
+        if failure_source == "body":
+            raise primary
+        pytest.fail("constructor failure must prevent context entry")
+
+    assert caught.value is primary
+    cleanup_marker = caught.value.__cause__
+    assert cleanup_marker is not None
+    assert "close" in str(cleanup_marker).lower()
+    assert "RuntimeError" in str(cleanup_marker)
+    assert "sensitive payload" not in str(cleanup_marker)
+    assert cleanup_marker.__cause__ is None
+    assert cleanup_marker.__context__ is None
+
+
+def test_body_primary_is_preserved_when_global_cleanup_fallback_succeeds() -> None:
+    primary = LookupError("body primary")
+    appworld_class = _lifecycle_appworld_class(
+        close_error=RuntimeError("instance cleanup sensitive payload")
+    )
+
+    with (
+        pytest.raises(LookupError) as caught,
+        replay_module.managed_appworld_context(appworld_class),
+    ):
+        raise primary
+
+    assert caught.value is primary
+    assert caught.value.__cause__ is not None
+    assert "RuntimeError" in str(caught.value.__cause__)
+    assert "sensitive payload" not in str(caught.value.__cause__)
+    assert appworld_class.close_all_calls == 1
+
+
+def test_fatal_global_cleanup_contamination_aborts_repetition_run() -> None:
+    primary = LookupError("constructor primary")
+    appworld_class = _lifecycle_appworld_class(
+        constructor_error=primary,
+        close_all_error=RuntimeError("global cleanup sensitive payload"),
+    )
+
+    def factory(**kwargs: object) -> AbstractContextManager[object]:
+        return replay_module.managed_appworld_context(appworld_class, **kwargs)
+
+    with pytest.raises(LookupError) as caught:
+        run_task_repetitions(
+            "train-task-unit",
+            seed=100,
+            repetitions=2,
+            world_context_factory=factory,
+        )
+
+    assert caught.value is primary
+    assert "sensitive payload" not in str(caught.value.__cause__)
+    assert appworld_class.constructor_calls == 1
     assert appworld_class.close_all_calls == 1
 
 
@@ -699,6 +789,26 @@ def _official_task_set() -> object:
     )
 
 
+def _smoke_summary() -> ReplaySummary:
+    return summarize_replays(
+        build_task_set({"train": ["train-task-unit"]}),
+        [_task_result(_run(), _run())],
+        mode=ReplayMode.SMOKE,
+        seed=100,
+        repetitions=2,
+        workers=1,
+    )
+
+
+def _reconstruct_summary(
+    summary: ReplaySummary,
+    **changes: object,
+) -> ReplaySummary:
+    values = {definition.name: getattr(summary, definition.name) for definition in fields(summary)}
+    values.update(changes)
+    return ReplaySummary(**values)  # type: ignore[arg-type]
+
+
 def test_task_set_rejects_held_out_empty_duplicate_and_overlapping_ids() -> None:
     with pytest.raises(ValueError, match="allowed"):
         build_task_set({"test_normal": ["hidden"]})
@@ -792,6 +902,130 @@ def test_formal_summary_passes_only_for_complete_fixed_official_protocol() -> No
     assert summary.exception_count == 0
     assert summary.episode_count == 441
     assert type(summary.episode_count) is int
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("mode", "smoke", "mode"),
+        ("pinned_appworld_commit", "0" * 40, "commit"),
+        ("splits", ("train", "private/task"), "splits"),
+        ("split_counts", (("private/task", 1),), "split_counts"),
+        ("task_set_sha256", "0" * 63, "SHA-256"),
+        ("task_count", True, "task_count"),
+        ("task_count", -1, "task_count"),
+        ("repetitions", True, "repetitions"),
+        ("episode_count", -1, "episode_count"),
+        ("seed", -1, "seed"),
+        ("workers", 0, "workers"),
+        ("execution_failure_count", -1, "execution_failure_count"),
+        ("exception_count", -1, "exception_count"),
+        (
+            "failure_counts",
+            (("cleanup:RuntimeError:/private/path", 1),),
+            "failure_counts",
+        ),
+    ],
+)
+def test_replay_summary_constructor_rejects_forged_evidence_fields(
+    field_name: str,
+    invalid_value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _reconstruct_summary(_smoke_summary(), **{field_name: invalid_value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("initial_state_match_rate", 1),
+        ("final_state_match_rate", -0.1),
+        ("evaluator_match_rate", 99.0),
+        ("trace_match_rate", float("inf")),
+        ("task_consistency_rate", float("nan")),
+        ("oracle_success_rate", -0.1),
+    ],
+)
+def test_replay_summary_constructor_rejects_non_finite_or_out_of_range_rates(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        _reconstruct_summary(_smoke_summary(), **{field_name: invalid_value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "forged_value"),
+    [
+        ("gate_evaluable", True),
+        ("gate_passed", True),
+        ("smoke_passed", False),
+    ],
+)
+def test_replay_summary_constructor_rejects_forged_derived_flags(
+    field_name: str,
+    forged_value: bool,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        _reconstruct_summary(_smoke_summary(), **{field_name: forged_value})
+
+
+def test_replay_summary_rejects_joint_consistency_above_a_component_channel() -> None:
+    with pytest.raises(ValueError, match="task_consistency_rate"):
+        _reconstruct_summary(
+            _smoke_summary(),
+            final_state_match_rate=0.5,
+            smoke_passed=False,
+        )
+
+
+def test_replay_summary_rejects_inconsistent_failure_aggregates() -> None:
+    failed_run = _run(
+        final=None,
+        evaluator=None,
+        trace=None,
+        success=False,
+        execution_failed=True,
+        failure_stage=ReplayStage.EXECUTE_ORACLE,
+        exception_type="RuntimeError",
+    )
+    summary = summarize_replays(
+        build_task_set({"train": ["train-task-unit"]}),
+        [_task_result(failed_run, _run())],
+        mode=ReplayMode.SMOKE,
+        seed=100,
+        repetitions=2,
+        workers=1,
+    )
+
+    with pytest.raises(ValueError, match="failure_counts"):
+        _reconstruct_summary(
+            summary,
+            failure_counts=(("execute_oracle:RuntimeError", 2),),
+        )
+    with pytest.raises(ValueError, match="exception_count"):
+        _reconstruct_summary(summary, exception_count=2)
+
+
+@pytest.mark.parametrize("boundary", ["to_dict", "write", "exit_code"])
+def test_mutated_replay_summary_is_rejected_at_every_public_boundary(
+    boundary: str,
+    tmp_path: Path,
+) -> None:
+    summary = _smoke_summary()
+    object.__setattr__(summary, "task_set_sha256", "forged protected payload")
+    output = tmp_path / "reports" / "forged.json"
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        if boundary == "to_dict":
+            summary.to_dict()
+        elif boundary == "write":
+            write_summary_json(output, summary)
+        else:
+            assert exit_code_for_summary(summary) != 0
+
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
