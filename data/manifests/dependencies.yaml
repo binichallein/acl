@@ -1,0 +1,18 @@
+schema_version: 1
+dependencies:
+  appworld:
+    source: https://github.com/StonyBrookNLP/appworld
+    revision: a072b7a86e7c1d5b1d7175659d750ebb9b79f10a
+    status: verified
+  bfcl:
+    source: https://github.com/ShishirPatil/gorilla
+    revision: f7cf7359b7ac615a0b294831c5ba2bc95ee4a000
+    status: verified
+  training_framework:
+    source: https://github.com/volcengine/verl
+    revision: UNRESOLVED
+    status: candidate
+  base_model:
+    source: https://modelscope.cn/models/Qwen/Qwen3-4B
+    revision: UNRESOLVED
+    status: candidate

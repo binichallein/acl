@@ -1,0 +1,91 @@
+schema_version: 1
+kind: benchmark_environment_verification
+benchmark:
+  name: appworld
+  repository:
+    url: https://github.com/StonyBrookNLP/appworld.git
+    commit: a072b7a86e7c1d5b1d7175659d750ebb9b79f10a
+    checkout: detached
+  package:
+    version: 0.2.0.dev0
+    python_requires: ">=3.11"
+  runtime:
+    python_version: "3.11.15"
+installation:
+  uv_version: "0.11.8"
+  dependency_resolution: upstream_editable
+  project_training_dependency_lock:
+    status: not_completed
+    checksum: null
+data:
+  version: "0.2.0"
+  mode: minimal
+  version_files:
+    - path: data/version.txt
+      version: "0.2.0"
+    - path: data/base_dbs/version.txt
+      version: "0.2.0"
+  integrity:
+    official_manifest_available: false
+    official_checksum_available: false
+    official_content_checksum: UNRESOLVED
+    path_size_inventory:
+      record_count: 14885
+      sha256: 9a7f2826556f8aa18ecc34ebd96ab88ff9d40257ad220ee463e7904c1b8031e5
+      algorithm:
+        input_line: "<relative-path><TAB><decimal-byte-size><LF>"
+        relative_to: data/
+        sort_locale: C
+        sort_order: bytewise
+        exclude:
+          - "*/__pycache__/*"
+          - "*.pyc"
+          - "*.pyo"
+          - "*-journal"
+          - "*-wal"
+          - "*-shm"
+      content_integrity: false
+git_lfs:
+  version: "3.8.0"
+  pointer_worktree_object_hashes_matched: true
+  encrypted_bundles:
+    - path: generate/.source/data.bundle
+      bytes: 1508806
+      sha256: 42c2a3c929c60cc891c94e8924d8ce39c2ffd779bd51ca819b26944483de6106
+    - path: generate/.source/tasks.bundle
+      bytes: 163959
+      sha256: 471f225cf4d85db1ba61d24e2fef881afb68f4f9ca0b8bf76cde712745d60433
+    - path: src/appworld/.source/apps.bundle
+      bytes: 193950
+      sha256: 88d21fc526c1655bb3eee4adfca78ccac793921e4506f28f734ecdb19af77a62
+    - path: src/appworld/.source/tests.bundle
+      bytes: 204426
+      sha256: 04aa898cb015c53468c355d5ded662757c5234835a4de5cf4f7d7947bef159ec
+official_verification:
+  observed_at: "2026-08-29"
+  tests:
+    command: appworld verify tests
+    exit_code: 0
+    elapsed_seconds: 612
+    suite_summaries:
+      - passed: 1652
+        skipped: 0
+      - passed: 76
+        skipped: 0
+      - passed: 110
+        skipped: 2
+  tasks:
+    command: appworld verify tasks --num-processes 4
+    exit_code: 0
+    elapsed_seconds: 246
+    passed: 147
+    total: 147
+warnings:
+  - starlette_httpx_compatibility
+  - cryptography_cfb_deprecation
+license:
+  public_code: Apache-2.0
+  protected_code_and_data:
+    redistribution_constraint: >-
+      Public redistribution of protected content or its derivatives must remain encrypted.
+    protected_content_included: false
