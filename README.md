@@ -6,9 +6,14 @@ The project uses AppWorld as the primary stateful training and evaluation enviro
 
 ## Status
 
-The project is in the environment-validation and pilot-design phase. Results and model artifacts will be published only after reproducibility and data-license checks.
+The project is in the environment-validation and pilot-design phase. Results and model artifacts will be published only after reproducibility and data-license checks. Model training has not started.
 
-The local W1 project scaffold and system-configuration layer are under development. The remote AppWorld installation and smoke test on `ml2` have **not** been completed yet.
+The local W1 scaffold and system-configuration layer are complete. On `ml2`, the pinned AppWorld checkout has completed the official test and task verification commands. The reproducibility records and approved plans are:
+
+- [AppWorld `ml2` manifest](data/manifests/appworld-ml2.yaml)
+- [BFCL v4 manifest](data/manifests/bfcl-v4.yaml)
+- [Research design](docs/plans/2026-08-29-tool-interface-tail-rl-design.md)
+- [Implementation plan](docs/plans/2026-08-29-tool-interface-tail-rl-implementation-plan.md)
 
 ## Local development
 
@@ -30,7 +35,7 @@ ruff check .
 pytest
 ```
 
-The dependency candidates and their unresolved revisions are recorded in `data/manifests/dependencies.yaml`. Revisions must be replaced with verified immutable identifiers before the corresponding remote smoke test is declared reproducible.
+Verified AppWorld and BFCL revisions, together with the still-unresolved training-framework and base-model candidates, are recorded in `data/manifests/dependencies.yaml`. A candidate must receive a verified immutable identifier before its corresponding remote work is declared reproducible.
 
 ## Development principles
 
