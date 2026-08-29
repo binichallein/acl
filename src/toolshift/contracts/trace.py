@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from toolshift.adapters.semantic import SemanticAdapter
-from toolshift.contracts.denotation import (
-    DenotationCase,
-    _denotation_case_has_canonical_shape,
-    _validate_denotation_case,
-)
-from toolshift.contracts.schema import (
+from toolshift.contracts._common import (
+    ContractDiagnostic,
     LayerContractResult,
     _actions_equal,
     _diagnostic,
@@ -22,7 +18,12 @@ from toolshift.contracts.schema import (
     _require_safe_identifier,
     _require_sha256,
     _snapshot_actions,
-    schema_fingerprint,
+)
+from toolshift.contracts._schema import schema_fingerprint
+from toolshift.contracts.denotation import (
+    DenotationCase,
+    _denotation_case_has_canonical_shape,
+    _validate_denotation_case,
 )
 from toolshift.types import (
     ExecutionTrace,
@@ -190,9 +191,7 @@ class TraceEvidence:
         candidate_trace = _snapshot_trace(self.candidate_trace, "candidate_trace")
         if not isinstance(self.candidate_steps, (list, tuple)):
             raise ValueError("candidate_steps must be a list or tuple")
-        candidate_steps = tuple(
-            _validate_denotation_case(step) for step in self.candidate_steps
-        )
+        candidate_steps = tuple(_validate_denotation_case(step) for step in self.candidate_steps)
         reference_score = _freeze_json_root(self.reference_score, "reference_score")
         candidate_score = _freeze_json_root(self.candidate_score, "candidate_score")
         if not isinstance(self.reference_effects, (list, tuple)):
@@ -200,12 +199,10 @@ class TraceEvidence:
         if not isinstance(self.candidate_effects, (list, tuple)):
             raise ValueError("candidate_effects must be a list or tuple")
         reference_effects = tuple(
-            _snapshot_effect(effect, "reference_effects")
-            for effect in self.reference_effects
+            _snapshot_effect(effect, "reference_effects") for effect in self.reference_effects
         )
         candidate_effects = tuple(
-            _snapshot_effect(effect, "candidate_effects")
-            for effect in self.candidate_effects
+            _snapshot_effect(effect, "candidate_effects") for effect in self.candidate_effects
         )
         object.__setattr__(self, "reference_trace", reference_trace)
         object.__setattr__(self, "candidate_trace", candidate_trace)
@@ -230,12 +227,8 @@ class TraceEvidence:
                     (canonical_json_bytes(action.name), canonical_json_bytes(action.arguments))
                 )
         parts.extend(bytes.fromhex(step._snapshot_fingerprint) for step in candidate_steps)
-        parts.extend(
-            bytes.fromhex(effect._snapshot_fingerprint) for effect in reference_effects
-        )
-        parts.extend(
-            bytes.fromhex(effect._snapshot_fingerprint) for effect in candidate_effects
-        )
+        parts.extend(bytes.fromhex(effect._snapshot_fingerprint) for effect in reference_effects)
+        parts.extend(bytes.fromhex(effect._snapshot_fingerprint) for effect in candidate_effects)
         object.__setattr__(
             self,
             "_snapshot_fingerprint",
@@ -260,28 +253,18 @@ def _trace_evidence_has_canonical_shape(value: object) -> bool:
     reference_effects = object.__getattribute__(evidence, "reference_effects")
     candidate_effects = object.__getattribute__(evidence, "candidate_effects")
     return (
-        _execution_trace_has_canonical_shape(
-            object.__getattribute__(evidence, "reference_trace")
-        )
+        _execution_trace_has_canonical_shape(object.__getattribute__(evidence, "reference_trace"))
         and _execution_trace_has_canonical_shape(
             object.__getattribute__(evidence, "candidate_trace")
         )
         and type(candidate_steps) is tuple
-        and all(
-            _denotation_case_has_canonical_shape(step) for step in candidate_steps
-        )
+        and all(_denotation_case_has_canonical_shape(step) for step in candidate_steps)
         and _is_frozen_json(object.__getattribute__(evidence, "reference_score"))
         and _is_frozen_json(object.__getattribute__(evidence, "candidate_score"))
         and type(reference_effects) is tuple
-        and all(
-            _physical_effect_has_canonical_shape(effect)
-            for effect in reference_effects
-        )
+        and all(_physical_effect_has_canonical_shape(effect) for effect in reference_effects)
         and type(candidate_effects) is tuple
-        and all(
-            _physical_effect_has_canonical_shape(effect)
-            for effect in candidate_effects
-        )
+        and all(_physical_effect_has_canonical_shape(effect) for effect in candidate_effects)
         and type(object.__getattribute__(evidence, "_snapshot_fingerprint")) is str
     )
 
@@ -343,7 +326,7 @@ def _check_effect_alignment(
     case_id: str,
     base_calls: tuple[Mapping[str, JSONValue], ...],
     effects: tuple[PhysicalCallEffect, ...],
-    diagnostics: list,
+    diagnostics: list[ContractDiagnostic],
 ) -> None:
     if len(effects) != len(base_calls):
         diagnostics.append(
@@ -366,32 +349,16 @@ def _check_effect_alignment(
             )
 
 
-def check_trace_contract(
-    adapter: SemanticAdapter,
-    cases: Sequence[TraceCase],
-    provider: TraceEvidenceProvider,
-    verified_denotation_cases: Sequence[DenotationCase],
-) -> LayerContractResult:
-    """Verify reconstructed traces without rerunning per-step adapter mappings."""
-
-    diagnostics = []
-    try:
-        adapter_variant_fingerprint = schema_fingerprint(adapter.variant)
-    except Exception:
-        adapter_variant_fingerprint = None
-        diagnostics.append(_diagnostic("trace.invalid_adapter", "Adapter validation failed"))
-
-    def adapter_binding_matches() -> bool:
-        if adapter_variant_fingerprint is None:
-            return False
-        try:
-            return schema_fingerprint(adapter.variant) == adapter_variant_fingerprint
-        except Exception:
-            return False
-
-    if not isinstance(cases, (list, tuple)):
+def _collect_trace_cases(
+    cases: object,
+    diagnostics: list[ContractDiagnostic],
+) -> list[TraceCase]:
+    if type(cases) not in (list, tuple):
         diagnostics.append(
-            _diagnostic("trace.invalid_cases", "Trace cases must be a finite sequence")
+            _diagnostic(
+                "trace.invalid_cases",
+                "Trace cases must be an exact built-in list or tuple",
+            )
         )
         raw_cases: tuple[object, ...] = ()
     else:
@@ -412,7 +379,6 @@ def check_trace_contract(
             diagnostics.append(
                 _diagnostic("trace.invalid_case", "Trace case validation failed", case_id)
             )
-
     case_ids = [case.case_id for case in valid_cases]
     episode_ids = [case.episode_id for case in valid_cases]
     if len(case_ids) != len(set(case_ids)):
@@ -423,79 +389,293 @@ def check_trace_contract(
         diagnostics.append(
             _diagnostic("trace.duplicate_episode", "Trace episode identifiers must be unique")
         )
+    return valid_cases
 
+
+def _collect_verified_steps(
+    verified_cases: object,
+    diagnostics: list[ContractDiagnostic],
+) -> tuple[dict[str, DenotationCase], tuple[tuple[DenotationCase, str], ...], bool]:
     verified_by_id: dict[str, DenotationCase] = {}
     verified_snapshots: list[tuple[DenotationCase, str]] = []
-    if not isinstance(verified_denotation_cases, (list, tuple)):
+    container_is_exact = type(verified_cases) in (list, tuple)
+    if not container_is_exact:
         diagnostics.append(
             _diagnostic(
                 "trace.invalid_verified_steps",
-                "Verified denotation cases must be a finite sequence",
+                "Verified denotation cases must be an exact built-in list or tuple",
             )
         )
-    else:
-        for raw_step in verified_denotation_cases:
-            try:
-                step = _validate_denotation_case(raw_step)
-            except Exception:
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.invalid_verified_step",
-                        "Verified denotation case validation failed",
-                    )
-                )
-                continue
-            if step.case_id in verified_by_id:
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.duplicate_verified_step",
-                        "Verified denotation identifiers must be unique",
-                    )
-                )
-            else:
-                verified_by_id[step.case_id] = step
-            verified_snapshots.append((step, step._snapshot_fingerprint))
+        return verified_by_id, (), False
 
-    def verified_steps_match() -> bool:
-        for step, entry_fingerprint in verified_snapshots:
-            try:
-                current = _validate_denotation_case(step)
-                current_fingerprint = _require_sha256(
-                    current._snapshot_fingerprint,
-                    "denotation_case_fingerprint",
-                )
-            except Exception:
-                return False
-            if current is not step or current_fingerprint != entry_fingerprint:
-                return False
-        return True
-
-    fingerprint_parts = [
-        bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases
-    ]
-    surface_steps_run = 0
-    for case in valid_cases:
+    for raw_step in verified_cases:
         try:
-            evidence = _validate_trace_evidence(provider(case))
+            step = _validate_denotation_case(raw_step)
         except Exception:
             diagnostics.append(
                 _diagnostic(
-                    "trace.provider_exception",
-                    "Trace evidence provider raised or returned malformed evidence",
+                    "trace.invalid_verified_step",
+                    "Verified denotation case validation failed",
+                )
+            )
+            continue
+        if step.case_id in verified_by_id:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.duplicate_verified_step",
+                    "Verified denotation identifiers must be unique",
+                )
+            )
+        else:
+            verified_by_id[step.case_id] = step
+        verified_snapshots.append((step, step._snapshot_fingerprint))
+    return verified_by_id, tuple(verified_snapshots), True
+
+
+def _verified_steps_match(
+    snapshots: tuple[tuple[DenotationCase, str], ...],
+) -> bool:
+    for step, entry_fingerprint in snapshots:
+        try:
+            current = _validate_denotation_case(step)
+            current_fingerprint = _require_sha256(
+                current._snapshot_fingerprint,
+                "denotation_case_fingerprint",
+            )
+        except Exception:
+            return False
+        if current is not step or current_fingerprint != entry_fingerprint:
+            return False
+    return True
+
+
+def _reconstruct_candidate_trace(
+    case: TraceCase,
+    evidence: TraceEvidence,
+    verified_by_id: dict[str, DenotationCase],
+    diagnostics: list[ContractDiagnostic],
+) -> ExecutionTrace:
+    reconstructed_surface: list[Mapping[str, JSONValue]] = []
+    reconstructed_actions: list[SemanticAction] = []
+    reconstructed_base: list[Mapping[str, JSONValue]] = []
+    for step in evidence.candidate_steps:
+        registered = verified_by_id.get(step.case_id)
+        if registered is not step:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.unverified_step",
+                    "Candidate trace contains an unverified denotation object",
                     case.case_id,
                 )
             )
-            fingerprint_parts.append(b"provider-error")
-            if not verified_steps_match():
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.verified_step_mutated",
-                        "Verified denotation content changed during trace evidence collection",
-                        case.case_id,
-                    )
+        if not _validate_step_structure(step):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.invalid_step_structure",
+                    "Candidate denotation step has invalid group structure",
+                    case.case_id,
                 )
-            continue
-        if not verified_steps_match():
+            )
+        reconstructed_surface.append(step.surface_call)
+        reconstructed_actions.extend(step.expected_actions)
+        for group in step.expected_base_call_groups:
+            reconstructed_base.extend(group)
+    return ExecutionTrace(
+        reconstructed_surface,
+        reconstructed_actions,
+        reconstructed_base,
+    )
+
+
+def _check_reconstructed_channels(
+    case: TraceCase,
+    reconstructed: ExecutionTrace,
+    candidate: ExecutionTrace,
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    if not _call_sequences_equal(reconstructed.surface_calls, candidate.surface_calls):
+        diagnostics.append(
+            _diagnostic(
+                "trace.surface_reconstruction_mismatch",
+                "Reconstructed surface calls differ from candidate trace",
+                case.case_id,
+            )
+        )
+    if not _actions_equal(reconstructed.semantic_actions, candidate.semantic_actions):
+        diagnostics.append(
+            _diagnostic(
+                "trace.semantic_reconstruction_mismatch",
+                "Reconstructed semantic actions differ from candidate trace",
+                case.case_id,
+            )
+        )
+    if not _call_sequences_equal(reconstructed.base_calls, candidate.base_calls):
+        diagnostics.append(
+            _diagnostic(
+                "trace.base_reconstruction_mismatch",
+                "Reconstructed base calls differ from candidate trace",
+                case.case_id,
+            )
+        )
+
+
+def _check_canonical_trace_semantics(
+    adapter: SemanticAdapter,
+    case: TraceCase,
+    evidence: TraceEvidence,
+    reconstructed: ExecutionTrace,
+    binding_matches: Callable[[], bool],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    variant_rebound = False
+    try:
+        try:
+            reference_semantics = adapter.canonicalize_trace(evidence.reference_trace)
+        finally:
+            if not binding_matches():
+                variant_rebound = True
+        try:
+            candidate_semantics = adapter.canonicalize_trace(evidence.candidate_trace)
+        finally:
+            if not binding_matches():
+                variant_rebound = True
+        if not isinstance(reference_semantics, tuple) or not isinstance(candidate_semantics, tuple):
+            raise ValueError("canonical semantics must be tuples")
+        reference_semantics = _snapshot_actions(
+            reference_semantics,
+            "reference canonical semantics",
+        )
+        candidate_semantics = _snapshot_actions(
+            candidate_semantics,
+            "candidate canonical semantics",
+        )
+        if (
+            not _actions_equal(candidate_semantics, reconstructed.semantic_actions)
+            or not _actions_equal(
+                candidate_semantics,
+                evidence.candidate_trace.semantic_actions,
+            )
+            or not _actions_equal(
+                reference_semantics,
+                evidence.reference_trace.semantic_actions,
+            )
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.canonical_semantic_channel_mismatch",
+                    "Candidate canonical semantics differ from reconstructed actions",
+                    case.case_id,
+                )
+            )
+        if not _actions_equal(reference_semantics, candidate_semantics):
+            diagnostics.append(
+                _diagnostic(
+                    "trace.semantic_mismatch",
+                    "Reference and candidate canonical semantics differ",
+                    case.case_id,
+                )
+            )
+    except Exception:
+        diagnostics.append(
+            _diagnostic(
+                "trace.canonicalization_exception",
+                "Trace canonicalization raised or returned malformed actions",
+                case.case_id,
+            )
+        )
+    if variant_rebound:
+        diagnostics.append(
+            _diagnostic(
+                "trace.variant_rebound",
+                "Adapter variant changed during trace canonicalization",
+                case.case_id,
+            )
+        )
+
+
+def _check_trace_effects_and_score(
+    case: TraceCase,
+    evidence: TraceEvidence,
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    if not _call_sequences_equal(
+        evidence.reference_trace.base_calls,
+        evidence.candidate_trace.base_calls,
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "trace.base_call_mismatch",
+                "Reference and candidate base call order differs",
+                case.case_id,
+            )
+        )
+    _check_effect_alignment(
+        side="reference",
+        case_id=case.case_id,
+        base_calls=evidence.reference_trace.base_calls,
+        effects=evidence.reference_effects,
+        diagnostics=diagnostics,
+    )
+    _check_effect_alignment(
+        side="candidate",
+        case_id=case.case_id,
+        base_calls=evidence.candidate_trace.base_calls,
+        effects=evidence.candidate_effects,
+        diagnostics=diagnostics,
+    )
+    if len(evidence.reference_effects) == len(evidence.candidate_effects) and any(
+        (
+            reference.call_index != candidate.call_index
+            or reference.base_call_fingerprint != candidate.base_call_fingerprint
+            or reference.effect_digest != candidate.effect_digest
+        )
+        for reference, candidate in zip(
+            evidence.reference_effects,
+            evidence.candidate_effects,
+            strict=True,
+        )
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "trace.effect_mismatch",
+                "Reference and candidate physical effects differ",
+                case.case_id,
+            )
+        )
+    if canonical_json_bytes(evidence.reference_score) != canonical_json_bytes(
+        evidence.candidate_score
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "trace.score_mismatch",
+                "Reference and candidate scores differ",
+                case.case_id,
+            )
+        )
+
+
+def _check_trace_case(
+    adapter: SemanticAdapter,
+    case: TraceCase,
+    provider: TraceEvidenceProvider,
+    verified_by_id: dict[str, DenotationCase],
+    verified_snapshots: tuple[tuple[DenotationCase, str], ...],
+    binding_matches: Callable[[], bool],
+    fingerprint_parts: list[bytes],
+    diagnostics: list[ContractDiagnostic],
+) -> int:
+    try:
+        evidence = _validate_trace_evidence(provider(case))
+    except Exception:
+        diagnostics.append(
+            _diagnostic(
+                "trace.provider_exception",
+                "Trace evidence provider raised or returned malformed evidence",
+                case.case_id,
+            )
+        )
+        fingerprint_parts.append(b"provider-error")
+        if not _verified_steps_match(verified_snapshots):
             diagnostics.append(
                 _diagnostic(
                     "trace.verified_step_mutated",
@@ -503,205 +683,95 @@ def check_trace_contract(
                     case.case_id,
                 )
             )
-        fingerprint_parts.append(bytes.fromhex(evidence._snapshot_fingerprint))
-        surface_steps_run += len(evidence.candidate_steps)
-        if not evidence.candidate_steps:
-            diagnostics.append(
-                _diagnostic(
-                    "trace.empty_steps",
-                    "Candidate trace must contain a verified surface step",
-                    case.case_id,
-                )
+        return 0
+    if not _verified_steps_match(verified_snapshots):
+        diagnostics.append(
+            _diagnostic(
+                "trace.verified_step_mutated",
+                "Verified denotation content changed during trace evidence collection",
+                case.case_id,
             )
-
-        reconstructed_surface: list[Mapping[str, JSONValue]] = []
-        reconstructed_actions: list[SemanticAction] = []
-        reconstructed_base: list[Mapping[str, JSONValue]] = []
-        for step in evidence.candidate_steps:
-            registered = verified_by_id.get(step.case_id)
-            if registered is not step:
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.unverified_step",
-                        "Candidate trace contains an unverified denotation object",
-                        case.case_id,
-                    )
-                )
-            if not _validate_step_structure(step):
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.invalid_step_structure",
-                        "Candidate denotation step has invalid group structure",
-                        case.case_id,
-                    )
-                )
-            reconstructed_surface.append(step.surface_call)
-            reconstructed_actions.extend(step.expected_actions)
-            for group in step.expected_base_call_groups:
-                reconstructed_base.extend(group)
-
-        reconstructed = ExecutionTrace(
-            reconstructed_surface,
-            reconstructed_actions,
-            reconstructed_base,
         )
-        if not _call_sequences_equal(
-            reconstructed.surface_calls, evidence.candidate_trace.surface_calls
-        ):
-            diagnostics.append(
-                _diagnostic(
-                    "trace.surface_reconstruction_mismatch",
-                    "Reconstructed surface calls differ from candidate trace",
-                    case.case_id,
-                )
+    fingerprint_parts.append(bytes.fromhex(evidence._snapshot_fingerprint))
+    if not evidence.candidate_steps:
+        diagnostics.append(
+            _diagnostic(
+                "trace.empty_steps",
+                "Candidate trace must contain a verified surface step",
+                case.case_id,
             )
-        if not _actions_equal(
-            reconstructed.semantic_actions, evidence.candidate_trace.semantic_actions
-        ):
-            diagnostics.append(
-                _diagnostic(
-                    "trace.semantic_reconstruction_mismatch",
-                    "Reconstructed semantic actions differ from candidate trace",
-                    case.case_id,
-                )
-            )
-        if not _call_sequences_equal(
-            reconstructed.base_calls, evidence.candidate_trace.base_calls
-        ):
-            diagnostics.append(
-                _diagnostic(
-                    "trace.base_reconstruction_mismatch",
-                    "Reconstructed base calls differ from candidate trace",
-                    case.case_id,
-                )
-            )
+        )
+    reconstructed = _reconstruct_candidate_trace(
+        case,
+        evidence,
+        verified_by_id,
+        diagnostics,
+    )
+    _check_reconstructed_channels(
+        case,
+        reconstructed,
+        evidence.candidate_trace,
+        diagnostics,
+    )
+    _check_canonical_trace_semantics(
+        adapter,
+        case,
+        evidence,
+        reconstructed,
+        binding_matches,
+        diagnostics,
+    )
+    _check_trace_effects_and_score(case, evidence, diagnostics)
+    return len(evidence.candidate_steps)
 
-        variant_rebound = False
+
+def check_trace_contract(
+    adapter: SemanticAdapter,
+    cases: list[TraceCase] | tuple[TraceCase, ...],
+    provider: TraceEvidenceProvider,
+    verified_denotation_cases: list[DenotationCase] | tuple[DenotationCase, ...],
+) -> LayerContractResult:
+    """Verify exact built-in list or tuple inputs without rerunning step mappings.
+
+    Candidate steps must be the same objects as already-verified denotation cases;
+    their identity and snapshots are checked around provider execution. Rebuilt
+    surface, semantic, and base channels, physical effects, and JSON-typed score
+    evidence must match the reference trace exactly and in order.
+    """
+
+    diagnostics: list[ContractDiagnostic] = []
+    try:
+        adapter_variant_fingerprint = schema_fingerprint(adapter.variant)
+    except Exception:
+        adapter_variant_fingerprint = None
+        diagnostics.append(_diagnostic("trace.invalid_adapter", "Adapter validation failed"))
+
+    def adapter_binding_matches() -> bool:
+        if adapter_variant_fingerprint is None:
+            return False
         try:
-            try:
-                reference_semantics = adapter.canonicalize_trace(
-                    evidence.reference_trace
-                )
-            finally:
-                if not adapter_binding_matches():
-                    variant_rebound = True
-            try:
-                candidate_semantics = adapter.canonicalize_trace(
-                    evidence.candidate_trace
-                )
-            finally:
-                if not adapter_binding_matches():
-                    variant_rebound = True
-            if not isinstance(reference_semantics, tuple) or not isinstance(
-                candidate_semantics, tuple
-            ):
-                raise ValueError("canonical semantics must be tuples")
-            reference_semantics = _snapshot_actions(
-                reference_semantics, "reference canonical semantics"
-            )
-            candidate_semantics = _snapshot_actions(
-                candidate_semantics, "candidate canonical semantics"
-            )
-            if (
-                not _actions_equal(candidate_semantics, reconstructed.semantic_actions)
-                or not _actions_equal(
-                    candidate_semantics,
-                    evidence.candidate_trace.semantic_actions,
-                )
-                or not _actions_equal(
-                    reference_semantics,
-                    evidence.reference_trace.semantic_actions,
-                )
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.canonical_semantic_channel_mismatch",
-                        "Candidate canonical semantics differ from reconstructed actions",
-                        case.case_id,
-                    )
-                )
-            if not _actions_equal(reference_semantics, candidate_semantics):
-                diagnostics.append(
-                    _diagnostic(
-                        "trace.semantic_mismatch",
-                        "Reference and candidate canonical semantics differ",
-                        case.case_id,
-                    )
-                )
+            return schema_fingerprint(adapter.variant) == adapter_variant_fingerprint
         except Exception:
-            diagnostics.append(
-                _diagnostic(
-                    "trace.canonicalization_exception",
-                    "Trace canonicalization raised or returned malformed actions",
-                    case.case_id,
-                )
-            )
-        if variant_rebound:
-            diagnostics.append(
-                _diagnostic(
-                    "trace.variant_rebound",
-                    "Adapter variant changed during trace canonicalization",
-                    case.case_id,
-                )
-            )
+            return False
 
-        if not _call_sequences_equal(
-            evidence.reference_trace.base_calls,
-            evidence.candidate_trace.base_calls,
-        ):
-            diagnostics.append(
-                _diagnostic(
-                    "trace.base_call_mismatch",
-                    "Reference and candidate base call order differs",
-                    case.case_id,
-                )
-            )
-
-        _check_effect_alignment(
-            side="reference",
-            case_id=case.case_id,
-            base_calls=evidence.reference_trace.base_calls,
-            effects=evidence.reference_effects,
-            diagnostics=diagnostics,
+    valid_cases = _collect_trace_cases(cases, diagnostics)
+    verified_by_id, verified_snapshots, verified_container_is_exact = _collect_verified_steps(
+        verified_denotation_cases, diagnostics
+    )
+    fingerprint_parts = [bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases]
+    surface_steps_run = 0
+    provider_cases = valid_cases if verified_container_is_exact else ()
+    for case in provider_cases:
+        surface_steps_run += _check_trace_case(
+            adapter,
+            case,
+            provider,
+            verified_by_id,
+            verified_snapshots,
+            adapter_binding_matches,
+            fingerprint_parts,
+            diagnostics,
         )
-        _check_effect_alignment(
-            side="candidate",
-            case_id=case.case_id,
-            base_calls=evidence.candidate_trace.base_calls,
-            effects=evidence.candidate_effects,
-            diagnostics=diagnostics,
-        )
-        if len(evidence.reference_effects) == len(evidence.candidate_effects) and any(
-            (
-                reference.call_index != candidate.call_index
-                or reference.base_call_fingerprint != candidate.base_call_fingerprint
-                or reference.effect_digest != candidate.effect_digest
-            )
-            for reference, candidate in zip(
-                evidence.reference_effects,
-                evidence.candidate_effects,
-                strict=True,
-            )
-        ):
-            diagnostics.append(
-                _diagnostic(
-                    "trace.effect_mismatch",
-                    "Reference and candidate physical effects differ",
-                    case.case_id,
-                )
-            )
-
-        if canonical_json_bytes(evidence.reference_score) != canonical_json_bytes(
-            evidence.candidate_score
-        ):
-            diagnostics.append(
-                _diagnostic(
-                    "trace.score_mismatch",
-                    "Reference and candidate scores differ",
-                    case.case_id,
-                )
-            )
-
     return _make_layer_result(
         "trace",
         _fingerprint_parts(b"toolshift.trace-suite.v1", fingerprint_parts),

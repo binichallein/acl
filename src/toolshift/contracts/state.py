@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
-from toolshift.contracts.schema import (
+from toolshift.contracts._common import (
     LayerContractResult,
     _diagnostic,
     _fingerprint_parts,
@@ -174,15 +173,23 @@ def _validate_state_evidence(value: object) -> StateEvidence:
 
 
 def check_state_contract(
-    cases: Sequence[StateCase],
+    cases: list[StateCase] | tuple[StateCase, ...],
     provider: StateEvidenceProvider,
 ) -> LayerContractResult:
-    """Verify paired start, final, collateral, and reset digests."""
+    """Verify opaque state evidence for an exact built-in list or tuple of cases.
+
+    Providers supply only whole-state SHA256 and collateral digests. The checker
+    requires paired starts, finals, and collateral evidence to match and requires
+    each post-episode reset digest to restore its corresponding initial digest.
+    """
 
     diagnostics = []
-    if not isinstance(cases, (list, tuple)):
+    if type(cases) not in (list, tuple):
         diagnostics.append(
-            _diagnostic("state.invalid_cases", "State cases must be a finite sequence")
+            _diagnostic(
+                "state.invalid_cases",
+                "State cases must be an exact built-in list or tuple",
+            )
         )
         raw_cases: tuple[object, ...] = ()
     else:
@@ -215,9 +222,7 @@ def check_state_contract(
             _diagnostic("state.duplicate_episode", "State episode identifiers must be unique")
         )
 
-    fingerprint_parts = [
-        bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases
-    ]
+    fingerprint_parts = [bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases]
     for case in valid_cases:
         try:
             evidence = _validate_state_evidence(provider(case))

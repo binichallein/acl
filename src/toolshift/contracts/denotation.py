@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TypeAlias, cast
 
 from toolshift.adapters.semantic import SemanticAdapter
-from toolshift.contracts.schema import (
+from toolshift.contracts._common import (
+    ContractDiagnostic,
     LayerContractResult,
     _actions_equal,
     _diagnostic,
     _fingerprint_parts,
     _make_layer_result,
+    _require_safe_identifier,
     _require_sha256,
     _snapshot_actions,
     _snapshot_call,
-    schema_fingerprint,
 )
+from toolshift.contracts._schema import schema_fingerprint
 from toolshift.types import (
     JSONValue,
     SemanticAction,
@@ -41,17 +43,11 @@ def _snapshot_call_groups(
     for group_index, group in enumerate(value):
         if not isinstance(group, (list, tuple)):
             raise ValueError(f"{context} groups must be lists or tuples")
-        groups.append(
-            tuple(
-                _snapshot_call(call, f"{context}[{group_index}]") for call in group
-            )
-        )
+        groups.append(tuple(_snapshot_call(call, f"{context}[{group_index}]") for call in group))
     return tuple(groups)
 
 
-def _snapshot_observation_groups(
-    value: object, context: str
-) -> tuple[tuple[JSONValue, ...], ...]:
+def _snapshot_observation_groups(value: object, context: str) -> tuple[tuple[JSONValue, ...], ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"{context} must be a list or tuple")
     groups: list[tuple[JSONValue, ...]] = []
@@ -109,8 +105,6 @@ class DenotationCase:
     _snapshot_fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        from toolshift.contracts.schema import _require_safe_identifier
-
         object.__setattr__(
             self,
             "case_id",
@@ -168,25 +162,18 @@ def _denotation_case_has_canonical_shape(value: object) -> bool:
         type(object.__getattribute__(case, "case_id")) is str
         and _is_frozen_mapping(object.__getattribute__(case, "surface_call"))
         and type(expected_actions) is tuple
-        and all(
-            _semantic_action_has_canonical_shape(action)
-            for action in expected_actions
-        )
+        and all(_semantic_action_has_canonical_shape(action) for action in expected_actions)
         and type(base_call_groups) is tuple
         and all(
-            type(group) is tuple
-            and all(_is_frozen_mapping(call) for call in group)
+            type(group) is tuple and all(_is_frozen_mapping(call) for call in group)
             for group in base_call_groups
         )
         and type(observation_groups) is tuple
         and all(
-            type(group) is tuple
-            and all(_is_frozen_json(observation) for observation in group)
+            type(group) is tuple and all(_is_frozen_json(observation) for observation in group)
             for group in observation_groups
         )
-        and _is_frozen_json(
-            object.__getattribute__(case, "expected_surface_observation")
-        )
+        and _is_frozen_json(object.__getattribute__(case, "expected_surface_observation"))
         and type(object.__getattribute__(case, "_snapshot_fingerprint")) is str
     )
 
@@ -212,32 +199,16 @@ def _validate_denotation_case(value: object) -> DenotationCase:
     return case
 
 
-def check_denotation_contract(
-    adapter: SemanticAdapter,
-    cases: Sequence[DenotationCase],
-) -> LayerContractResult:
-    """Verify deterministic parse, compilation, cardinality, and observation wrapping."""
-
-    diagnostics = []
-    try:
-        adapter_variant_fingerprint = schema_fingerprint(adapter.variant)
-    except Exception:
-        adapter_variant_fingerprint = None
+def _collect_denotation_cases(
+    cases: object,
+    diagnostics: list[ContractDiagnostic],
+) -> list[DenotationCase]:
+    if type(cases) not in (list, tuple):
         diagnostics.append(
-            _diagnostic("denotation.invalid_adapter", "Adapter validation failed")
-        )
-
-    def adapter_binding_matches() -> bool:
-        if adapter_variant_fingerprint is None:
-            return False
-        try:
-            return schema_fingerprint(adapter.variant) == adapter_variant_fingerprint
-        except Exception:
-            return False
-
-    if not isinstance(cases, (list, tuple)):
-        diagnostics.append(
-            _diagnostic("denotation.invalid_cases", "Denotation cases must be a finite sequence")
+            _diagnostic(
+                "denotation.invalid_cases",
+                "Denotation cases must be an exact built-in list or tuple",
+            )
         )
         raw_cases: tuple[object, ...] = ()
     else:
@@ -254,8 +225,6 @@ def check_denotation_contract(
         except Exception:
             case_id = getattr(raw_case, "case_id", "suite")
             try:
-                from toolshift.contracts.schema import _require_safe_identifier
-
                 case_id = _require_safe_identifier(case_id, "case_id")
             except ValueError:
                 case_id = "suite"
@@ -266,7 +235,6 @@ def check_denotation_contract(
                     case_id,
                 )
             )
-
     case_ids = [case.case_id for case in valid_cases]
     if len(case_ids) != len(set(case_ids)):
         diagnostics.append(
@@ -275,230 +243,314 @@ def check_denotation_contract(
                 "Denotation case identifiers must be unique",
             )
         )
+    return valid_cases
 
-    for case in valid_cases:
-        variant_rebound = False
-        action_count = len(case.expected_actions)
-        if len(case.expected_base_call_groups) != action_count:
+
+def _check_denotation_group_counts(
+    case: DenotationCase,
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    action_count = len(case.expected_actions)
+    if len(case.expected_base_call_groups) != action_count:
+        diagnostics.append(
+            _diagnostic(
+                "denotation.base_group_count",
+                "Base call group count must equal action count",
+                case.case_id,
+            )
+        )
+    if len(case.base_observation_groups) != action_count:
+        diagnostics.append(
+            _diagnostic(
+                "denotation.observation_group_count",
+                "Observation group count must equal action count",
+                case.case_id,
+            )
+        )
+
+
+def _parse_denotation_case(
+    adapter: SemanticAdapter,
+    case: DenotationCase,
+    binding_matches: Callable[[], bool],
+    diagnostics: list[ContractDiagnostic],
+) -> tuple[list[tuple[SemanticAction, ...]], bool]:
+    parsed: list[tuple[SemanticAction, ...]] = []
+    parsed_snapshots: list[tuple[SemanticAction, ...]] = []
+    parse_raised = False
+    variant_rebound = False
+    for _ in range(2):
+        try:
+            output = adapter.surface_to_semantic(case.surface_call)
+            if not isinstance(output, tuple):
+                raise ValueError("parse output must be a tuple")
+            parsed_snapshots.append(_snapshot_actions(output, "parsed actions"))
+            parsed.append(output)
+        except Exception:
+            parse_raised = True
+        finally:
+            if not binding_matches():
+                variant_rebound = True
+    if parse_raised or len(parsed) != 2:
+        diagnostics.append(
+            _diagnostic(
+                "denotation.parse_exception",
+                "Surface parsing raised or returned malformed actions",
+                case.case_id,
+            )
+        )
+    else:
+        if not _actions_equal(parsed_snapshots[0], parsed_snapshots[1]):
             diagnostics.append(
                 _diagnostic(
-                    "denotation.base_group_count",
-                    "Base call group count must equal action count",
+                    "denotation.nondeterministic_parse",
+                    "Surface parsing is not deterministic",
                     case.case_id,
                 )
             )
-        if len(case.base_observation_groups) != action_count:
+        if any(not _actions_equal(run, case.expected_actions) for run in parsed_snapshots):
             diagnostics.append(
                 _diagnostic(
-                    "denotation.observation_group_count",
-                    "Observation group count must equal action count",
+                    "denotation.parse_mismatch",
+                    "Surface parsing differs from expected actions",
                     case.case_id,
                 )
             )
+    return parsed, variant_rebound
 
-        parsed: list[tuple[SemanticAction, ...]] = []
-        parsed_snapshots: list[tuple[SemanticAction, ...]] = []
-        parse_raised = False
-        for _ in range(2):
-            try:
-                output = adapter.surface_to_semantic(case.surface_call)
-                if not isinstance(output, tuple):
-                    raise ValueError("parse output must be a tuple")
-                parsed_snapshots.append(_snapshot_actions(output, "parsed actions"))
-                parsed.append(output)
-            except Exception:
-                parse_raised = True
-            finally:
-                if not adapter_binding_matches():
-                    variant_rebound = True
-        if parse_raised or len(parsed) != 2:
-            diagnostics.append(
-                _diagnostic(
-                    "denotation.parse_exception",
-                    "Surface parsing raised or returned malformed actions",
-                    case.case_id,
-                )
-            )
-        else:
-            if not _actions_equal(parsed_snapshots[0], parsed_snapshots[1]):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.nondeterministic_parse",
-                        "Surface parsing is not deterministic",
-                        case.case_id,
-                    )
-                )
-            if any(
-                not _actions_equal(run, case.expected_actions)
-                for run in parsed_snapshots
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.parse_mismatch",
-                        "Surface parsing differs from expected actions",
-                        case.case_id,
-                    )
-                )
 
-        compiled_runs: list[_CompileRun] = []
-        compile_raised = False
-        if len(parsed) == 2:
-            for parsed_run in parsed:
-                compiled_actions: list[tuple[_BaseCallGroup, ...]] = []
-                run_raised = False
-                for action in parsed_run:
-                    trials: list[_BaseCallGroup] = []
-                    for _ in range(2):
-                        try:
-                            output = adapter.semantic_to_base_calls(action)
-                            if not isinstance(output, tuple):
-                                raise ValueError("compile output must be a tuple")
-                            group = tuple(
-                                _snapshot_call(call, "compiled base calls")
-                                for call in output
-                            )
-                            if not group:
-                                raise ValueError("compile output must not be empty")
-                            trials.append(group)
-                        except Exception:
-                            compile_raised = True
-                            run_raised = True
-                        finally:
-                            if not adapter_binding_matches():
-                                variant_rebound = True
-                    if len(trials) == 2:
-                        compiled_actions.append(tuple(trials))
-                if not run_raised:
-                    compiled_runs.append(tuple(compiled_actions))
-        if compile_raised:
-            diagnostics.append(
-                _diagnostic(
-                    "denotation.compile_exception",
-                    "Action compilation raised or returned an empty malformed group",
-                    case.case_id,
-                )
-            )
-
-        if len(compiled_runs) == 2:
-            if not _compile_runs_equal(
-                compiled_runs[0], compiled_runs[1]
-            ) or any(
-                any(
-                    not _call_groups_equal(trials[0], trial)
-                    for trial in trials[1:]
-                )
-                for compiled_run in compiled_runs
-                for trials in compiled_run
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.nondeterministic_compile",
-                        "Action compilation is not deterministic",
-                        case.case_id,
-                    )
-                )
-            if any(
-                len(compiled_run) != len(case.expected_base_call_groups)
-                or any(
-                    any(
-                        not _call_groups_equal(group, expected_group)
-                        for group in trials
-                    )
-                    for trials, expected_group in zip(
-                        compiled_run,
-                        case.expected_base_call_groups,
-                        strict=True,
-                    )
-                )
-                for compiled_run in compiled_runs
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.compile_mismatch",
-                        "Action compilation differs from expected base calls",
-                        case.case_id,
-                    )
-                )
-
-            if any(
-                len(compiled_run) != len(case.base_observation_groups)
-                or any(
-                    any(
-                        len(observation_group) != len(compiled_group)
-                        for compiled_group in trials
-                    )
-                    for observation_group, trials in zip(
-                        case.base_observation_groups,
-                        compiled_run,
-                        strict=True,
-                    )
-                )
-                for compiled_run in compiled_runs
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.observation_cardinality",
-                        "Observation cardinality must equal physical call count",
-                        case.case_id,
-                    )
-                )
-
-        wrapped_runs: list[JSONValue] = []
-        observation_raised = False
-        if len(parsed) == 2:
-            for parsed_run in parsed:
-                try:
-                    wrapped_runs.append(
-                        _freeze_json_root(
-                            adapter.base_observation_to_surface(
-                                case.surface_call,
-                                parsed_run,
-                                case.base_observation_groups,
-                            ),
-                            "wrapped surface observation",
+def _compile_denotation_case(
+    adapter: SemanticAdapter,
+    case: DenotationCase,
+    parsed: list[tuple[SemanticAction, ...]],
+    binding_matches: Callable[[], bool],
+    diagnostics: list[ContractDiagnostic],
+) -> tuple[list[_CompileRun], bool]:
+    compiled_runs: list[_CompileRun] = []
+    compile_raised = False
+    variant_rebound = False
+    if len(parsed) == 2:
+        for parsed_run in parsed:
+            compiled_actions: list[tuple[_BaseCallGroup, ...]] = []
+            run_raised = False
+            for action in parsed_run:
+                trials: list[_BaseCallGroup] = []
+                for _ in range(2):
+                    try:
+                        output = adapter.semantic_to_base_calls(action)
+                        if not isinstance(output, tuple):
+                            raise ValueError("compile output must be a tuple")
+                        group = tuple(
+                            _snapshot_call(call, "compiled base calls") for call in output
                         )
+                        if not group:
+                            raise ValueError("compile output must not be empty")
+                        trials.append(group)
+                    except Exception:
+                        compile_raised = True
+                        run_raised = True
+                    finally:
+                        if not binding_matches():
+                            variant_rebound = True
+                if len(trials) == 2:
+                    compiled_actions.append(tuple(trials))
+            if not run_raised:
+                compiled_runs.append(tuple(compiled_actions))
+    if compile_raised:
+        diagnostics.append(
+            _diagnostic(
+                "denotation.compile_exception",
+                "Action compilation raised or returned an empty malformed group",
+                case.case_id,
+            )
+        )
+    return compiled_runs, variant_rebound
+
+
+def _check_compiled_denotation_runs(
+    case: DenotationCase,
+    compiled_runs: list[_CompileRun],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    if len(compiled_runs) != 2:
+        return
+    if not _compile_runs_equal(compiled_runs[0], compiled_runs[1]) or any(
+        any(not _call_groups_equal(trials[0], trial) for trial in trials[1:])
+        for compiled_run in compiled_runs
+        for trials in compiled_run
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "denotation.nondeterministic_compile",
+                "Action compilation is not deterministic",
+                case.case_id,
+            )
+        )
+    if any(
+        len(compiled_run) != len(case.expected_base_call_groups)
+        or any(
+            any(not _call_groups_equal(group, expected_group) for group in trials)
+            for trials, expected_group in zip(
+                compiled_run,
+                case.expected_base_call_groups,
+                strict=True,
+            )
+        )
+        for compiled_run in compiled_runs
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "denotation.compile_mismatch",
+                "Action compilation differs from expected base calls",
+                case.case_id,
+            )
+        )
+    if any(
+        len(compiled_run) != len(case.base_observation_groups)
+        or any(
+            any(len(observation_group) != len(compiled_group) for compiled_group in trials)
+            for observation_group, trials in zip(
+                case.base_observation_groups,
+                compiled_run,
+                strict=True,
+            )
+        )
+        for compiled_run in compiled_runs
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "denotation.observation_cardinality",
+                "Observation cardinality must equal physical call count",
+                case.case_id,
+            )
+        )
+
+
+def _wrap_denotation_case(
+    adapter: SemanticAdapter,
+    case: DenotationCase,
+    parsed: list[tuple[SemanticAction, ...]],
+    binding_matches: Callable[[], bool],
+    diagnostics: list[ContractDiagnostic],
+) -> bool:
+    wrapped_runs: list[JSONValue] = []
+    observation_raised = False
+    variant_rebound = False
+    if len(parsed) == 2:
+        for parsed_run in parsed:
+            try:
+                wrapped_runs.append(
+                    _freeze_json_root(
+                        adapter.base_observation_to_surface(
+                            case.surface_call,
+                            parsed_run,
+                            case.base_observation_groups,
+                        ),
+                        "wrapped surface observation",
                     )
-                except Exception:
-                    observation_raised = True
-                finally:
-                    if not adapter_binding_matches():
-                        variant_rebound = True
-        if observation_raised:
+                )
+            except Exception:
+                observation_raised = True
+            finally:
+                if not binding_matches():
+                    variant_rebound = True
+    if observation_raised:
+        diagnostics.append(
+            _diagnostic(
+                "denotation.observation_exception",
+                "Observation wrapping raised or returned malformed JSON",
+                case.case_id,
+            )
+        )
+    if len(wrapped_runs) == 2:
+        if not _json_equal(wrapped_runs[0], wrapped_runs[1]):
             diagnostics.append(
                 _diagnostic(
-                    "denotation.observation_exception",
-                    "Observation wrapping raised or returned malformed JSON",
+                    "denotation.nondeterministic_observation",
+                    "Observation wrapping is not deterministic",
                     case.case_id,
                 )
             )
-        if len(wrapped_runs) == 2:
-            if not _json_equal(wrapped_runs[0], wrapped_runs[1]):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.nondeterministic_observation",
-                        "Observation wrapping is not deterministic",
-                        case.case_id,
-                    )
-                )
-            if any(
-                not _json_equal(wrapped, case.expected_surface_observation)
-                for wrapped in wrapped_runs
-            ):
-                diagnostics.append(
-                    _diagnostic(
-                        "denotation.observation_mismatch",
-                        "Wrapped observation differs from expected observation",
-                        case.case_id,
-                    )
-                )
-        if variant_rebound:
+        if any(
+            not _json_equal(wrapped, case.expected_surface_observation) for wrapped in wrapped_runs
+        ):
             diagnostics.append(
                 _diagnostic(
-                    "denotation.variant_rebound",
-                    "Adapter variant changed during denotation checks",
+                    "denotation.observation_mismatch",
+                    "Wrapped observation differs from expected observation",
                     case.case_id,
                 )
             )
+    return variant_rebound
+
+
+def _check_denotation_case(
+    adapter: SemanticAdapter,
+    case: DenotationCase,
+    binding_matches: Callable[[], bool],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    _check_denotation_group_counts(case, diagnostics)
+    parsed, parse_rebound = _parse_denotation_case(
+        adapter,
+        case,
+        binding_matches,
+        diagnostics,
+    )
+    compiled_runs, compile_rebound = _compile_denotation_case(
+        adapter,
+        case,
+        parsed,
+        binding_matches,
+        diagnostics,
+    )
+    _check_compiled_denotation_runs(case, compiled_runs, diagnostics)
+    wrap_rebound = _wrap_denotation_case(
+        adapter,
+        case,
+        parsed,
+        binding_matches,
+        diagnostics,
+    )
+    if parse_rebound or compile_rebound or wrap_rebound:
+        diagnostics.append(
+            _diagnostic(
+                "denotation.variant_rebound",
+                "Adapter variant changed during denotation checks",
+                case.case_id,
+            )
+        )
+
+
+def check_denotation_contract(
+    adapter: SemanticAdapter,
+    cases: list[DenotationCase] | tuple[DenotationCase, ...],
+) -> LayerContractResult:
+    """Verify denotations from an exact built-in list or tuple of cases.
+
+    Each surface parse and action compilation runs twice. The checker compares
+    ordered action and base-call groups plus wrapped observations against the case
+    expectations using type-sensitive canonical JSON equality.
+    """
+
+    diagnostics: list[ContractDiagnostic] = []
+    try:
+        adapter_variant_fingerprint = schema_fingerprint(adapter.variant)
+    except Exception:
+        adapter_variant_fingerprint = None
+        diagnostics.append(_diagnostic("denotation.invalid_adapter", "Adapter validation failed"))
+
+    def adapter_binding_matches() -> bool:
+        if adapter_variant_fingerprint is None:
+            return False
+        try:
+            return schema_fingerprint(adapter.variant) == adapter_variant_fingerprint
+        except Exception:
+            return False
+
+    valid_cases = _collect_denotation_cases(cases, diagnostics)
+    for case in valid_cases:
+        _check_denotation_case(adapter, case, adapter_binding_matches, diagnostics)
 
     fingerprint = _fingerprint_parts(
         b"toolshift.denotation-suite.v1",

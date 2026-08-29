@@ -5,16 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import ItemsView, Iterator, Mapping, ValuesView
 from dataclasses import dataclass, field
 from typing import TypeAlias, cast
 
 JSONScalar: TypeAlias = bool | int | float | str | None
 JSONValue: TypeAlias = (
-    JSONScalar
-    | Mapping[str, "JSONValue"]
-    | list["JSONValue"]
-    | tuple["JSONValue", ...]
+    JSONScalar | Mapping[str, "JSONValue"] | list["JSONValue"] | tuple["JSONValue", ...]
 )
 _MAX_SAFE_INTEGER = 2**53 - 1
 _MAX_JSON_CONTAINER_DEPTH = 128
@@ -23,10 +20,26 @@ _MAX_JSON_CONTAINER_DEPTH = 128
 class _FrozenJSONMapping(Mapping[str, JSONValue]):
     """Private immutable mapping backed only by an exact tuple graph."""
 
-    __slots__ = ("_items",)
+    __slots__ = ("_index", "_items")
 
     def __init__(self, items: tuple[tuple[str, JSONValue], ...]) -> None:
+        if type(items) is not tuple:
+            raise ValueError("frozen mapping state is invalid")
         object.__setattr__(self, "_items", items)
+        index: dict[str, int] = {}
+        for position, entry in enumerate(items):
+            if type(entry) is not tuple or len(entry) != 2 or type(entry[0]) is not str:
+                raise ValueError("frozen mapping state is invalid")
+            key = entry[0]
+            if key in index:
+                raise ValueError("frozen mapping keys must be unique")
+            index[key] = position
+        object.__setattr__(self, "_index", index)
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "_index":
+            raise AttributeError("frozen mapping lookup index is private")
+        return object.__getattribute__(self, name)
 
     def _raw_items(self) -> tuple[tuple[str, JSONValue], ...]:
         items = object.__getattribute__(self, "_items")
@@ -38,22 +51,94 @@ class _FrozenJSONMapping(Mapping[str, JSONValue]):
         return cast(tuple[tuple[str, JSONValue], ...], items)
 
     def __getitem__(self, key: str) -> JSONValue:
-        for stored_key, value in self._raw_items():
-            if stored_key == key:
-                return value
-        raise KeyError(key)
+        items = object.__getattribute__(self, "_items")
+        index = object.__getattribute__(self, "_index")
+        if type(items) is not tuple or type(index) is not dict:
+            raise ValueError("frozen mapping state is invalid")
+        position = dict.get(index, key)
+        if position is None:
+            raise KeyError(key)
+        if type(position) is not int or position < 0 or position >= len(items):
+            raise ValueError("frozen mapping state is invalid")
+        entry = items[position]
+        if type(entry) is not tuple or len(entry) != 2 or type(entry[0]) is not str:
+            raise ValueError("frozen mapping state is invalid")
+        if entry[0] != key:
+            raise ValueError("frozen mapping state is invalid")
+        return cast(JSONValue, entry[1])
 
     def __iter__(self) -> Iterator[str]:
         return (key for key, _ in self._raw_items())
 
     def __len__(self) -> int:
-        return len(self._raw_items())
+        items = object.__getattribute__(self, "_items")
+        if type(items) is not tuple:
+            raise ValueError("frozen mapping state is invalid")
+        return len(items)
+
+    def items(self) -> ItemsView[str, JSONValue]:
+        """Return the immutable ordered entries without repeated key lookup."""
+
+        return _FrozenJSONItemsView(self)
+
+    def values(self) -> ValuesView[JSONValue]:
+        """Return values in insertion order without repeated key lookup."""
+
+        return _FrozenJSONValuesView(self)
+
+    def __repr__(self) -> str:
+        rendered = ", ".join(f"{key!r}: {value!r}" for key, value in self._raw_items())
+        return f"FrozenJSONMapping({{{rendered}}})"
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("frozen JSON mappings are immutable")
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError("frozen JSON mappings are immutable")
+
+
+class _FrozenJSONItemsView(ItemsView[str, JSONValue]):
+    __slots__ = ()
+
+    def __iter__(self) -> Iterator[tuple[str, JSONValue]]:
+        mapping = cast(_FrozenJSONMapping, object.__getattribute__(self, "_mapping"))
+        return iter(mapping._raw_items())
+
+
+class _FrozenJSONValuesView(ValuesView[JSONValue]):
+    __slots__ = ()
+
+    def __iter__(self) -> Iterator[JSONValue]:
+        mapping = cast(_FrozenJSONMapping, object.__getattribute__(self, "_mapping"))
+        return (value for _, value in mapping._raw_items())
+
+
+def _frozen_mapping_index_matches(mapping: _FrozenJSONMapping) -> bool:
+    """Validate the private index without invoking injected key behavior."""
+
+    try:
+        items = object.__getattribute__(mapping, "_items")
+        index = object.__getattribute__(mapping, "_index")
+    except AttributeError:
+        return False
+    if type(items) is not tuple or type(index) is not dict:
+        return False
+    index_entries = tuple(dict.items(index))
+    if len(index_entries) != len(items):
+        return False
+    for position, (item_entry, index_entry) in enumerate(
+        zip(items, index_entries, strict=True)
+    ):
+        if type(item_entry) is not tuple or len(item_entry) != 2:
+            return False
+        if type(item_entry[0]) is not str:
+            return False
+        index_key, index_position = index_entry
+        if type(index_key) is not str or type(index_position) is not int:
+            return False
+        if index_key != item_entry[0] or index_position != position:
+            return False
+    return True
 
 
 def _require_utf8_text(value: str, context: str) -> str:
@@ -92,12 +177,44 @@ def _freeze_json(
             raise ValueError(f"{context} must be a finite float")
         return value
 
+    if type(value) is _FrozenJSONMapping:
+        if container_depth >= _MAX_JSON_CONTAINER_DEPTH:
+            raise ValueError(
+                f"{context} exceeds maximum JSON container depth {_MAX_JSON_CONTAINER_DEPTH}"
+            )
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{context} contains a cycle")
+        active.add(identity)
+        try:
+            if not _frozen_mapping_index_matches(value):
+                raise ValueError(f"{context} contains invalid frozen mapping state")
+            entries = cast(
+                tuple[tuple[str, JSONValue], ...],
+                object.__getattribute__(value, "_items"),
+            )
+            return _FrozenJSONMapping(
+                tuple(
+                    (
+                        key,
+                        _freeze_json(
+                            item,
+                            f"{context}.{key}",
+                            active,
+                            container_depth + 1,
+                        ),
+                    )
+                    for key, item in entries
+                )
+            )
+        finally:
+            active.remove(identity)
+
     is_mapping = isinstance(value, Mapping)
     is_array = isinstance(value, (list, tuple))
     if (is_mapping or is_array) and container_depth >= _MAX_JSON_CONTAINER_DEPTH:
         raise ValueError(
-            f"{context} exceeds maximum JSON container depth "
-            f"{_MAX_JSON_CONTAINER_DEPTH}"
+            f"{context} exceeds maximum JSON container depth {_MAX_JSON_CONTAINER_DEPTH}"
         )
 
     if is_mapping:
@@ -139,9 +256,7 @@ def _freeze_json(
         finally:
             active.remove(identity)
 
-    raise ValueError(
-        f"{context} contains unsupported JSON value of type {type(value).__name__}"
-    )
+    raise ValueError(f"{context} contains unsupported JSON value of type {type(value).__name__}")
 
 
 def _freeze_json_root(value: object, context: str) -> JSONValue:
@@ -149,8 +264,7 @@ def _freeze_json_root(value: object, context: str) -> JSONValue:
         return _freeze_json(value, context, set(), 0)
     except RecursionError as error:
         raise ValueError(
-            f"{context} exceeds maximum JSON container depth "
-            f"{_MAX_JSON_CONTAINER_DEPTH}"
+            f"{context} exceeds maximum JSON container depth {_MAX_JSON_CONTAINER_DEPTH}"
         ) from error
 
 
@@ -184,10 +298,13 @@ def _is_frozen_json(value: object) -> bool:
         active.add(identity)
         try:
             if type(item) is tuple:
-                return all(
-                    visit(child, active, container_depth + 1) for child in item
-                )
-            entries = object.__getattribute__(item, "_items")
+                return all(visit(child, active, container_depth + 1) for child in item)
+            if not _frozen_mapping_index_matches(item):
+                return False
+            try:
+                entries = object.__getattribute__(item, "_items")
+            except AttributeError:
+                return False
             if type(entries) is not tuple:
                 return False
             keys: set[str] = set()
@@ -228,6 +345,14 @@ def _freeze_call_sequence(
 
 
 def _to_json_container(value: JSONValue) -> JSONScalar | dict[str, object] | list[object]:
+    if type(value) is _FrozenJSONMapping:
+        if not _frozen_mapping_index_matches(value):
+            raise ValueError("frozen mapping state is invalid")
+        entries = cast(
+            tuple[tuple[str, JSONValue], ...],
+            object.__getattribute__(value, "_items"),
+        )
+        return {key: _to_json_container(item) for key, item in entries}
     if isinstance(value, Mapping):
         return {key: _to_json_container(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -285,10 +410,7 @@ class SemanticAction:
     def __eq__(self, other: object) -> bool:
         if type(self) is not type(other):
             return NotImplemented
-        return (
-            self.name == other.name
-            and self._arguments_canonical == other._arguments_canonical
-        )
+        return self.name == other.name and self._arguments_canonical == other._arguments_canonical
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -460,10 +582,7 @@ def _execution_trace_has_canonical_shape(value: object) -> bool:
         type(surface_calls) is tuple
         and all(_is_frozen_mapping(call) for call in surface_calls)
         and type(semantic_actions) is tuple
-        and all(
-            _semantic_action_has_canonical_shape(action)
-            for action in semantic_actions
-        )
+        and all(_semantic_action_has_canonical_shape(action) for action in semantic_actions)
         and type(base_calls) is tuple
         and all(_is_frozen_mapping(call) for call in base_calls)
         and type(object.__getattribute__(trace, "_surface_calls_canonical")) is bytes
