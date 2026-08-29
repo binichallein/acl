@@ -18,7 +18,7 @@ from toolshift.contracts.schema import (
     _require_safe_identifier,
     _require_sha256,
     _snapshot_actions,
-    _validate_schema_variant,
+    schema_fingerprint,
 )
 from toolshift.types import (
     ExecutionTrace,
@@ -302,9 +302,18 @@ def check_trace_contract(
 
     diagnostics = []
     try:
-        _validate_schema_variant(adapter.variant)
+        adapter_variant_fingerprint = schema_fingerprint(adapter.variant)
     except Exception:
+        adapter_variant_fingerprint = None
         diagnostics.append(_diagnostic("trace.invalid_adapter", "Adapter validation failed"))
+
+    def adapter_binding_matches() -> bool:
+        if adapter_variant_fingerprint is None:
+            return False
+        try:
+            return schema_fingerprint(adapter.variant) == adapter_variant_fingerprint
+        except Exception:
+            return False
 
     if not isinstance(cases, (list, tuple)):
         diagnostics.append(
@@ -374,6 +383,7 @@ def check_trace_contract(
     fingerprint_parts = [
         bytes.fromhex(case._snapshot_fingerprint) for case in valid_cases
     ]
+    surface_steps_run = 0
     for case in valid_cases:
         try:
             evidence = _validate_trace_evidence(provider(case))
@@ -388,6 +398,15 @@ def check_trace_contract(
             fingerprint_parts.append(b"provider-error")
             continue
         fingerprint_parts.append(bytes.fromhex(evidence._snapshot_fingerprint))
+        surface_steps_run += len(evidence.candidate_steps)
+        if not evidence.candidate_steps:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.empty_steps",
+                    "Candidate trace must contain a verified surface step",
+                    case.case_id,
+                )
+            )
 
         reconstructed_surface: list[Mapping[str, JSONValue]] = []
         reconstructed_actions: list[SemanticAction] = []
@@ -451,9 +470,22 @@ def check_trace_contract(
                 )
             )
 
+        variant_rebound = False
         try:
-            reference_semantics = adapter.canonicalize_trace(evidence.reference_trace)
-            candidate_semantics = adapter.canonicalize_trace(evidence.candidate_trace)
+            try:
+                reference_semantics = adapter.canonicalize_trace(
+                    evidence.reference_trace
+                )
+            finally:
+                if not adapter_binding_matches():
+                    variant_rebound = True
+            try:
+                candidate_semantics = adapter.canonicalize_trace(
+                    evidence.candidate_trace
+                )
+            finally:
+                if not adapter_binding_matches():
+                    variant_rebound = True
             if not isinstance(reference_semantics, tuple) or not isinstance(
                 candidate_semantics, tuple
             ):
@@ -495,6 +527,14 @@ def check_trace_contract(
                 _diagnostic(
                     "trace.canonicalization_exception",
                     "Trace canonicalization raised or returned malformed actions",
+                    case.case_id,
+                )
+            )
+        if variant_rebound:
+            diagnostics.append(
+                _diagnostic(
+                    "trace.variant_rebound",
+                    "Adapter variant changed during trace canonicalization",
                     case.case_id,
                 )
             )
@@ -559,7 +599,7 @@ def check_trace_contract(
     return _make_layer_result(
         "trace",
         _fingerprint_parts(b"toolshift.trace-suite.v1", fingerprint_parts),
-        len(valid_cases),
+        surface_steps_run,
         diagnostics,
     )
 

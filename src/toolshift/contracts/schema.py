@@ -157,9 +157,7 @@ class LayerContractResult:
             raise ValueError("checks_run must be a nonnegative integer")
         if not isinstance(self.diagnostics, (list, tuple)):
             raise ValueError("diagnostics must be a list or tuple")
-        diagnostics = tuple(self.diagnostics)
-        if any(not isinstance(item, ContractDiagnostic) for item in diagnostics):
-            raise ValueError("diagnostics must contain only ContractDiagnostic values")
+        diagnostics = tuple(_validate_diagnostic(item) for item in self.diagnostics)
         object.__setattr__(self, "diagnostics", diagnostics)
         parts = [
             canonical_json_bytes(self.layer),
@@ -185,7 +183,8 @@ class LayerContractResult:
     def passed(self) -> bool:
         """Return true exactly when no diagnostics were recorded."""
 
-        return len(self.diagnostics) == 0
+        result = _validate_layer_result(self)
+        return len(result.diagnostics) == 0
 
 
 def _validate_diagnostic(value: object) -> ContractDiagnostic:
@@ -299,10 +298,27 @@ class ContractSuiteResult:
     def passed(self) -> bool:
         """Return true exactly when every layer has zero diagnostics."""
 
-        return all(len(result.diagnostics) == 0 for result in self.results)
+        suite = _validate_suite_result(
+            self,
+            require_attested=self in _EVALUATED_SUITES,
+        )
+        return all(len(result.diagnostics) == 0 for result in suite.results)
 
 
-_EVALUATED_SUITES: weakref.WeakSet[ContractSuiteResult] = weakref.WeakSet()
+@dataclass(frozen=True, slots=True)
+class _SuiteProvenance:
+    results: tuple[LayerContractResult, ...]
+    result_snapshots: tuple[str, ...]
+    schema_fingerprint: str
+    aggregate_fingerprint: str
+    state_episode_fingerprint: str
+    trace_episode_fingerprint: str
+    admission_snapshot_fingerprint: str
+
+
+_EVALUATED_SUITES: weakref.WeakKeyDictionary[
+    ContractSuiteResult, _SuiteProvenance
+] = weakref.WeakKeyDictionary()
 
 
 def _admission_snapshot_fingerprint(suite: ContractSuiteResult) -> str:
@@ -422,8 +438,8 @@ def check_schema_contract(
         )
 
     try:
-        bound_variant = _validate_schema_variant(adapter.variant)
-        if validated_variant is None or bound_variant != validated_variant:
+        bound_fingerprint = schema_fingerprint(adapter.variant)
+        if validated_variant is None or bound_fingerprint != fingerprint:
             diagnostics.append(
                 _diagnostic("schema.variant_mismatch", "Adapter variant does not match schema")
             )
@@ -431,6 +447,17 @@ def check_schema_contract(
         diagnostics.append(
             _diagnostic("schema.variant_exception", "Adapter variant validation raised")
         )
+
+    def adapter_binding_matches() -> bool:
+        if validated_variant is None:
+            return False
+        try:
+            return (
+                schema_fingerprint(variant) == fingerprint
+                and schema_fingerprint(adapter.variant) == fingerprint
+            )
+        except Exception:
+            return False
 
     if not isinstance(probes, (list, tuple)):
         diagnostics.append(
@@ -493,6 +520,7 @@ def check_schema_contract(
             )
         parsed: list[tuple[SemanticAction, ...]] = []
         raised = False
+        variant_rebound = False
         for _ in range(2):
             try:
                 output = adapter.surface_to_semantic(probe.surface_call)
@@ -501,6 +529,17 @@ def check_schema_contract(
                 parsed.append(_snapshot_actions(output, "adapter actions"))
             except Exception:
                 raised = True
+            finally:
+                if not adapter_binding_matches():
+                    variant_rebound = True
+        if variant_rebound:
+            diagnostics.append(
+                _diagnostic(
+                    "schema.variant_rebound",
+                    "Adapter variant changed during surface mapping",
+                    probe.case_id,
+                )
+            )
         if raised or len(parsed) != 2:
             diagnostics.append(
                 _diagnostic(
@@ -526,6 +565,16 @@ def check_schema_contract(
                     probe.case_id,
                 )
             )
+
+    if not adapter_binding_matches() and not any(
+        diagnostic.code == "schema.variant_rebound" for diagnostic in diagnostics
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "schema.variant_rebound",
+                "Adapter variant changed during schema checks",
+            )
+        )
 
     return _make_layer_result(
         layer="schema",
@@ -583,8 +632,11 @@ def evaluate_contract_suite(
     from toolshift.contracts.trace import _validate_trace_case, check_trace_contract
 
     try:
+        _validate_schema_variant(variant)
         variant_fingerprint = schema_fingerprint(variant)
+        supplied_variant_valid = True
     except Exception:
+        supplied_variant_valid = False
         variant_fingerprint = hashlib.sha256(b"toolshift.schema.invalid").hexdigest()
 
     schema_result = _run_suite_checker(
@@ -612,6 +664,28 @@ def evaluate_contract_suite(
             denotation_cases,
         ),
     )
+
+    try:
+        variant_binding_matches = (
+            supplied_variant_valid
+            and schema_fingerprint(variant) == variant_fingerprint
+            and schema_fingerprint(adapter.variant) == variant_fingerprint
+        )
+    except Exception:
+        variant_binding_matches = False
+    if not variant_binding_matches:
+        schema_result = _make_layer_result(
+            "schema",
+            schema_result.fingerprint,
+            schema_result.checks_run,
+            (
+                *schema_result.diagnostics,
+                _diagnostic(
+                    "suite.variant_binding_mismatch",
+                    "Adapter binding changed during contract evaluation",
+                ),
+            ),
+        )
 
     try:
         if not isinstance(state_cases, (list, tuple)):
@@ -668,7 +742,20 @@ def evaluate_contract_suite(
         "_admission_snapshot_fingerprint",
         _admission_snapshot_fingerprint(suite),
     )
-    _EVALUATED_SUITES.add(suite)
+    _EVALUATED_SUITES[suite] = _SuiteProvenance(
+        results=suite.results,
+        result_snapshots=tuple(
+            result._snapshot_fingerprint for result in suite.results
+        ),
+        schema_fingerprint=suite.schema_fingerprint,
+        aggregate_fingerprint=suite.fingerprint,
+        state_episode_fingerprint=state_episode_fingerprint,
+        trace_episode_fingerprint=trace_episode_fingerprint,
+        admission_snapshot_fingerprint=cast(
+            str,
+            suite._admission_snapshot_fingerprint,
+        ),
+    )
     return suite
 
 
@@ -682,6 +769,31 @@ def _validate_suite_result(
         raise ValueError("suite results have been mutated")
     if tuple(result.layer for result in suite.results) != _LAYERS:
         raise ValueError("suite result order has been mutated")
+    provenance = _EVALUATED_SUITES.get(suite) if require_attested else None
+    if require_attested and provenance is None:
+        raise ValueError("suite result is not evaluator-attested or issued")
+    if provenance is not None and (
+        len(suite.results) != len(provenance.results)
+        or any(
+            current is not issued
+            for current, issued in zip(
+                suite.results,
+                provenance.results,
+                strict=True,
+            )
+        )
+        or tuple(result._snapshot_fingerprint for result in suite.results)
+        != provenance.result_snapshots
+        or suite.schema_fingerprint != provenance.schema_fingerprint
+        or suite.fingerprint != provenance.aggregate_fingerprint
+        or suite._state_episode_fingerprint
+        != provenance.state_episode_fingerprint
+        or suite._trace_episode_fingerprint
+        != provenance.trace_episode_fingerprint
+        or suite._admission_snapshot_fingerprint
+        != provenance.admission_snapshot_fingerprint
+    ):
+        raise ValueError("suite fingerprint or external provenance has been mutated")
     for result in suite.results:
         _validate_layer_result(result, require_attested=require_attested)
     rebuilt = ContractSuiteResult(suite.schema_fingerprint, suite.results)
@@ -692,8 +804,6 @@ def _validate_suite_result(
         or suite._sealed_fingerprint != suite.fingerprint
     ):
         raise ValueError("suite result is not evaluator-attested")
-    if require_attested and suite not in _EVALUATED_SUITES:
-        raise ValueError("suite result was not issued by contract evaluation")
     if require_attested and (
         suite._admission_snapshot_fingerprint != _admission_snapshot_fingerprint(suite)
     ):

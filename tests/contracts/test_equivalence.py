@@ -188,6 +188,202 @@ class _ExplodingDenotationAdapter(_IdentityAdapter):
         raise RuntimeError("observation payload /private/observation 92")
 
 
+class _ActualPipelineAdapter(_IdentityAdapter):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        self.parsed_actions: list[SemanticAction] = []
+        self.compiled_actions: list[SemanticAction] = []
+        self.wrapped_actions: list[tuple[SemanticAction, ...]] = []
+
+    def surface_to_semantic(
+        self, surface_call: Mapping[str, JSONValue]
+    ) -> tuple[SemanticAction, ...]:
+        action = SemanticAction("search", {"value": "alpha"})
+        self.parsed_actions.append(action)
+        return (action,)
+
+    def semantic_to_base_calls(
+        self, action: SemanticAction
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self.compiled_actions.append(action)
+        value = "changed" if action is self.parsed_actions[1] else "alpha"
+        return (_surface_call(value=value),)
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self.wrapped_actions.append(actions)
+        if actions and actions[0] is self.parsed_actions[1]:
+            return {"items": [2]}
+        return {"items": [1]}
+
+
+class _OneParseFailureAdapter(_IdentityAdapter):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        self.parse_calls = 0
+        self.compiled_actions: list[SemanticAction] = []
+        self.wrapped_actions: list[tuple[SemanticAction, ...]] = []
+
+    def surface_to_semantic(
+        self, surface_call: Mapping[str, JSONValue]
+    ) -> tuple[SemanticAction, ...]:
+        self.parse_calls += 1
+        if self.parse_calls == 1:
+            raise RuntimeError("parser payload /private/parse 93")
+        return (SemanticAction("search", {"value": "alpha"}),)
+
+    def semantic_to_base_calls(
+        self, action: SemanticAction
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self.compiled_actions.append(action)
+        return (_surface_call(),)
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self.wrapped_actions.append(actions)
+        return {"items": [1]}
+
+
+class _SecondCompileDriftAdapter(_IdentityAdapter):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        self.compile_counts: dict[int, int] = {}
+
+    def semantic_to_base_calls(
+        self, action: SemanticAction
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        action_id = id(action)
+        count = self.compile_counts.get(action_id, 0) + 1
+        self.compile_counts[action_id] = count
+        value = "changed" if count == 2 else "alpha"
+        return (_surface_call(value=value),)
+
+
+class _StageRebindingAdapter(_IdentityAdapter):
+    def __init__(self, variant: SchemaVariant, stage: str) -> None:
+        super().__init__(variant)
+        self._stage = stage
+        self._rebound_variant = SchemaVariant(
+            "rebound-v1",
+            variant.tools,
+            {"operator": "rebound", "seed": 8},
+        )
+
+    def _maybe_rebind(self, stage: str) -> None:
+        if self._stage == stage:
+            self._variant = self._rebound_variant
+
+    def surface_to_semantic(
+        self, surface_call: Mapping[str, JSONValue]
+    ) -> tuple[SemanticAction, ...]:
+        self._maybe_rebind("parse")
+        name = surface_call["name"]
+        arguments = surface_call["arguments"]
+        assert isinstance(name, str)
+        assert isinstance(arguments, Mapping)
+        return (SemanticAction(name, arguments),)
+
+    def semantic_to_base_calls(
+        self, action: SemanticAction
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self._maybe_rebind("compile")
+        return ({"name": action.name, "arguments": action.arguments},)
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self._maybe_rebind("wrap")
+        return base_observation_groups[0][0]
+
+    def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
+        self._maybe_rebind("canonicalize")
+        return trace.semantic_actions
+
+
+class _InPlaceVariantMutationAdapter(_IdentityAdapter):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        self._mutated = False
+
+    def surface_to_semantic(
+        self, surface_call: Mapping[str, JSONValue]
+    ) -> tuple[SemanticAction, ...]:
+        if not self._mutated:
+            replacement = SchemaVariant(
+                self._variant.variant_id,
+                self._variant.tools,
+                {"operator": "mutated", "seed": 9},
+            )
+            object.__setattr__(self._variant, "manifest", replacement.manifest)
+            object.__setattr__(
+                self._variant,
+                "_manifest_canonical",
+                replacement._manifest_canonical,
+            )
+            self._mutated = True
+        return super().surface_to_semantic(surface_call)
+
+
+class _TransientStageRebindingAdapter(_IdentityAdapter):
+    def __init__(self, variant: SchemaVariant, stage: str) -> None:
+        super().__init__(variant)
+        self._original_variant = variant
+        self._rebound_variant = SchemaVariant(
+            "transient-v1",
+            variant.tools,
+            {"operator": "transient", "seed": 10},
+        )
+        self._stage = stage
+
+    def _toggle_binding(self, stage: str) -> None:
+        if self._stage == stage:
+            self._variant = (
+                self._rebound_variant
+                if self._variant is self._original_variant
+                else self._original_variant
+            )
+
+    def surface_to_semantic(
+        self, surface_call: Mapping[str, JSONValue]
+    ) -> tuple[SemanticAction, ...]:
+        self._toggle_binding("parse")
+        name = surface_call["name"]
+        arguments = surface_call["arguments"]
+        assert isinstance(name, str)
+        assert isinstance(arguments, Mapping)
+        return (SemanticAction(name, arguments),)
+
+    def semantic_to_base_calls(
+        self, action: SemanticAction
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self._toggle_binding("compile")
+        return ({"name": action.name, "arguments": action.arguments},)
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self._toggle_binding("wrap")
+        return base_observation_groups[0][0]
+
+    def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
+        self._toggle_binding("canonicalize")
+        return trace.semantic_actions
+
+
 def test_schema_fingerprint_covers_variant_and_ordered_full_tool_specs() -> None:
     first = SchemaVariant(
         variant_id="identity-v1",
@@ -253,6 +449,31 @@ def test_layer_result_is_immutable_typed_and_passes_only_without_diagnostics() -
         ContractDiagnostic("schema.invalid", "line one\nline two", "case-1")
 
 
+def test_layer_passed_revalidates_object_setattr_mutation() -> None:
+    result = LayerContractResult(
+        "schema",
+        "a" * 64,
+        1,
+        [ContractDiagnostic("schema.failed", "Schema check failed", "case-1")],
+    )
+    object.__setattr__(result, "diagnostics", ())
+
+    with pytest.raises(ValueError, match="mutated"):
+        _ = result.passed
+
+
+def test_layer_constructor_revalidates_mutated_diagnostic_payload_safety() -> None:
+    diagnostic = ContractDiagnostic(
+        "schema.failed",
+        "Schema check failed",
+        "case-1",
+    )
+    object.__setattr__(diagnostic, "message", "payload\n/private/path")
+
+    with pytest.raises(ValueError, match="message"):
+        LayerContractResult("schema", "a" * 64, 1, [diagnostic])
+
+
 def test_identity_schema_contract_passes_with_complete_unique_probes() -> None:
     variant = _variant("search", "open")
     probes = [
@@ -271,6 +492,21 @@ def test_identity_schema_contract_passes_with_complete_unique_probes() -> None:
     assert result.fingerprint == schema_fingerprint(variant)
     assert result.checks_run == 2
     assert result.passed is True
+
+
+def test_schema_revalidates_adapter_binding_after_every_parse() -> None:
+    variant = _variant()
+    adapter = _StageRebindingAdapter(variant, "parse")
+    probe = SchemaProbe(
+        "schema-rebinding",
+        "search",
+        _surface_call(),
+        [SemanticAction("search", {"value": "alpha"})],
+    )
+
+    result = check_schema_contract(variant, adapter, [probe])
+
+    assert "schema.variant_rebound" in {item.code for item in result.diagnostics}
 
 
 def test_schema_contract_rejects_bad_and_nondeterministic_mappings() -> None:
@@ -422,6 +658,71 @@ def test_identity_single_step_denotation_contract_passes() -> None:
     assert result.passed is True
 
 
+def test_denotation_runs_both_actual_parse_objects_through_compile_and_wrap() -> None:
+    adapter = _ActualPipelineAdapter(_variant())
+    case = DenotationCase(
+        "denotation-actual-pipeline",
+        _surface_call(),
+        [SemanticAction("search", {"value": "alpha"})],
+        [[_surface_call()]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+
+    result = check_denotation_contract(adapter, [case])
+
+    assert len(adapter.parsed_actions) == 2
+    assert len(adapter.compiled_actions) == 4
+    assert adapter.compiled_actions[0] is adapter.parsed_actions[0]
+    assert adapter.compiled_actions[1] is adapter.parsed_actions[0]
+    assert adapter.compiled_actions[2] is adapter.parsed_actions[1]
+    assert adapter.compiled_actions[3] is adapter.parsed_actions[1]
+    assert len(adapter.wrapped_actions) == 2
+    assert adapter.wrapped_actions[0][0] is adapter.parsed_actions[0]
+    assert adapter.wrapped_actions[1][0] is adapter.parsed_actions[1]
+    assert {item.code for item in result.diagnostics} >= {
+        "denotation.nondeterministic_compile",
+        "denotation.nondeterministic_observation",
+    }
+
+
+def test_denotation_does_not_fallback_to_expected_actions_after_parse_failure() -> None:
+    adapter = _OneParseFailureAdapter(_variant())
+    case = DenotationCase(
+        "denotation-parse-failure",
+        _surface_call(),
+        [SemanticAction("search", {"value": "alpha"})],
+        [[_surface_call()]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+
+    result = check_denotation_contract(adapter, [case])
+
+    assert "denotation.parse_exception" in {item.code for item in result.diagnostics}
+    assert adapter.compiled_actions == []
+    assert adapter.wrapped_actions == []
+
+
+def test_denotation_compiles_each_actual_action_twice_for_determinism() -> None:
+    adapter = _SecondCompileDriftAdapter(_variant())
+    case = DenotationCase(
+        "denotation-same-object-compile-drift",
+        _surface_call(),
+        [SemanticAction("search", {"value": "alpha"})],
+        [[_surface_call()]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+
+    result = check_denotation_contract(adapter, [case])
+
+    assert sorted(adapter.compile_counts.values()) == [2, 2]
+    assert "denotation.nondeterministic_compile" in {
+        item.code for item in result.diagnostics
+    }
+
+
 def test_denotation_rejects_nondeterministic_parse_compile_and_empty_base_group() -> None:
     variant = _variant()
     case = DenotationCase(
@@ -496,7 +797,7 @@ def test_denotation_rejects_observation_cardinality_mismatch() -> None:
     }
 
 
-def test_denotation_allows_zero_actions_only_with_zero_groups_and_wraps_once() -> None:
+def test_denotation_allows_zero_actions_only_with_zero_groups_and_wraps_each_run() -> None:
     variant = _variant()
     valid = DenotationCase(
         "denotation-noop",
@@ -731,6 +1032,75 @@ def test_identity_trace_contract_reconstructs_verified_denotation_steps() -> Non
     assert result.layer == "trace"
     assert result.checks_run == 1
     assert result.passed is True
+
+
+def test_trace_requires_a_registered_surface_step_but_allows_zero_actions() -> None:
+    variant = _variant()
+    adapter = _NoOpAdapter(variant)
+    call = _surface_call()
+    probe = SchemaProbe("schema-zero-step", "search", call, [])
+    step = DenotationCase(
+        "denotation-zero-step",
+        call,
+        [],
+        [],
+        [],
+        {"status": "noop"},
+    )
+    state_case = StateCase("state-zero-step", "episode-zero-step")
+    trace_case = TraceCase("trace-zero-step", "episode-zero-step")
+    empty_trace = ExecutionTrace([], [], [])
+    empty_evidence = TraceEvidence(
+        empty_trace,
+        empty_trace,
+        [],
+        1,
+        1,
+        [],
+        [],
+    )
+
+    empty_suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        lambda _: empty_evidence,
+    )
+
+    assert empty_suite.results[3].checks_run == 0
+    assert "trace.empty_steps" in {
+        item.code for item in empty_suite.results[3].diagnostics
+    }
+    with pytest.raises(ValueError, match=r"non-vacuous|pass|provenance"):
+        require_dataset_admission(variant, empty_suite)
+
+    zero_action_trace = ExecutionTrace([call], [], [])
+    zero_action_evidence = TraceEvidence(
+        zero_action_trace,
+        zero_action_trace,
+        [step],
+        1,
+        1,
+        [],
+        [],
+    )
+    zero_action_suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        lambda _: zero_action_evidence,
+    )
+
+    assert zero_action_suite.results[3].checks_run == 1
+    assert require_dataset_admission(variant, zero_action_suite) is zero_action_suite
 
 
 def _effect(
@@ -1145,6 +1515,99 @@ def _evaluate_identity_components(
     return variant, suite
 
 
+@pytest.mark.parametrize("stage", ["parse", "compile", "wrap", "canonicalize"])
+def test_suite_rejects_adapter_rebinding_during_every_adapter_stage(stage: str) -> None:
+    variant, _, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    adapter = _StageRebindingAdapter(variant, stage)
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        lambda _: trace_evidence,
+    )
+
+    assert "suite.variant_binding_mismatch" in {
+        item.code for item in suite.results[0].diagnostics
+    }
+    assert suite.passed is False
+    with pytest.raises(ValueError, match=r"pass|binding"):
+        require_dataset_admission(variant, suite)
+
+
+def test_suite_uses_initial_fingerprint_against_in_place_variant_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variant, _, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    initial_fingerprint = schema_fingerprint(variant)
+    adapter = _InPlaceVariantMutationAdapter(variant)
+    monkeypatch.setattr(SchemaVariant, "__eq__", lambda self, other: True)
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        lambda _: trace_evidence,
+    )
+
+    assert schema_fingerprint(variant) != initial_fingerprint
+    assert "suite.variant_binding_mismatch" in {
+        item.code for item in suite.results[0].diagnostics
+    }
+    assert suite.passed is False
+    with pytest.raises(ValueError, match=r"fingerprint|pass|binding"):
+        require_dataset_admission(variant, suite)
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_code"),
+    [
+        ("parse", "schema.variant_rebound"),
+        ("compile", "denotation.variant_rebound"),
+        ("wrap", "denotation.variant_rebound"),
+        ("canonicalize", "trace.variant_rebound"),
+    ],
+)
+def test_suite_rejects_transient_rebinding_at_each_adapter_boundary(
+    stage: str,
+    expected_code: str,
+) -> None:
+    variant, _, probe, step, state_case, trace_case, trace_evidence = (
+        _identity_suite_components()
+    )
+    suite = evaluate_contract_suite(
+        variant,
+        _TransientStageRebindingAdapter(variant, stage),
+        [probe],
+        [step],
+        [state_case],
+        lambda _: _state_evidence(),
+        [trace_case],
+        lambda _: trace_evidence,
+    )
+
+    assert expected_code in {
+        diagnostic.code
+        for result in suite.results
+        for diagnostic in result.diagnostics
+    }
+    assert suite.passed is False
+    with pytest.raises(ValueError, match=r"pass|binding"):
+        require_dataset_admission(variant, suite)
+
+
 def test_suite_runs_all_four_layers_when_every_checker_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1371,6 +1834,59 @@ def test_hard_admission_rejects_copied_private_seals_on_forged_suite() -> None:
 
     with pytest.raises(ValueError, match=r"evaluation|issued|provenance|forged"):
         require_dataset_admission(variant, forged_suite)
+
+
+def test_hard_admission_uses_external_provenance_for_evaluator_failure() -> None:
+    supplied_variant = _variant()
+    variant, suite = _evaluate_identity_components(
+        adapter_override=_BadSchemaAdapter(supplied_variant)
+    )
+    assert suite.passed is False
+
+    for result in suite.results:
+        clean = LayerContractResult(
+            result.layer,
+            result.fingerprint,
+            result.checks_run,
+            [],
+        )
+        object.__setattr__(result, "diagnostics", ())
+        object.__setattr__(
+            result,
+            "_snapshot_fingerprint",
+            clean._snapshot_fingerprint,
+        )
+        object.__setattr__(
+            result,
+            "_sealed_snapshot_fingerprint",
+            clean._snapshot_fingerprint,
+        )
+    aggregate = contract_suite_fingerprint(suite.schema_fingerprint, suite.results)
+    object.__setattr__(suite, "fingerprint", aggregate)
+    object.__setattr__(suite, "_sealed_fingerprint", aggregate)
+    object.__setattr__(
+        suite,
+        "_admission_snapshot_fingerprint",
+        schema_contracts._admission_snapshot_fingerprint(suite),
+    )
+    with pytest.raises(ValueError, match=r"provenance|mutated"):
+        _ = suite.passed
+
+    with pytest.raises(ValueError, match=r"provenance|mutated|issued"):
+        require_dataset_admission(variant, suite)
+
+
+def test_suite_passed_revalidates_object_setattr_mutation() -> None:
+    supplied_variant = _variant()
+    _, suite = _evaluate_identity_components(
+        adapter_override=_BadSchemaAdapter(supplied_variant)
+    )
+    assert suite.passed is False
+    for result in suite.results:
+        object.__setattr__(result, "diagnostics", ())
+
+    with pytest.raises(ValueError, match=r"provenance|mutated"):
+        _ = suite.passed
 
 
 def test_hard_admission_rejects_dual_episode_fingerprint_mutation() -> None:
