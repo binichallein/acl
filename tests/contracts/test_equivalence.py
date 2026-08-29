@@ -384,6 +384,27 @@ class _TransientStageRebindingAdapter(_IdentityAdapter):
         return trace.semantic_actions
 
 
+class _DenotationListSwapAdapter(_IdentityAdapter):
+    def __init__(
+        self,
+        variant: SchemaVariant,
+        mutable_steps: list[DenotationCase],
+        replacement: DenotationCase,
+    ) -> None:
+        super().__init__(variant)
+        self._mutable_steps = mutable_steps
+        self._replacement = replacement
+        self._parse_calls = 0
+
+    def surface_to_semantic(
+        self, surface_call: Mapping[str, JSONValue]
+    ) -> tuple[SemanticAction, ...]:
+        self._parse_calls += 1
+        if self._parse_calls == 3:
+            self._mutable_steps[0] = self._replacement
+        return super().surface_to_semantic(surface_call)
+
+
 def test_schema_fingerprint_covers_variant_and_ordered_full_tool_specs() -> None:
     first = SchemaVariant(
         variant_id="identity-v1",
@@ -1606,6 +1627,148 @@ def test_suite_rejects_transient_rebinding_at_each_adapter_boundary(
     assert suite.passed is False
     with pytest.raises(ValueError, match=r"pass|binding"):
         require_dataset_admission(variant, suite)
+
+
+def test_suite_freezes_denotation_identity_before_adapter_can_swap_input_list() -> None:
+    variant = _variant()
+    action = SemanticAction("search", {"value": "alpha"})
+    call = _surface_call()
+    checked_step = DenotationCase(
+        "denotation-checked-step",
+        call,
+        [action],
+        [[call]],
+        [[{"items": [1]}]],
+        {"items": [1]},
+    )
+    unchecked_action = SemanticAction("delete_all", {})
+    unchecked_call = {"name": "delete_all", "arguments": {}}
+    unchecked_step = DenotationCase(
+        "denotation-unchecked-step",
+        unchecked_call,
+        [unchecked_action],
+        [[unchecked_call]],
+        [[{"deleted": True}]],
+        {"deleted": True},
+    )
+    mutable_steps = [checked_step]
+    adapter = _DenotationListSwapAdapter(variant, mutable_steps, unchecked_step)
+    trace = ExecutionTrace([unchecked_call], [unchecked_action], [unchecked_call])
+    effect = _effect(unchecked_call)
+    trace_evidence = TraceEvidence(
+        trace,
+        trace,
+        [unchecked_step],
+        1,
+        1,
+        [effect],
+        [effect],
+    )
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [SchemaProbe("schema-toctou", "search", call, [action])],
+        mutable_steps,
+        [StateCase("state-toctou", "episode-toctou")],
+        lambda _: _state_evidence(),
+        [TraceCase("trace-toctou", "episode-toctou")],
+        lambda _: trace_evidence,
+    )
+
+    assert mutable_steps[0] is unchecked_step
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_UNCHECKED_STEP")
+    assert "trace.unverified_step" in {
+        item.code for item in suite.results[3].diagnostics
+    }
+
+
+def test_suite_freezes_checked_state_episode_before_provider_can_swap_list() -> None:
+    variant, adapter, probe, step, _, _, _ = _identity_suite_components()
+    checked_state_case = StateCase("state-checked-episode", "episode-checked")
+    unchecked_state_case = StateCase("state-unchecked-episode", "episode-unchecked")
+    mutable_state_cases = [checked_state_case]
+    trace_case = TraceCase("trace-unchecked-episode", "episode-unchecked")
+    action = step.expected_actions[0]
+    call = step.surface_call
+    trace = ExecutionTrace([call], [action], [call])
+    effect = _effect(call)
+    trace_evidence = TraceEvidence(
+        trace,
+        trace,
+        [step],
+        1,
+        1,
+        [effect],
+        [effect],
+    )
+
+    def swapping_state_provider(requested: StateCase) -> StateEvidence:
+        assert requested is checked_state_case
+        mutable_state_cases[0] = unchecked_state_case
+        return _state_evidence()
+
+    suite = evaluate_contract_suite(
+        variant,
+        adapter,
+        [probe],
+        [step],
+        mutable_state_cases,
+        swapping_state_provider,
+        [trace_case],
+        lambda _: trace_evidence,
+    )
+
+    assert mutable_state_cases[0] is unchecked_state_case
+    try:
+        require_dataset_admission(variant, suite)
+    except ValueError:
+        pass
+    else:
+        pytest.fail("ADMITTED_DIFFERENT_CHECKED_EPISODES")
+    assert "suite.episode_set_mismatch" in {
+        item.code for item in suite.results[3].diagnostics
+    }
+
+
+def test_suite_conversion_exceptions_still_return_all_four_layer_results() -> None:
+    class ExplodingList(list[object]):
+        def __iter__(self):
+            raise RuntimeError("conversion payload /private/sequence 919")
+
+    variant = _variant()
+    exploding = ExplodingList([object()])
+
+    suite = evaluate_contract_suite(
+        variant,
+        _IdentityAdapter(variant),
+        exploding,  # type: ignore[arg-type]
+        exploding,
+        exploding,
+        lambda _: _state_evidence(),
+        exploding,
+        lambda _: None,
+    )
+    diagnostic_text = " ".join(
+        f"{item.code} {item.message} {item.case_id}"
+        for result in suite.results
+        for item in result.diagnostics
+    )
+
+    assert [result.layer for result in suite.results] == [
+        "schema",
+        "denotation",
+        "state",
+        "trace",
+    ]
+    assert all(result.diagnostics for result in suite.results)
+    assert "/private" not in diagnostic_text
+    assert "919" not in diagnostic_text
 
 
 def test_suite_runs_all_four_layers_when_every_checker_raises(

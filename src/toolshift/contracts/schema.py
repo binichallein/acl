@@ -25,6 +25,7 @@ _SAFE_MESSAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,;:()'=_+-]{0,239}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LAYER_ATTESTATION = object()
 _SUITE_ATTESTATION = object()
+_INVALID_SUITE_SEQUENCE = object()
 
 
 def _require_safe_identifier(value: object, context: str) -> str:
@@ -615,6 +616,15 @@ def _episode_fingerprint(values: Sequence[str]) -> str:
     )
 
 
+def _freeze_suite_sequence(value: object) -> object:
+    if not isinstance(value, (list, tuple)):
+        return value
+    try:
+        return tuple(value)
+    except Exception:
+        return _INVALID_SUITE_SEQUENCE
+
+
 def evaluate_contract_suite(
     variant: SchemaVariant,
     adapter: SemanticAdapter,
@@ -630,6 +640,11 @@ def evaluate_contract_suite(
     from toolshift.contracts.denotation import check_denotation_contract
     from toolshift.contracts.state import _validate_state_case, check_state_contract
     from toolshift.contracts.trace import _validate_trace_case, check_trace_contract
+
+    schema_probes = cast(Sequence[SchemaProbe], _freeze_suite_sequence(schema_probes))
+    denotation_cases = cast(Sequence[object], _freeze_suite_sequence(denotation_cases))
+    state_cases = cast(Sequence[object], _freeze_suite_sequence(state_cases))
+    trace_cases = cast(Sequence[object], _freeze_suite_sequence(trace_cases))
 
     try:
         _validate_schema_variant(variant)
