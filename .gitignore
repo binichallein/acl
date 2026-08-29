@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+*~
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Large research artifacts
+artifacts/
+checkpoints/
+models/
+outputs/
+wandb/
+data/raw/
+data/cache/
+*.parquet
+*.jsonl
+*.sqlite
+*.db
+*.pt
+*.pth
+*.safetensors
+
+# Benchmark protected assets
+*.bundle
+
+# Local worktrees
+.worktrees/
+worktrees/
+
