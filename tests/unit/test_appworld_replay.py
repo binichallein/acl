@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from contextlib import AbstractContextManager
 from dataclasses import FrozenInstanceError
@@ -549,25 +550,67 @@ def test_native_request_trace_must_be_nonempty_and_match_pinned_shape(
 
 def _run(
     *,
-    initial: str = "initial",
-    final: str = "final",
-    evaluator: str = "evaluator",
-    trace: str = "trace",
+    initial: str | None = "initial",
+    final: str | None = "final",
+    evaluator: str | None = "evaluator",
+    trace: str | None = "trace",
     success: bool = True,
     execution_failed: bool = False,
     failure_stage: ReplayStage | None = None,
     exception_type: str | None = None,
 ) -> ReplayRun:
+    def fingerprint(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
     return ReplayRun(
-        initial_state_sha256=initial,
-        final_state_sha256=final,
-        evaluator_sha256=evaluator,
-        trace_sha256=trace,
+        initial_state_sha256=fingerprint(initial),
+        final_state_sha256=fingerprint(final),
+        evaluator_sha256=fingerprint(evaluator),
+        trace_sha256=fingerprint(trace),
         oracle_success=success,
         execution_failed=execution_failed,
         failure_stage=failure_stage,
         exception_type=exception_type,
     )
+
+
+@pytest.mark.parametrize(
+    "invalid_fingerprint",
+    ["", "   ", "a" * 63, "A" * 64, "g" * 64],
+    ids=["empty", "whitespace", "short", "uppercase", "non-hex"],
+)
+def test_replay_run_rejects_non_sha256_fingerprints(
+    invalid_fingerprint: str,
+) -> None:
+    valid_fingerprint = hashlib.sha256(b"valid").hexdigest()
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        ReplayRun(
+            initial_state_sha256=invalid_fingerprint,
+            final_state_sha256=valid_fingerprint,
+            evaluator_sha256=valid_fingerprint,
+            trace_sha256=valid_fingerprint,
+            oracle_success=True,
+            execution_failed=False,
+        )
+
+
+def test_failed_replay_run_allows_only_none_or_valid_produced_fingerprints() -> None:
+    valid_fingerprint = hashlib.sha256(b"initial state").hexdigest()
+
+    run = ReplayRun(
+        initial_state_sha256=valid_fingerprint,
+        final_state_sha256=None,
+        evaluator_sha256=None,
+        trace_sha256=None,
+        oracle_success=False,
+        execution_failed=True,
+        failure_stage=ReplayStage.EXECUTE_ORACLE,
+    )
+
+    assert run.initial_state_sha256 == valid_fingerprint
 
 
 def test_failed_replay_run_cannot_claim_oracle_success() -> None:
@@ -614,6 +657,32 @@ def test_summary_rejects_non_task_results_and_forged_run_shapes() -> None:
         summarize_replays(
             task_set,
             [forged_result],
+            mode=ReplayMode.SMOKE,
+            seed=100,
+            repetitions=2,
+            workers=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "initial_state_sha256",
+        "final_state_sha256",
+        "evaluator_sha256",
+        "trace_sha256",
+    ],
+)
+def test_summary_rejects_forged_smoke_fingerprint(field_name: str) -> None:
+    task_set = build_task_set({"train": ["train-task-unit"]})
+    first_run = _run()
+    result = _task_result(first_run, _run())
+    object.__setattr__(first_run, field_name, "forged")
+
+    with pytest.raises(ValueError, match="replay result integrity"):
+        summarize_replays(
+            task_set,
+            [result],
             mode=ReplayMode.SMOKE,
             seed=100,
             repetitions=2,
@@ -721,6 +790,44 @@ def test_formal_summary_passes_only_for_complete_fixed_official_protocol() -> No
     assert summary.oracle_success_rate == 1.0
     assert summary.execution_failure_count == 0
     assert summary.exception_count == 0
+    assert summary.episode_count == 441
+    assert type(summary.episode_count) is int
+
+
+@pytest.mark.parametrize(
+    ("seed", "repetitions", "message"),
+    [
+        (100.0, 3, "seed must"),
+        (True, 3, "seed must"),
+        (100, 3.0, "repetitions must"),
+        (100, True, "repetitions must"),
+        (100, 1, "repetitions must"),
+    ],
+    ids=[
+        "float-seed",
+        "bool-seed",
+        "float-repetitions",
+        "bool-repetitions",
+        "too-few-repetitions",
+    ],
+)
+def test_summary_rejects_non_integer_protocol_values(
+    seed: object,
+    repetitions: object,
+    message: str,
+) -> None:
+    task_set = _official_task_set()
+    result = _task_result(_run(), _run(), _run())
+
+    with pytest.raises(ValueError, match=message):
+        summarize_replays(
+            task_set,
+            [result] * 147,
+            mode=ReplayMode.GATE,
+            seed=seed,  # type: ignore[arg-type]
+            repetitions=repetitions,  # type: ignore[arg-type]
+            workers=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -847,9 +954,9 @@ def test_exception_and_initial_state_mismatch_always_fail_gate() -> None:
         _run(),
         _run(
             initial="changed",
-            final="",
-            evaluator="",
-            trace="",
+            final=None,
+            evaluator=None,
+            trace=None,
             success=False,
             execution_failed=True,
             failure_stage=ReplayStage.EVALUATE,

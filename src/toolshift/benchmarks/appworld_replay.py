@@ -33,6 +33,7 @@ OFFICIAL_TASK_COUNT = sum(OFFICIAL_SPLIT_COUNTS.values())
 _ALLOWED_SPLITS = frozenset(OFFICIAL_SPLIT_COUNTS)
 _EXECUTION_FAILURE_PREFIX = "Execution failed. Traceback:"
 _EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 class ReplayMode(str, Enum):
@@ -102,8 +103,13 @@ class ReplayRun:
             "trace_sha256",
         ):
             value = getattr(self, field_name)
-            if value is not None and not isinstance(value, str):
-                raise ValueError(f"{field_name} must be text or None")
+            if value is not None and (
+                not isinstance(value, str)
+                or _SHA256_PATTERN.fullmatch(value) is None
+            ):
+                raise ValueError(
+                    f"{field_name} must be a lowercase SHA-256 fingerprint or None"
+                )
         if not isinstance(self.oracle_success, bool):
             raise ValueError("oracle_success must be a boolean")
         if not isinstance(self.execution_failed, bool):
@@ -670,6 +676,14 @@ def summarize_replays(
     task_set = _require_task_set_integrity(task_set)
     if not isinstance(mode, ReplayMode):
         raise ValueError("mode must be a ReplayMode")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
+    if (
+        isinstance(repetitions, bool)
+        or not isinstance(repetitions, int)
+        or repetitions < 2
+    ):
+        raise ValueError("repetitions must be an integer of at least two")
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
     results = _require_replay_results_integrity(results, repetitions=repetitions)
