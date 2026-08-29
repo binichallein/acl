@@ -1,0 +1,10 @@
+schema_version: 1
+machine: ml2
+resources:
+  gpu_model: NVIDIA A100-SXM4-80GB
+  gpus: 4
+  gpu_memory_gib: 80
+  cpus: 112
+  memory_gib: 935
+storage:
+  shared_root_env: TOOLSHIFT_SHARED_ROOT

@@ -8,6 +8,30 @@ The project uses AppWorld as the primary stateful training and evaluation enviro
 
 The project is in the environment-validation and pilot-design phase. Results and model artifacts will be published only after reproducibility and data-license checks.
 
+The local W1 project scaffold and system-configuration layer are under development. The remote AppWorld installation and smoke test on `ml2` have **not** been completed yet.
+
+## Local development
+
+ToolShift requires Python 3.10 or newer. Create an isolated environment and install the package with its development tools:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+Copy `.env.example` to an ignored `.env` or export `TOOLSHIFT_SHARED_ROOT` in the runtime shell. Never commit the machine-specific shared path, proxy settings, or credentials.
+
+Run the local quality gates with:
+
+```bash
+ruff check .
+pytest
+```
+
+The dependency candidates and their unresolved revisions are recorded in `data/manifests/dependencies.yaml`. Revisions must be replaced with verified immutable identifiers before the corresponding remote smoke test is declared reproducible.
+
 ## Development principles
 
 - Work on topic branches and merge through reviewed pull requests.
