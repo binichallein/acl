@@ -72,7 +72,8 @@ The two data version files must both report `0.2.0`. The path/size inventory and
 Before starting AppWorld verification, remove every external proxy variable from the verification shell:
 
 ```bash
-unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+  http_proxy https_proxy all_proxy no_proxy
 ```
 
 This step is mandatory because AppWorld starts localhost services during verification. If a proxy remains active, local health checks can be routed through it and fail even when the local service is healthy.
@@ -87,3 +88,73 @@ cd "${TOOLSHIFT_SHARED_ROOT}/repos/appworld"
 ```
 
 Record only exit codes, elapsed seconds, suite counts, immutable revisions, and checksums in the repository manifest. Keep full logs and any protected data outside Git under `${TOOLSHIFT_SHARED_ROOT}`.
+
+## Deterministic oracle replay and Gate 0a
+
+AppWorld resolves its data relative to the process working directory. The smoke and
+formal verifier therefore **must run from the pinned AppWorld checkout**, even though
+the ToolShift script and test live in a separate repository. The verifier rejects any
+checkout whose `HEAD` is not the manifest revision.
+
+Gate 0a treats reset as construction of a fresh AppWorld instance. Every repetition
+uses a distinct `experiment_name`, runs the compiled train/dev oracle through native
+AppWorld APIs, evaluates it, and closes the world through a context manager. Do not use
+`load_state()` for this gate: the pinned revision can create a double time-freezer when
+state loading is combined with repeated world lifecycles. A fresh-world reset avoids
+that compatibility issue and tests the lifecycle used by later paired rollouts.
+Each successful repetition must contain at least one native request with the pinned
+`method`/`url`/`data` shape. The verifier hashes that private request list in memory and
+persists only its aggregate consistency rate.
+
+Supply the ToolShift checkout only at runtime. Clear every proxy-related variable
+before either smoke or formal execution so localhost AppWorld services are never
+routed away from the node:
+
+```bash
+set -euo pipefail
+: "${TOOLSHIFT_SHARED_ROOT:?TOOLSHIFT_SHARED_ROOT must be set and non-empty}"
+: "${TOOLSHIFT_REPOSITORY_ROOT:?TOOLSHIFT_REPOSITORY_ROOT must be set and non-empty}"
+case "${TOOLSHIFT_REPOSITORY_ROOT}" in
+  /*) ;;
+  *)
+    echo "TOOLSHIFT_REPOSITORY_ROOT must be an absolute path" >&2
+    exit 1
+    ;;
+esac
+TOOLSHIFT_REPOSITORY_ROOT="$(realpath -m -- "${TOOLSHIFT_REPOSITORY_ROOT}")"
+readonly TOOLSHIFT_REPOSITORY_ROOT
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+  http_proxy https_proxy all_proxy no_proxy
+mkdir -p "${TOOLSHIFT_SHARED_ROOT}/artifacts/gate0a"
+uv pip install \
+  --python "${TOOLSHIFT_SHARED_ROOT}/venvs/appworld-0.2.0/bin/python" \
+  -e "${TOOLSHIFT_REPOSITORY_ROOT}[dev]"
+cd "${TOOLSHIFT_SHARED_ROOT}/repos/appworld"
+
+TOOLSHIFT_RUN_APPWORLD_SMOKE=1 \
+  "${TOOLSHIFT_SHARED_ROOT}/venvs/appworld-0.2.0/bin/pytest" \
+  "${TOOLSHIFT_REPOSITORY_ROOT}/tests/smoke/test_environment.py" -v
+
+"${TOOLSHIFT_SHARED_ROOT}/venvs/appworld-0.2.0/bin/python" \
+  "${TOOLSHIFT_REPOSITORY_ROOT}/scripts/verify_appworld_replay.py" \
+  --smoke \
+  --output "${TOOLSHIFT_SHARED_ROOT}/artifacts/gate0a/smoke-summary.json"
+
+"${TOOLSHIFT_SHARED_ROOT}/venvs/appworld-0.2.0/bin/python" \
+  "${TOOLSHIFT_REPOSITORY_ROOT}/scripts/verify_appworld_replay.py" \
+  --output "${TOOLSHIFT_SHARED_ROOT}/artifacts/gate0a/formal-summary.json"
+```
+
+The formal command is intentionally fixed to all 90 train and 57 dev tasks, seed 100,
+three fresh worlds per task, and one worker. A formal report is Gate-evaluable only
+under that complete 147-task protocol. Its `task_consistency_rate` is a task-level AND
+over initial state, final state, evaluator, private request trace, oracle success, and
+zero execution failures; it must be at least 99%. The explicit smoke runs one train task
+twice;
+exit code zero means only that create, fresh reset, native oracle execution, evaluation,
+and close completed consistently. A smoke report always has `gate_evaluable=false` and
+`gate_passed=false`.
+
+The JSON report contains aggregate counts, rates, the pinned revision, and a SHA256
+fingerprint of the task set. It never contains raw task IDs, checkout paths, compiled
+solutions, execution output, API arguments, evaluator requirements, or request traces.
