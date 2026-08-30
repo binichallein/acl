@@ -612,6 +612,49 @@ def test_builder_rejects_non_draft_2020_schema_uri_without_payload_disclosure() 
     assert "PRIVATE_DIALECT" not in str(caught.value)
 
 
+def test_builder_rejects_nested_non_draft_2020_schema_without_payload_disclosure() -> None:
+    schema = _search_schema()
+    properties = cast(dict[str, JSONValue], schema["properties"])
+    properties["query"] = {
+        "type": "array",
+        "items": {
+            "$schema": "PRIVATE_DIALECT",
+            "type": "string",
+        },
+    }
+
+    with pytest.raises(TransformValidationError) as caught:
+        build_parameter_restructure_transform(
+            _base_variant(search_schema=schema),
+            rules=(_search_rule(("query",)),),
+            seed=7,
+        )
+
+    assert "PRIVATE_DIALECT" not in str(caught.value)
+
+
+def test_builder_accepts_nested_canonical_draft_2020_schema() -> None:
+    schema = _search_schema()
+    properties = cast(dict[str, JSONValue], schema["properties"])
+    nested: dict[str, JSONValue] = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+    }
+    properties["query"] = {"type": "array", "items": nested}
+
+    transform = build_parameter_restructure_transform(
+        _base_variant(search_schema=schema),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+
+    request = _properties(_tool(transform.variant, "search"))["request"]
+    assert isinstance(request, Mapping)
+    moved = request["properties"]
+    assert isinstance(moved, Mapping)
+    assert moved["query"] == properties["query"]
+
+
 def test_whitespace_only_property_name_is_preserved_when_unmoved() -> None:
     schema: dict[str, JSONValue] = {
         "type": "object",
@@ -672,7 +715,12 @@ def test_forbidden_words_in_property_names_and_instance_data_are_allowed() -> No
         "properties": {
             "$ref": {"type": "string"},
             "payload": {
-                "const": {"$id": "literal", "default": "literal", "examples": ()},
+                "const": {
+                    "$schema": "PRIVATE_DIALECT",
+                    "$id": "literal",
+                    "default": "literal",
+                    "examples": (),
+                },
             },
         },
         "additionalProperties": False,
@@ -882,6 +930,39 @@ def test_direct_transform_rejects_variant_not_rebuilt_from_rules() -> None:
         ParameterRestructureTransform(
             built.source_variant,
             wrong_variant,
+            built.operator,
+            built.rules,
+        )
+
+
+def test_direct_transform_rejects_equal_identity_tool_clone() -> None:
+    built = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+    source_identity = _tool(built.source_variant, "status")
+    identity_clone = SurfaceToolSpec(
+        source_identity.name,
+        source_identity.description,
+        source_identity.input_schema,
+    )
+    cloned_tools = tuple(
+        identity_clone if tool.name == source_identity.name else tool
+        for tool in built.variant.tools
+    )
+    equal_variant = SchemaVariant(
+        built.variant.variant_id,
+        cloned_tools,
+        built.variant.manifest,
+    )
+    assert equal_variant == built.variant
+    assert identity_clone is not source_identity
+
+    with pytest.raises(TransformValidationError, match="variant"):
+        ParameterRestructureTransform(
+            built.source_variant,
+            equal_variant,
             built.operator,
             built.rules,
         )

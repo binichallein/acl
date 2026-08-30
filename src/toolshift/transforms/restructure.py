@@ -228,13 +228,18 @@ def _dependencies_contain_forbidden_keyword(value: Mapping[object, object]) -> b
     )
 
 
+def _schema_node_uses_unsupported_dialect(value: Mapping[object, object]) -> bool:
+    return "$schema" in value and value["$schema"] != _DRAFT_2020_12_SCHEMA_URI
+
+
 def _schema_node_contains_forbidden_keyword(value: object) -> bool:
     if type(value) is bool:
         return False
     if not isinstance(value, Mapping):
         return False
     return (
-        any(key in _FORBIDDEN_SCHEMA_KEYWORDS for key in value)
+        _schema_node_uses_unsupported_dialect(value)
+        or any(key in _FORBIDDEN_SCHEMA_KEYWORDS for key in value)
         or _single_subschemas_contain_forbidden_keyword(value)
         or _array_subschemas_contain_forbidden_keyword(value)
         or _mapping_subschemas_contain_forbidden_keyword(value)
@@ -253,7 +258,7 @@ def _valid_property_name(value: object) -> bool:
 
 
 def _valid_root_annotations(schema: Mapping[str, JSONValue]) -> bool:
-    if "$schema" in schema and schema["$schema"] != _DRAFT_2020_12_SCHEMA_URI:
+    if _schema_node_uses_unsupported_dialect(schema):
         return False
     for key in _ROOT_ANNOTATION_KEYS:
         if key not in schema:
