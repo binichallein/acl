@@ -305,6 +305,8 @@ def _schema_format_entries(
             raise _SchemaSnapshotError
         active.add(identity)
         try:
+            if "$schema" in node:
+                raise _SchemaSnapshotError
             if "format" in node:
                 format_name = node["format"]
                 if (

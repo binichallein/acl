@@ -565,6 +565,48 @@ def test_catalog_construction_rejects_nested_resource_identifiers(
     assert private_identifier not in str(raised.value)
 
 
+@pytest.mark.parametrize("location", ["root", "nested", "referenced-target"])
+def test_catalog_construction_rejects_schema_dialect_overrides(location: str) -> None:
+    alternate_dialect = "http://json-schema.org/draft-07/schema#"
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={
+            "value": {
+                "type": "object",
+                "unevaluatedProperties": False,
+            }
+        },
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    properties = parameters["properties"]
+    assert isinstance(properties, dict)
+    value_schema = properties["value"]
+    assert isinstance(value_schema, dict)
+    if location == "root":
+        parameters["$schema"] = alternate_dialect
+    elif location == "nested":
+        value_schema["$schema"] = alternate_dialect
+    else:
+        value_schema.clear()
+        value_schema["$ref"] = "#/x-private/target"
+        parameters["x-private"] = {
+            "target": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "unevaluatedProperties": False,
+            }
+        }
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert alternate_dialect not in str(raised.value)
+
+
 def test_catalog_construction_rejects_cyclic_local_refs() -> None:
     tool = _tool(
         "synthetic__validate_value",
