@@ -1648,6 +1648,7 @@ def test_private_appworld_tree_precreates_private_runtime_directories(
     for relative in (
         "experiments",
         "experiments/outputs",
+        ".cache",
         ".tmp",
         ".profiling",
         "plots",
@@ -2261,9 +2262,18 @@ def test_editable_checkout_pin_verifies_expanded_lfs_payload_bytes(
     assert raised.value.__cause__ is None
 
 
-def test_editable_checkout_pin_rejects_untracked_importable_source(
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "src/appworld/untracked_runtime.py",
+        "src/appworld/apps/admin/untracked_runtime.py",
+        ".env",
+    ],
+)
+def test_editable_checkout_pin_rejects_untracked_runtime_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    relative: str,
 ) -> None:
     import toolshift.benchmarks.appworld_gate0 as gate0_module
 
@@ -2289,7 +2299,9 @@ def test_editable_checkout_pin_rejects_untracked_importable_source(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    (package / "untracked_runtime.py").write_text(
+    untracked = checkout / relative
+    untracked.parent.mkdir(parents=True, exist_ok=True)
+    untracked.write_text(
         "PRIVATE_RUNTIME_OVERRIDE = True\n",
         encoding="utf-8",
     )
@@ -2327,7 +2339,19 @@ def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
     for key in tuple(os.environ):
         if key.lower().endswith("_proxy"):
             monkeypatch.delenv(key, raising=False)
+    for key in ("APPWORLD_DB_ARGS", "APPWORLD_DATE_TIME", "LOAD_ON_STARTUP"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("APPWORLD_ROOT", str(private_root))
+    monkeypatch.setenv("APPWORLD_CACHE", str(private_root / ".cache"))
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     monkeypatch.setattr(gate0_module.sys, "version_info", (3, 11, 15, "final", 0))
+    monkeypatch.setattr(gate0_module.sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(
+        gate0_module.importlib.metadata,
+        "version",
+        lambda name: "1.2.2" if name == "python-dotenv" else "unexpected",
+    )
     monkeypatch.setattr(
         gate0_module,
         "_require_private_appworld_root",
@@ -2355,7 +2379,47 @@ def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
     monkeypatch.setitem(sys.modules, "appworld.common", common_module)
     monkeypatch.setitem(sys.modules, "appworld.common.constants", constants_module)
 
+    dotenv_module = ModuleType("dotenv")
+    dotenv_module.load_dotenv = lambda *, stream, override: False  # type: ignore[attr-defined]
+    original_import = gate0_module.importlib.import_module
+
+    def import_runtime_module(name: str) -> ModuleType:
+        if name == "dotenv":
+            return dotenv_module
+        return original_import(name)
+
+    monkeypatch.setattr(gate0_module.importlib, "import_module", import_runtime_module)
+
     gate0_module.require_pinned_appworld_runtime()
+
+    monkeypatch.setattr(
+        gate0_module.importlib.metadata,
+        "version",
+        lambda name: "1.1.1" if name == "python-dotenv" else "unexpected",
+    )
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        gate0_module.require_pinned_appworld_runtime()
+    monkeypatch.setattr(
+        gate0_module.importlib.metadata,
+        "version",
+        lambda name: "1.2.2" if name == "python-dotenv" else "unexpected",
+    )
+
+    def mutate_from_dotenv(*, stream: object, override: bool) -> bool:
+        del stream, override
+        monkeypatch.setenv("TOOLSHIFT_DOTENV_DISABLED_PROBE", "mutated")
+        return True
+
+    monkeypatch.setattr(dotenv_module, "load_dotenv", mutate_from_dotenv, raising=False)
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        gate0_module.require_pinned_appworld_runtime()
+    assert "TOOLSHIFT_DOTENV_DISABLED_PROBE" not in os.environ
+    monkeypatch.setattr(
+        dotenv_module,
+        "load_dotenv",
+        lambda *, stream, override: False,
+        raising=False,
+    )
 
     shadow_file = tmp_path / "shadow" / "appworld" / "__init__.py"
     shadow_file.parent.mkdir(parents=True)
@@ -2369,6 +2433,20 @@ def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
     with pytest.raises(RuntimeError, match="preflight failed") as raised:
         gate0_module.require_pinned_appworld_runtime()
     assert "PRIVATE_PROXY_CANARY" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    monkeypatch.delenv("CUSTOM_PROXY")
+
+    original_import = gate0_module.importlib.import_module
+
+    def import_with_environment_mutation(name: str) -> ModuleType:
+        module = original_import(name)
+        if name == "appworld.common.constants":
+            monkeypatch.delenv("PYTHONDONTWRITEBYTECODE")
+        return module
+
+    monkeypatch.setattr(gate0_module.importlib, "import_module", import_with_environment_mutation)
+    with pytest.raises(RuntimeError, match="preflight failed") as raised:
+        gate0_module.require_pinned_appworld_runtime()
     assert raised.value.__cause__ is None
 
 

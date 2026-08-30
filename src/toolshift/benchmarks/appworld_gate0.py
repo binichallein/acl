@@ -6,9 +6,11 @@ contract suite, episode record, task identity, call, observation, or digest.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import importlib.metadata
+import io
 import json
 import os
 import stat
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -79,22 +82,15 @@ _PINNED_APPWORLD_PACKAGE_VERSION = "0.2.0.dev0"
 _PINNED_APPWORLD_DATA_VERSION = "0.2.0"
 _PINNED_APPWORLD_DB_VERSION = "0.2.0"
 _PINNED_PYTHON_VERSION = (3, 11, 15)
-_ALLOWED_APPWORLD_UNTRACKED_SOURCE_PREFIXES = tuple(
-    f"src/appworld/apps/{name}/".encode("ascii")
-    for name in (
-        "admin",
-        "amazon",
-        "api_docs",
-        "file_system",
-        "gmail",
-        "phone",
-        "simple_note",
-        "splitwise",
-        "spotify",
-        "supervisor",
-        "todoist",
-        "venmo",
-    )
+_PINNED_PYTHON_DOTENV_VERSION = "1.2.2"
+_PINNED_APPWORLD_BUNDLE_LAYOUT = (
+    (b"src/appworld/.source/apps.bundle", b"src/appworld"),
+    (b"src/appworld/.source/tests.bundle", b"tests"),
+    (b"generate/.source/tasks.bundle", b"generate/tasks"),
+    (b"generate/.source/data.bundle", b"generate"),
+)
+_FORBIDDEN_APPWORLD_RUNTIME_ENVIRONMENT = frozenset(
+    {"APPWORLD_DB_ARGS", "APPWORLD_DATE_TIME", "LOAD_ON_STARTUP"}
 )
 APPWORLD_ADAPTER_ABI_SHA256 = hashlib.sha256(b"toolshift.appworld.adapter.v1").hexdigest()
 APPWORLD_GATE0_RUNNER_ABI_SHA256 = hashlib.sha256(b"toolshift.appworld.gate0.runner.v1").hexdigest()
@@ -1352,7 +1348,7 @@ def _require_private_appworld_tree(root: Path) -> None:
                 create=True,
             )
         )
-        for name in (".tmp", ".profiling", "plots", ".release"):
+        for name in (".cache", ".tmp", ".profiling", "plots", ".release"):
             runtime_fds.append(
                 _open_private_appworld_directory(name, parent_fd=root_fd, create=True)
             )
@@ -1501,11 +1497,136 @@ def _open_checkout_parent(root_fd: int, parts: tuple[bytes, ...]) -> int:
         raise
 
 
+def _trusted_appworld_bundle_secrets(constants_payload: bytes) -> tuple[str, bytes]:
+    module = ast.parse(constants_payload.decode("utf-8", errors="strict"))
+    literals: dict[str, object] = {}
+    for statement in module.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id in ("PASSWORD", "SALT")
+        ):
+            name = statement.targets[0].id
+            if name in literals:
+                raise ValueError
+            literals[name] = ast.literal_eval(statement.value)
+    bundle_phrase = literals.get("PASSWORD")
+    kdf_salt = literals.get("SALT")
+    if type(bundle_phrase) is not str or type(kdf_salt) is not bytes:
+        raise ValueError
+    return bundle_phrase, kdf_salt
+
+
+def _read_checkout_regular(root_fd: int, raw_path: bytes) -> bytes:
+    parts = tuple(raw_path.split(b"/"))
+    if (
+        not raw_path
+        or raw_path.startswith(b"/")
+        or any(part in (b"", b".", b"..") for part in parts)
+    ):
+        raise ValueError
+    parent_fd = _open_checkout_parent(root_fd, parts[:-1])
+    try:
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
+                raise ValueError
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ):
+                raise ValueError
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def _decrypt_pinned_appworld_bundles(
+    root_fd: int,
+    head_payloads: Mapping[bytes, bytes],
+) -> dict[bytes, bytes]:
+    try:
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+        bundle_phrase, kdf_salt = _trusted_appworld_bundle_secrets(
+            head_payloads[b"src/appworld/common/constants.py"]
+        )
+        expected_files: dict[bytes, bytes] = {}
+        for bundle_path, base_directory in _PINNED_APPWORLD_BUNDLE_LAYOUT:
+            pointer = _parse_lfs_pointer(head_payloads[bundle_path])
+            if pointer is None:
+                raise ValueError
+            expected_digest, expected_size = pointer
+            encrypted = _read_checkout_regular(root_fd, bundle_path)
+            if (
+                len(encrypted) != expected_size
+                or hashlib.sha256(encrypted).hexdigest() != expected_digest
+                or len(encrypted) < 17
+            ):
+                raise ValueError
+            key = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=kdf_salt,
+                iterations=100000,
+                backend=default_backend(),
+            ).derive(bundle_phrase.encode("utf-8"))
+            decryptor = Cipher(
+                algorithms.AES(key),
+                modes.CFB(encrypted[:16]),
+                backend=default_backend(),
+            ).decryptor()
+            archive_bytes = decryptor.update(encrypted[16:]) + decryptor.finalize()
+            with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
+                for info in archive.infolist():
+                    raw_member = info.filename.encode("utf-8", errors="strict")
+                    parts = raw_member.split(b"/")
+                    if (
+                        info.is_dir()
+                        or not raw_member
+                        or raw_member.startswith(b"/")
+                        or b"\\" in raw_member
+                        or any(part in (b"", b".", b"..") for part in parts)
+                    ):
+                        raise ValueError
+                    target = base_directory + b"/" + raw_member
+                    if target in expected_files or target in head_payloads:
+                        raise ValueError
+                    expected_files[target] = archive.read(info)
+        return expected_files
+    except BaseException:
+        raise ValueError from None
+
+
 def _require_untracked_source_layout(
-    checkout: Path,
+    root_fd: int,
     git_prefix: list[str],
     git_environment: dict[str, str],
+    entries: tuple[tuple[bytes, bytes, str, bytes], ...],
 ) -> None:
+    head_payloads = {os.fsencode(path): payload for _, _, path, payload in entries}
     untracked = subprocess.run(
         [*git_prefix, "ls-files", "--others", "-z", "--"],
         check=True,
@@ -1514,35 +1635,30 @@ def _require_untracked_source_layout(
         text=False,
         timeout=30,
     ).stdout
+    actual_paths: set[bytes] = set()
     for raw_path in untracked.split(b"\0"):
-        if not raw_path or not raw_path.startswith(b"src/"):
+        if not raw_path:
             continue
-        parts = raw_path.split(b"/")
-        allowed = (
-            any(
-                raw_path.startswith(prefix)
-                for prefix in _ALLOWED_APPWORLD_UNTRACKED_SOURCE_PREFIXES
-            )
-            or raw_path.startswith(b"src/appworld.egg-info/")
-            or (b"/__pycache__/" in raw_path and raw_path.endswith(b".pyc"))
-        )
         if (
-            not allowed
-            or raw_path.startswith(b"/")
-            or any(part in (b"", b".", b"..") for part in parts)
+            raw_path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in raw_path.split(b"/"))
+            or raw_path in actual_paths
         ):
             raise ValueError
-        current = checkout
-        for index, part in enumerate(parts):
-            current /= os.fsdecode(part)
-            metadata = current.lstat()
-            if metadata.st_uid != os.geteuid() or stat.S_ISLNK(metadata.st_mode):
-                raise ValueError
-            if index < len(parts) - 1:
-                if not stat.S_ISDIR(metadata.st_mode):
-                    raise ValueError
-            elif not stat.S_ISREG(metadata.st_mode):
-                raise ValueError
+        actual_paths.add(raw_path)
+    has_pinned_bundles = all(
+        bundle_path in head_payloads for bundle_path, _ in _PINNED_APPWORLD_BUNDLE_LAYOUT
+    )
+    if not has_pinned_bundles:
+        if actual_paths:
+            raise ValueError
+        return
+    expected_files = _decrypt_pinned_appworld_bundles(root_fd, head_payloads)
+    if actual_paths != set(expected_files):
+        raise ValueError
+    for raw_path, expected in expected_files.items():
+        if _read_checkout_regular(root_fd, raw_path) != expected:
+            raise ValueError
 
 
 def _require_head_worktree_match(
@@ -1551,7 +1667,6 @@ def _require_head_worktree_match(
     git_environment: dict[str, str],
 ) -> None:
     entries = _read_head_blobs(git_prefix, git_environment)
-    _require_untracked_source_layout(checkout, git_prefix, git_environment)
     root_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     opened_root = os.fstat(root_fd)
     try:
@@ -1615,6 +1730,7 @@ def _require_head_worktree_match(
                     os.close(descriptor)
             finally:
                 os.close(parent_fd)
+        _require_untracked_source_layout(root_fd, git_prefix, git_environment, entries)
         current_root = checkout.lstat()
         if (current_root.st_dev, current_root.st_ino) != (
             opened_root.st_dev,
@@ -1755,19 +1871,63 @@ def _require_editable_appworld_checkout() -> Path:
         raise RuntimeError(_PREFLIGHT_FAILURE) from None
 
 
+def _require_pinned_dotenv_runtime() -> None:
+    probe_key = "TOOLSHIFT_DOTENV_DISABLED_PROBE"
+    try:
+        if (
+            importlib.metadata.version("python-dotenv") != _PINNED_PYTHON_DOTENV_VERSION
+            or probe_key in os.environ
+        ):
+            raise ValueError
+        dotenv_module = importlib.import_module("dotenv")
+        load_dotenv = getattr(dotenv_module, "load_dotenv", None)
+        if not callable(load_dotenv):
+            raise ValueError
+        try:
+            disabled = load_dotenv(
+                stream=io.StringIO(f"{probe_key}=mutated\n"),
+                override=True,
+            )
+            if disabled is not False or probe_key in os.environ:
+                raise ValueError
+        finally:
+            os.environ.pop(probe_key, None)
+    except BaseException:
+        raise ValueError from None
+
+
 def require_pinned_appworld_runtime() -> None:
     """Validate the private pinned runtime without exposing paths or values."""
 
     try:
-        if any(key.lower().endswith("_proxy") for key in os.environ):
+        if (
+            any(key.lower().endswith("_proxy") for key in os.environ)
+            or _FORBIDDEN_APPWORLD_RUNTIME_ENVIRONMENT.intersection(os.environ)
+            or os.environ.get("PYTHON_DOTENV_DISABLED") != "1"
+            or os.environ.get("PYTHONDONTWRITEBYTECODE") != "1"
+            or sys.dont_write_bytecode is not True
+        ):
             raise ValueError
         if tuple(sys.version_info[:3]) != _PINNED_PYTHON_VERSION:
             raise ValueError
         root = _require_private_appworld_root()
+        if os.environ.get("APPWORLD_CACHE") != str(root / ".cache"):
+            raise ValueError
         _require_private_appworld_tree(root)
         checkout = _require_editable_appworld_checkout()
+        _require_pinned_dotenv_runtime()
         package_module = importlib.import_module("appworld")
         constants_module = importlib.import_module("appworld.common.constants")
+        if (
+            any(key.lower().endswith("_proxy") for key in os.environ)
+            or _FORBIDDEN_APPWORLD_RUNTIME_ENVIRONMENT.intersection(os.environ)
+            or os.environ.get("APPWORLD_ROOT") != str(root)
+            or os.environ.get("APPWORLD_CACHE") != str(root / ".cache")
+            or os.environ.get("PYTHON_DOTENV_DISABLED") != "1"
+            or os.environ.get("PYTHONDONTWRITEBYTECODE") != "1"
+            or sys.dont_write_bytecode is not True
+        ):
+            raise ValueError
         package_root = (checkout / "src" / "appworld").resolve(strict=True)
         for module in (package_module, constants_module):
             module_file = getattr(module, "__file__", None)
