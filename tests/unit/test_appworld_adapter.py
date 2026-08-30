@@ -6,7 +6,7 @@ import copy
 import os
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,48 @@ def _catalog() -> list[dict[str, object]]:
             additional_properties=False,
         ),
     ]
+
+
+def _semantic_catalog() -> list[dict[str, object]]:
+    return [
+        _tool(
+            "calendar__create_event",
+            properties={
+                "title": {"type": "string", "minLength": 1},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string", "format": "email"},
+                },
+                "options": {
+                    "type": "object",
+                    "properties": {"notify": {"type": "boolean"}},
+                    "required": ["notify"],
+                    "additionalProperties": False,
+                },
+                "retries": {"type": "integer", "minimum": 0, "default": 2},
+            },
+            required=["title", "attendees", "options"],
+        ),
+        _tool(
+            "mail__send_message",
+            properties={"body": {"type": "string", "minLength": 1}},
+            required=["body"],
+        ),
+    ]
+
+
+def _event_call(*, metadata: object | None = None) -> dict[str, object]:
+    call: dict[str, object] = {
+        "name": "calendar__create_event",
+        "arguments": {
+            "title": "Synthetic meeting",
+            "attendees": ["synthetic@example.com"],
+            "options": {"notify": True},
+        },
+    }
+    if metadata is not None:
+        call["metadata"] = metadata
+    return call
 
 
 def test_build_appworld_adapter_snapshots_sorts_and_closes_catalog() -> None:
@@ -170,22 +212,563 @@ def test_importing_appworld_adapter_does_not_import_external_appworld() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
-def test_catalog_only_adapter_fails_closed_for_all_semantic_methods() -> None:
-    adapter = AppWorldSemanticAdapter(_catalog())
-    private_call = {"name": "private__canary", "arguments": {"secret": "private-value"}}
-    action = SemanticAction("private__canary", {"secret": "private-value"})
-    trace = ExecutionTrace((private_call,), (action,), (private_call,))
-    operations = (
-        lambda: adapter.surface_to_semantic(private_call),
-        lambda: adapter.semantic_to_base_calls(action),
-        lambda: adapter.base_observation_to_surface(private_call, (action,), ((None,),)),
-        lambda: adapter.canonicalize_trace(trace),
+def test_surface_to_semantic_parses_one_exact_native_call() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    call = _event_call()
+
+    actions = adapter.surface_to_semantic(call)  # type: ignore[arg-type]
+
+    assert type(actions) is tuple
+    assert len(actions) == 1
+    assert actions[0] == SemanticAction(
+        "calendar__create_event",
+        {
+            "title": "Synthetic meeting",
+            "attendees": ["synthetic@example.com"],
+            "options": {"notify": True},
+        },
+    )
+    assert set(call) == {"name", "arguments"}
+
+
+def test_surface_to_semantic_snapshots_nested_arguments() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    call = _event_call()
+    arguments = call["arguments"]
+    assert isinstance(arguments, dict)
+
+    action = adapter.surface_to_semantic(call)[0]  # type: ignore[arg-type]
+    arguments["title"] = "changed"
+
+    assert action.arguments["title"] == "Synthetic meeting"
+    assert action.arguments["attendees"] == ("synthetic@example.com",)
+    assert action.arguments["options"] == {"notify": True}
+    with pytest.raises(TypeError):
+        action.arguments["title"] = "forbidden"  # type: ignore[index]
+
+
+def test_surface_to_semantic_does_not_apply_schema_defaults() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+
+    action = adapter.surface_to_semantic(_event_call())[0]  # type: ignore[arg-type]
+
+    assert "retries" not in action.arguments
+
+
+@pytest.mark.parametrize(
+    ("call", "private_canary"),
+    [
+        ({"arguments": {}}, "missing-name-canary"),
+        ({"name": "mail__send_message"}, "missing-arguments-canary"),
+        ({"name": 7, "arguments": {}}, "wrong-name-canary"),
+        ({"name": "mail__send_message", "arguments": []}, "array-arguments-canary"),
+        (
+            {"name": "mail__send_message", "arguments": {}},
+            "missing-required-canary",
+        ),
+        (
+            {
+                "name": "mail__send_message",
+                "arguments": {"body": "ok", "private_extra": "PRIVATE_EXTRA_CANARY"},
+            },
+            "PRIVATE_EXTRA_CANARY",
+        ),
+        (
+            {"name": "mail__send_message", "arguments": {"body": 7}},
+            "wrong-type-canary",
+        ),
+        (
+            {
+                "name": "calendar__create_event",
+                "arguments": {
+                    "title": "Synthetic meeting",
+                    "attendees": ["synthetic@example.com"],
+                    "options": {"notify": True},
+                    "retries": True,
+                },
+            },
+            "bool-as-int-canary",
+        ),
+        (
+            {"name": "private__unknown", "arguments": {"secret": "PRIVATE_TOOL_CANARY"}},
+            "PRIVATE_TOOL_CANARY",
+        ),
+        (
+            {
+                "name": "mail__send_message",
+                "arguments": {"body": "ok"},
+                "metadata": {"secret": "PRIVATE_METADATA_CANARY"},
+            },
+            "PRIVATE_METADATA_CANARY",
+        ),
+        (
+            {
+                "name": "mail__send_message",
+                "arguments": {"body": "ok"},
+                "metadata": float("nan"),
+            },
+            "nan-metadata-canary",
+        ),
+        (
+            {
+                "name": "mail__send_message",
+                "arguments": {"body": "ok", "unsafe": 2**53},
+            },
+            "unsafe-integer-canary",
+        ),
+    ],
+    ids=[
+        "missing-name",
+        "missing-arguments",
+        "wrong-name-type",
+        "wrong-arguments-type",
+        "missing-required",
+        "extra-argument",
+        "wrong-argument-type",
+        "bool-is-not-integer",
+        "unknown-tool",
+        "extra-call-metadata",
+        "non-ijson-metadata",
+        "non-ijson-argument",
+    ],
+)
+def test_surface_to_semantic_rejects_invalid_calls_without_payload(
+    call: dict[str, object],
+    private_canary: str,
+) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+
+    with pytest.raises(ValueError, match=r"^AppWorld surface call is invalid$") as raised:
+        adapter.surface_to_semantic(call)  # type: ignore[arg-type]
+
+    assert private_canary not in str(raised.value)
+
+
+def test_surface_to_semantic_rejects_cyclic_arguments_without_payload() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    cyclic: dict[str, object] = {}
+    cyclic["PRIVATE_CYCLE_CANARY"] = cyclic
+
+    with pytest.raises(ValueError, match=r"^AppWorld surface call is invalid$") as raised:
+        adapter.surface_to_semantic(
+            {"name": "mail__send_message", "arguments": cyclic}  # type: ignore[arg-type]
+        )
+
+    assert "PRIVATE_CYCLE_CANARY" not in str(raised.value)
+
+
+def test_semantic_to_base_calls_compiles_one_exact_immutable_native_call() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    action = adapter.surface_to_semantic(
+        _event_call()  # type: ignore[arg-type]
+    )[0]
+
+    base_calls = adapter.semantic_to_base_calls(action)
+
+    assert type(base_calls) is tuple
+    assert len(base_calls) == 1
+    assert base_calls[0] == {
+        "name": "calendar__create_event",
+        "arguments": {
+            "title": "Synthetic meeting",
+            "attendees": ("synthetic@example.com",),
+            "options": {"notify": True},
+        },
+    }
+    assert set(base_calls[0]) == {"name", "arguments"}
+    with pytest.raises(TypeError):
+        base_calls[0]["name"] = "forbidden"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        SemanticAction("private__unknown", {"secret": "PRIVATE_ACTION_CANARY"}),
+        SemanticAction("mail__send_message", {}),
+        SemanticAction("mail__send_message", {"body": 7}),
+    ],
+    ids=["unknown-tool", "missing-required", "wrong-type"],
+)
+def test_semantic_to_base_calls_rejects_invalid_actions_without_payload(
+    action: SemanticAction,
+) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+
+    with pytest.raises(ValueError, match=r"^AppWorld semantic action is invalid$") as raised:
+        adapter.semantic_to_base_calls(action)
+
+    assert "PRIVATE_ACTION_CANARY" not in str(raised.value)
+
+
+def test_semantic_to_base_calls_rejects_tampered_action_snapshot() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    action = SemanticAction("mail__send_message", {"body": "Synthetic"})
+    object.__setattr__(action, "_arguments_canonical", b"PRIVATE_ACTION_SNAPSHOT_CANARY")
+
+    with pytest.raises(ValueError, match=r"^AppWorld semantic action is invalid$") as raised:
+        adapter.semantic_to_base_calls(action)
+
+    assert "PRIVATE_ACTION_SNAPSHOT_CANARY" not in str(raised.value)
+
+
+def test_base_observation_to_surface_wraps_one_deeply_frozen_observation() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    call = _event_call()
+    action = adapter.surface_to_semantic(call)[0]  # type: ignore[arg-type]
+    observation: dict[str, object] = {
+        "event": {"created": True, "attendees": ["synthetic@example.com"]}
+    }
+
+    surface = adapter.base_observation_to_surface(
+        call,  # type: ignore[arg-type]
+        (action,),
+        ((observation,),),  # type: ignore[arg-type]
+    )
+    observation["event"] = {"created": False}
+
+    assert surface == {
+        "event": {"created": True, "attendees": ("synthetic@example.com",)}
+    }
+    assert isinstance(surface, Mapping)
+    with pytest.raises(TypeError):
+        surface["event"] = None  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("actions_factory", "groups"),
+    [
+        (lambda parsed: (), ()),
+        (lambda parsed: (parsed, parsed), ((None,), (None,))),
+        (lambda parsed: (SemanticAction("mail__send_message", {"body": "other"}),), ((None,),)),
+        (lambda parsed: (parsed,), ()),
+        (lambda parsed: (parsed,), ((),)),
+        (lambda parsed: (parsed,), ((None, None),)),
+    ],
+    ids=[
+        "no-action",
+        "multiple-actions",
+        "mismatched-action",
+        "no-group",
+        "empty-group",
+        "multiple-observations",
+    ],
+)
+def test_base_observation_to_surface_rejects_invalid_grouping_without_payload(
+    actions_factory: Callable[[SemanticAction], tuple[SemanticAction, ...]],
+    groups: tuple[tuple[object, ...], ...],
+) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    call = {"name": "mail__send_message", "arguments": {"body": "Synthetic"}}
+    parsed = adapter.surface_to_semantic(call)[0]
+
+    with pytest.raises(ValueError, match=r"^AppWorld observation group is invalid$") as raised:
+        adapter.base_observation_to_surface(
+            call,
+            actions_factory(parsed),
+            groups,  # type: ignore[arg-type]
+        )
+
+    assert "Synthetic" not in str(raised.value)
+
+
+def test_base_observation_to_surface_rejects_non_ijson_observation() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    call = {"name": "mail__send_message", "arguments": {"body": "Synthetic"}}
+    parsed = adapter.surface_to_semantic(call)[0]
+
+    with pytest.raises(ValueError, match=r"^AppWorld observation group is invalid$") as raised:
+        adapter.base_observation_to_surface(
+            call,
+            (parsed,),
+            (({"secret": object()},),),  # type: ignore[arg-type]
+        )
+
+    assert "secret" not in str(raised.value)
+    assert "object" not in str(raised.value)
+
+
+def test_canonicalize_trace_independently_reparses_exact_native_calls() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    surface_calls = (
+        _event_call(),
+        {"name": "mail__send_message", "arguments": {"body": "Synthetic"}},
+    )
+    actions = tuple(
+        adapter.surface_to_semantic(call)[0]  # type: ignore[arg-type]
+        for call in surface_calls
+    )
+    base_calls = tuple(adapter.semantic_to_base_calls(action)[0] for action in actions)
+    trace = ExecutionTrace(surface_calls, actions, base_calls)  # type: ignore[arg-type]
+
+    canonical = adapter.canonicalize_trace(trace)
+
+    assert canonical == actions
+    assert set(base_calls[0]) == {"name", "arguments"}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "reordered-actions",
+        "extra-action",
+        "missing-action",
+        "reordered-base-calls",
+        "extra-base-call",
+        "missing-base-call",
+        "hybrid-base-call",
+        "tampered-surface-snapshot",
+        "tampered-base-snapshot",
+        "tampered-action-snapshot",
+    ],
+)
+def test_canonicalize_trace_rejects_inconsistent_or_tampered_channels(
+    mutation: str,
+) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    surface_calls = (
+        _event_call(),
+        {"name": "mail__send_message", "arguments": {"body": "Synthetic"}},
+    )
+    actions = tuple(
+        adapter.surface_to_semantic(call)[0]  # type: ignore[arg-type]
+        for call in surface_calls
+    )
+    base_calls = tuple(adapter.semantic_to_base_calls(action)[0] for action in actions)
+
+    if mutation == "reordered-actions":
+        trace = ExecutionTrace(surface_calls, tuple(reversed(actions)), base_calls)  # type: ignore[arg-type]
+    elif mutation == "extra-action":
+        trace = ExecutionTrace(surface_calls, (*actions, actions[0]), base_calls)  # type: ignore[arg-type]
+    elif mutation == "missing-action":
+        trace = ExecutionTrace(surface_calls, actions[:-1], base_calls)  # type: ignore[arg-type]
+    elif mutation == "reordered-base-calls":
+        trace = ExecutionTrace(surface_calls, actions, tuple(reversed(base_calls)))  # type: ignore[arg-type]
+    elif mutation == "extra-base-call":
+        trace = ExecutionTrace(surface_calls, actions, (*base_calls, base_calls[0]))  # type: ignore[arg-type]
+    elif mutation == "missing-base-call":
+        trace = ExecutionTrace(surface_calls, actions, base_calls[:-1])  # type: ignore[arg-type]
+    elif mutation == "hybrid-base-call":
+        hybrid = dict(base_calls[0])
+        hybrid["metadata"] = "PRIVATE_HYBRID_CANARY"
+        trace = ExecutionTrace(surface_calls, actions, (hybrid, base_calls[1]))  # type: ignore[arg-type]
+    else:
+        trace = ExecutionTrace(surface_calls, actions, base_calls)  # type: ignore[arg-type]
+        if mutation == "tampered-surface-snapshot":
+            object.__setattr__(
+                trace,
+                "_surface_calls_canonical",
+                b"PRIVATE_SURFACE_SNAPSHOT_CANARY",
+            )
+        elif mutation == "tampered-base-snapshot":
+            object.__setattr__(
+                trace,
+                "_base_calls_canonical",
+                b"PRIVATE_BASE_SNAPSHOT_CANARY",
+            )
+        else:
+            object.__setattr__(
+                actions[0],
+                "_arguments_canonical",
+                b"PRIVATE_ACTION_SNAPSHOT_CANARY",
+            )
+
+    with pytest.raises(ValueError, match=r"^AppWorld execution trace is invalid$") as raised:
+        adapter.canonicalize_trace(trace)
+
+    assert "PRIVATE_" not in str(raised.value)
+
+
+def test_canonicalize_trace_accepts_an_empty_consistent_trace() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+
+    assert adapter.canonicalize_trace(ExecutionTrace((), (), ())) == ()
+
+
+class _MutatingRuntimeMapping(Mapping[str, object]):
+    def __init__(
+        self,
+        entries: Mapping[str, object],
+        mutation: Callable[[], None],
+    ) -> None:
+        self._entries = dict(entries)
+        self._mutation = mutation
+
+    def __getitem__(self, key: str) -> object:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self):
+        self._mutation()
+        return self._entries.items()
+
+
+def _tamper_adapter(adapter: AppWorldSemanticAdapter, target: str) -> None:
+    bindings = object.__getattribute__(adapter, "_bindings")
+    validators = object.__getattribute__(adapter, "_validators")
+    binding = bindings["calendar__create_event"]
+    validator = validators["calendar__create_event"]
+    if target == "variant-slot":
+        object.__setattr__(adapter, "_variant", object())
+    elif target == "variant-name":
+        object.__setattr__(adapter.variant.tools[0], "name", "private__variant_canary")
+    elif target == "bindings-root":
+        object.__setattr__(adapter, "_bindings", {})
+    elif target == "binding-name":
+        object.__setattr__(binding, "api_name", "private_binding_canary")
+    elif target == "binding-schema":
+        object.__setattr__(binding, "schema", {})
+    elif target == "binding-schema-canonical":
+        object.__setattr__(binding, "schema_canonical", b"PRIVATE_SCHEMA_CANARY")
+    elif target == "validators-root":
+        object.__setattr__(adapter, "_validators", {})
+    elif target == "validator-schema":
+        object.__setattr__(validator, "schema", {})
+    elif target == "validator-format-checker":
+        object.__setattr__(validator, "format_checker", FormatChecker())
+    elif target == "validator-checkers":
+        validator.format_checker.checkers.clear()
+    else:  # pragma: no cover - keeps the helper fail-closed if extended incorrectly.
+        raise AssertionError("unknown synthetic tamper target")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "variant-slot",
+        "variant-name",
+        "bindings-root",
+        "binding-name",
+        "binding-schema",
+        "binding-schema-canonical",
+        "validators-root",
+        "validator-schema",
+        "validator-format-checker",
+        "validator-checkers",
+    ],
+)
+@pytest.mark.parametrize("method", ["parse", "compile", "wrap", "trace"])
+def test_semantic_methods_reject_preexisting_adapter_tampering(
+    target: str,
+    method: str,
+) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    call = _event_call()
+    action = adapter.surface_to_semantic(call)[0]  # type: ignore[arg-type]
+    base_call = adapter.semantic_to_base_calls(action)[0]
+    trace = ExecutionTrace((call,), (action,), (base_call,))  # type: ignore[arg-type]
+    operations = {
+        "parse": lambda: adapter.surface_to_semantic(call),  # type: ignore[arg-type]
+        "compile": lambda: adapter.semantic_to_base_calls(action),
+        "wrap": lambda: adapter.base_observation_to_surface(
+            call,  # type: ignore[arg-type]
+            (action,),
+            ((None,),),
+        ),
+        "trace": lambda: adapter.canonicalize_trace(trace),
+    }
+    _tamper_adapter(adapter, target)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ) as raised:
+        operations[method]()
+
+    assert "private" not in str(raised.value).lower()
+
+
+@pytest.mark.parametrize("phase", ["surface-call", "observation"])
+def test_callback_mutation_is_detected_by_final_integrity_check(phase: str) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+
+    def mutate() -> None:
+        _tamper_adapter(adapter, "binding-name")
+
+    if phase == "surface-call":
+        operation = lambda: adapter.surface_to_semantic(  # noqa: E731
+            _MutatingRuntimeMapping(_event_call(), mutate)  # type: ignore[arg-type]
+        )
+    else:
+        call = _event_call()
+        action = adapter.surface_to_semantic(call)[0]  # type: ignore[arg-type]
+        observation = _MutatingRuntimeMapping({"ok": True}, mutate)
+        operation = lambda: adapter.base_observation_to_surface(  # noqa: E731
+            call,  # type: ignore[arg-type]
+            (action,),
+            ((observation,),),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ):
+        operation()
+
+
+def test_mapping_callback_errors_are_sanitized() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+
+    class ExplodingMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):
+            raise ValueError("PRIVATE_CALLBACK_CANARY")
+
+    with pytest.raises(ValueError, match=r"^AppWorld surface call is invalid$") as raised:
+        adapter.surface_to_semantic(ExplodingMapping())  # type: ignore[arg-type]
+
+    assert "PRIVATE_CALLBACK_CANARY" not in str(raised.value)
+
+
+def test_runtime_seal_container_replacement_is_rejected() -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    seals = object.__getattribute__(adapter, "_binding_runtime_seals")
+    equal_replacement = tuple(list(seals))
+    assert equal_replacement == seals
+    assert equal_replacement is not seals
+    object.__setattr__(adapter, "_binding_runtime_seals", equal_replacement)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ):
+        adapter.surface_to_semantic(_event_call())  # type: ignore[arg-type]
+
+
+def test_hot_path_checks_only_the_selected_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(_semantic_catalog())
+    validators = object.__getattribute__(adapter, "_validators")
+    unselected = validators["mail__send_message"]
+    original = appworld_adapter_module._validator_seal_matches
+
+    def selected_only(seal: object) -> bool:
+        if seal.validator is unselected:  # type: ignore[attr-defined]
+            raise AssertionError("unselected validator visited")
+        return original(seal)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_validator_seal_matches",
+        selected_only,
     )
 
-    for operation in operations:
-        with pytest.raises(ValueError, match="semantic behavior is unavailable") as raised:
-            operation()
-        assert "private" not in str(raised.value)
+    action = adapter.surface_to_semantic(_event_call())[0]  # type: ignore[arg-type]
+
+    assert action.name == "calendar__create_event"
 
 
 def test_catalog_order_does_not_change_the_source_variant() -> None:

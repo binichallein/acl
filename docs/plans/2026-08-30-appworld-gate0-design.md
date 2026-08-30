@@ -165,7 +165,9 @@ the adapter performs:
 - `canonicalize_trace`: re-parse every surface call and require its semantic actions and base
   calls to match exactly.
 
-Call-level metadata is preserved by transforms but is not part of AppWorld semantic arguments.
+Generic transforms preserve call-level metadata mechanically, but the AppWorld source-call
+boundary accepts only the exact native outer shape with `name` and `arguments`; any extra
+outer field is rejected and never enters AppWorld semantic arguments or native base calls.
 All public errors are static and payload-free. Construction and every public method recheck
 variant, validator, and tool-binding root integrity before and after callback-bearing input is
 consumed.

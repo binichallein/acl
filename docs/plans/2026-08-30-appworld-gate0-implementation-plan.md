@@ -140,7 +140,9 @@ git commit -m "feat: add AppWorld catalog adapter"
 
 Cover the four `SemanticAdapter` methods:
 
-- accept only an exact mapping with `name` and `arguments`;
+- accept any `Mapping` implementation but require its I-JSON snapshot to have exactly the
+  `name` and `arguments` keys; generic transforms may preserve call-level metadata, but the
+  AppWorld source boundary rejects those extra fields;
 - validate arguments without applying JSON Schema defaults;
 - reject missing required, extra, wrong-type, unknown-tool, bool-as-int, and non-I-JSON calls;
 - parse to exactly one `SemanticAction` and compile to exactly one identical native call;
