@@ -158,3 +158,35 @@ and close completed consistently. A smoke report always has `gate_evaluable=fals
 The JSON report contains aggregate counts, rates, the pinned revision, and a SHA256
 fingerprint of the task set. It never contains raw task IDs, checkout paths, compiled
 solutions, execution output, API arguments, evaluator requirements, or request traces.
+
+## Recorded Gate 0a environment evidence
+
+The committed [formal aggregate summary](../../data/evidence/appworld/gate0a/formal-2026-08-30.json)
+records the fixed environment replay protocol over all 90 train and 57 dev tasks. Three
+fresh worlds per task produced 441 episodes with all six aggregate rates equal to 1.0,
+zero execution failures, zero exceptions, a Gate-evaluable result, and a passed Gate 0a.
+The manifest separately records the verifier process's OS exit code as zero. This is
+environment evidence for the pinned oracle replay lifecycle; it is not a model result or
+a held-out evaluation.
+
+For a successful audited run, the outer wrapper order is fixed: wait for the verifier to
+finish and capture its status; atomically write a mode-0600 OS-exit record; validate exit
+code zero and the exact summary integrity and hash; capture only safe process-log byte
+metadata; delete the exact resolved private process-log path; atomically write aggregate
+runtime metadata with `process_log_deleted=true`; only then promote the evidence and
+checksums. The deletion target must be one exact, resolved, private regular-file path,
+never a glob or symbolic link.
+
+A temporary or nonzero run retains its private process log for diagnosis, must not claim
+`process_log_deleted=true`, and must not promote evidence. The process log from the
+recorded successful run was nonempty but was not content-reviewed; only its byte count
+and source-metadata digest were retained. Neither the process log nor other raw runtime
+artifacts are committed.
+
+Schema v1 binds the AppWorld commit, task-set fingerprint, fixed protocol, and aggregate
+results. It does not bind the ToolShift commit, wrapper version, runtime version, command
+digest, or timestamps; the verifier commit is supported by the audited run label and
+operational chain rather than by the summary itself. A future schema v2 must emit an
+atomic completion record that binds those execution-provenance fields to the summary.
+The evidence and this runbook intentionally contain no machine-specific checkout or
+shared-filesystem path.
