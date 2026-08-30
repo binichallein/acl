@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -8,9 +9,7 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_PATTERNS = {
-    "private key": re.compile(
-        r"-----BEGIN (?:[A-Z0-9]+(?: [A-Z0-9]+)* )?PRIVATE KEY-----"
-    ),
+    "private key": re.compile(r"-----BEGIN (?:[A-Z0-9]+(?: [A-Z0-9]+)* )?PRIVATE KEY-----"),
     "GitHub token": re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
     "GitHub fine-grained PAT": re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
     "Hugging Face token": re.compile(r"hf_[A-Za-z0-9]{20,}"),
@@ -134,3 +133,57 @@ def test_env_example_contains_only_shared_root_placeholder() -> None:
     assert env_example.read_text(encoding="utf-8").splitlines() == [
         "TOOLSHIFT_SHARED_ROOT=/path/on/ml2/shared/filesystem"
     ]
+
+
+def _is_appworld_m3a_runtime_record(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and {
+            "schema_version",
+            "mode",
+            "pinned_appworld_commit",
+            "transform_counts",
+            "runner_abi_sha256",
+            "formal_gate_passed",
+            "smoke_passed",
+        }.issubset(value)
+        and value.get("mode") == "smoke"
+    )
+
+
+def _contains_appworld_m3a_runtime_record(value: object) -> bool:
+    if _is_appworld_m3a_runtime_record(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_appworld_m3a_runtime_record(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_appworld_m3a_runtime_record(item) for item in value)
+    return False
+
+
+def test_appworld_m3a_runtime_record_signature_is_detected() -> None:
+    record = {
+        "schema_version": 1,
+        "mode": "smoke",
+        "pinned_appworld_commit": "public-pin",
+        "transform_counts": {},
+        "runner_abi_sha256": "public-abi",
+        "formal_gate_passed": False,
+        "smoke_passed": False,
+    }
+
+    assert _contains_appworld_m3a_runtime_record(record)
+    assert _contains_appworld_m3a_runtime_record({"wrapper": [record]})
+
+
+def test_repository_contains_no_appworld_m3a_runtime_record() -> None:
+    violations: list[str] = []
+    for path in _candidate_text_files():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if _contains_appworld_m3a_runtime_record(payload):
+            violations.append(str(path.relative_to(REPOSITORY_ROOT)))
+
+    assert violations == []

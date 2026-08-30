@@ -7,12 +7,9 @@ benchmark package is imported only when a caller creates an AppWorld context.
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import re
 import subprocess
-import tempfile
 import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -23,6 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from toolshift.benchmarks._evidence import write_private_json
 from toolshift.types import manifest_sha256
 
 PINNED_APPWORLD_COMMIT = "a072b7a86e7c1d5b1d7175659d750ebb9b79f10a"
@@ -35,9 +33,7 @@ _ALLOWED_SPLITS = frozenset(OFFICIAL_SPLIT_COUNTS)
 _EXECUTION_FAILURE_PREFIX = "Execution failed. Traceback:"
 _EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
-_CLEANUP_PHASES = frozenset(
-    {"constructor_close_all", "instance_close", "instance_close_all"}
-)
+_CLEANUP_PHASES = frozenset({"constructor_close_all", "instance_close", "instance_close_all"})
 
 
 class _AppWorldCleanupMarker(RuntimeError):
@@ -126,23 +122,19 @@ class ReplayRun:
         ):
             value = getattr(self, field_name)
             if value is not None and (
-                not isinstance(value, str)
-                or _SHA256_PATTERN.fullmatch(value) is None
+                not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None
             ):
-                raise ValueError(
-                    f"{field_name} must be a lowercase SHA-256 fingerprint or None"
-                )
+                raise ValueError(f"{field_name} must be a lowercase SHA-256 fingerprint or None")
         if not isinstance(self.oracle_success, bool):
             raise ValueError("oracle_success must be a boolean")
         if not isinstance(self.execution_failed, bool):
             raise ValueError("execution_failed must be a boolean")
-        if self.failure_stage is not None and not isinstance(
-            self.failure_stage, ReplayStage
-        ):
+        if self.failure_stage is not None and not isinstance(self.failure_stage, ReplayStage):
             raise ValueError("failure_stage must be a ReplayStage or None")
-        if self.exception_type is not None and _EXCEPTION_TYPE_PATTERN.fullmatch(
-            self.exception_type
-        ) is None:
+        if (
+            self.exception_type is not None
+            and _EXCEPTION_TYPE_PATTERN.fullmatch(self.exception_type) is None
+        ):
             raise ValueError("exception_type must be a payload-free class name")
         if self.execution_failed and self.oracle_success:
             raise ValueError("failed replay runs cannot set oracle_success=True")
@@ -207,9 +199,7 @@ class TaskReplayResult:
 
     @property
     def all_oracles_succeeded(self) -> bool:
-        return all(
-            run.oracle_success and not run.execution_failed for run in self.runs
-        )
+        return all(run.oracle_success and not run.execution_failed for run in self.runs)
 
     @property
     def is_consistent(self) -> bool:
@@ -344,9 +334,7 @@ class ReplaySummary:
             "oracle_success_rate",
         ):
             if self.task_consistency_rate > getattr(self, field_name):
-                raise ValueError(
-                    f"task_consistency_rate cannot exceed {field_name}"
-                )
+                raise ValueError(f"task_consistency_rate cannot exceed {field_name}")
 
         if not isinstance(self.failure_counts, tuple):
             raise ValueError("failure_counts must be a tuple")
@@ -488,12 +476,10 @@ def _derive_task_set_fields(
         raise ValueError("task IDs must be unique across train/dev splits")
     sorted_task_ids = tuple(sorted(all_task_ids))
     fingerprint_payload = {
-        split_name: list(normalized_by_split[split_name])
-        for split_name in split_names
+        split_name: list(normalized_by_split[split_name]) for split_name in split_names
     }
     split_counts = tuple(
-        (split_name, len(normalized_by_split[split_name]))
-        for split_name in split_names
+        (split_name, len(normalized_by_split[split_name])) for split_name in split_names
     )
     return (
         MappingProxyType(dict(normalized_by_split)),
@@ -761,9 +747,7 @@ def _execute_single_replay(
             compiled_solution_code = ground_truth.compiled_solution_code
             if not isinstance(compiled_solution_code, str):
                 raise ValueError("compiled solution must be text")
-            execution_output = world.execute(
-                compiled_solution_code + "\nsolution(apis, requester)"
-            )
+            execution_output = world.execute(compiled_solution_code + "\nsolution(apis, requester)")
             if not isinstance(execution_output, str):
                 raise ValueError("AppWorld execute output must be text")
             if execution_output.startswith(_EXECUTION_FAILURE_PREFIX):
@@ -907,11 +891,7 @@ def summarize_replays(
         raise ValueError("mode must be a ReplayMode")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
-    if (
-        isinstance(repetitions, bool)
-        or not isinstance(repetitions, int)
-        or repetitions < 2
-    ):
+    if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 2:
         raise ValueError("repetitions must be an integer of at least two")
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
@@ -926,15 +906,16 @@ def summarize_replays(
     evaluator_match_rate = _rate([result.evaluator_matches for result in results])
     trace_match_rate = _rate([result.trace_matches for result in results])
     task_consistency_rate = _rate([result.is_consistent for result in results])
-    execution_failure_count = sum(
-        result.execution_failure_count for result in results
-    )
+    execution_failure_count = sum(result.execution_failure_count for result in results)
     exception_count = sum(result.exception_count for result in results)
-    oracle_success_rate = sum(
-        run.oracle_success and not run.execution_failed
-        for result in results
-        for run in result.runs
-    ) / episode_count
+    oracle_success_rate = (
+        sum(
+            run.oracle_success and not run.execution_failed
+            for result in results
+            for run in result.runs
+        )
+        / episode_count
+    )
     gate_evaluable = _is_official_gate_protocol(
         task_set,
         mode=mode,
@@ -1018,9 +999,7 @@ def run_replay_verification(
             raise ValueError("parallel verification requires the default AppWorld factory")
         from concurrent.futures import ProcessPoolExecutor
 
-        arguments = (
-            (task_id, seed, repetitions) for task_id in task_set.task_ids
-        )
+        arguments = ((task_id, seed, repetitions) for task_id in task_set.task_ids)
         with ProcessPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(_run_default_task, arguments))
     return summarize_replays(
@@ -1081,40 +1060,7 @@ def write_summary_json(path: str | Path, summary: ReplaySummary) -> None:
     if not isinstance(summary, ReplaySummary):
         raise ValueError("summary must be a ReplaySummary")
     summary._validate_integrity()
-    output_path = Path(path)
-    if not output_path.name:
-        raise ValueError("output path must name a JSON file")
-    if output_path.is_symlink():
-        raise ValueError("output path must not be a symbolic link")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_name = temporary.name
-            os.fchmod(temporary.fileno(), 0o600)
-            json.dump(
-                summary.to_dict(),
-                temporary,
-                sort_keys=True,
-                indent=2,
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            temporary.write("\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, output_path)
-        temporary_name = None
-    finally:
-        if temporary_name is not None:
-            Path(temporary_name).unlink(missing_ok=True)
+    write_private_json(path, summary.to_dict())
 
 
 def exit_code_for_summary(summary: ReplaySummary) -> int:

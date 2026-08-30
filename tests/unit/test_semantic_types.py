@@ -13,6 +13,7 @@ import yaml
 
 import toolshift.types as types_module
 from toolshift.adapters.semantic import SemanticAdapter
+from toolshift.contracts.schema import schema_fingerprint
 from toolshift.types import (
     ExecutionTrace,
     JSONValue,
@@ -184,6 +185,106 @@ def test_surface_tool_spec_allows_empty_description_and_preserves_text() -> None
     assert tool.name == " lookup "
     assert tool.description == ""
     assert tool.input_schema["required"] == ("query", "limit")
+
+
+def test_surface_tool_schema_preserves_nested_wide_integers_and_fingerprint() -> None:
+    wide = 2**80 + 123
+    source_schema = {
+        "type": "object",
+        "default": {"metadata": {"identifiers": [wide, -wide]}},
+        "properties": {
+            "count": {
+                "type": "integer",
+                "maximum": wide,
+                "examples": [wide],
+            }
+        },
+    }
+    first_tool = SurfaceToolSpec("count", "", source_schema)
+    reordered_tool = SurfaceToolSpec(
+        "count",
+        "",
+        {
+            "properties": {
+                "count": {
+                    "examples": [wide],
+                    "maximum": wide,
+                    "type": "integer",
+                }
+            },
+            "default": {"metadata": {"identifiers": [wide, -wide]}},
+            "type": "object",
+        },
+    )
+    first_variant = SchemaVariant("wide-schema", [first_tool], {"version": 1})
+    reordered_variant = SchemaVariant(
+        "wide-schema",
+        [reordered_tool],
+        {"version": 1},
+    )
+
+    source_schema["properties"]["count"]["maximum"] = 0
+    source_schema["default"]["metadata"]["identifiers"][0] = 0
+
+    assert first_tool.input_schema["properties"]["count"]["maximum"] == wide
+    assert first_tool.input_schema["properties"]["count"]["examples"] == (wide,)
+    assert first_tool.input_schema["default"]["metadata"]["identifiers"] == (
+        wide,
+        -wide,
+    )
+    assert schema_fingerprint(first_variant) == schema_fingerprint(reordered_variant)
+    with pytest.raises(ValueError, match="I-JSON safe range"):
+        canonical_json_bytes(first_tool.input_schema)
+    with pytest.raises(TypeError):
+        first_tool.input_schema["properties"]["count"]["maximum"] = 0  # type: ignore[index]
+
+
+def test_surface_tool_schema_accepts_integers_beyond_python_decimal_guard() -> None:
+    very_wide = 10**5000
+    tool = SurfaceToolSpec(
+        "count",
+        "",
+        {"type": "object", "maximum": very_wide},
+    )
+    variant = SchemaVariant("very-wide-schema", [tool], {"version": 1})
+
+    assert tool.input_schema["maximum"] == very_wide
+    assert len(schema_fingerprint(variant)) == 64
+
+
+def test_surface_tool_schema_keeps_json_safety_guards_for_non_integer_values() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    for schema in (
+        {"bad": float("inf")},
+        {"bad": "\ud800"},
+        cyclic,
+        {"nested": _nested_list(128)},
+    ):
+        with pytest.raises(ValueError, match=r"input_schema|cycle|depth|UTF-8"):
+            SurfaceToolSpec("guarded", "", schema)  # type: ignore[arg-type]
+
+
+def test_schema_fingerprint_rejects_tampered_wide_integer_schema() -> None:
+    wide = 2**80 + 123
+    tool = SurfaceToolSpec(
+        "count",
+        "",
+        {"type": "object", "maximum": wide},
+    )
+    replacement = SurfaceToolSpec(
+        "count",
+        "",
+        {"type": "object", "maximum": wide + 1},
+    )
+    variant = SchemaVariant("wide-schema", [tool], {"version": 1})
+    replacement_items = object.__getattribute__(replacement.input_schema, "_items")
+
+    object.__setattr__(tool.input_schema, "_items", replacement_items)
+
+    with pytest.raises(ValueError, match="mutated"):
+        schema_fingerprint(variant)
 
 
 @pytest.mark.parametrize("name", ["", " ", "\t\n"])
@@ -578,6 +679,25 @@ def test_json_integers_outside_ieee754_exact_range_are_rejected(value: int) -> N
         canonical_json_bytes(value)
     with pytest.raises(ValueError, match=r"arguments\.cursor"):
         SemanticAction("search", {"cursor": value})
+
+
+def test_runtime_trace_and_manifest_still_reject_wide_integers() -> None:
+    wide = 2**80 + 123
+
+    with pytest.raises(ValueError, match="manifest"):
+        SchemaVariant("identity", [_tool()], {"wide": wide})
+    with pytest.raises(ValueError, match="surface_calls"):
+        ExecutionTrace(
+            ({"name": "search", "arguments": {"wide": wide}},),
+            (),
+            (),
+        )
+    with pytest.raises(ValueError, match="base_calls"):
+        ExecutionTrace(
+            (),
+            (),
+            ({"name": "search", "arguments": {"wide": wide}},),
+        )
 
 
 def test_json_booleans_remain_valid_and_distinct_from_integers() -> None:

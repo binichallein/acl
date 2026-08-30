@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +17,7 @@ from toolshift.benchmarks.appworld_replay import ReplayMode, ReplaySummary
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 APPWORLD_RUNBOOK = REPOSITORY_ROOT / "docs/environment/ml2-appworld.md"
 README = REPOSITORY_ROOT / "README.md"
-GATE_0A_EVIDENCE_RELATIVE_PATH = Path(
-    "data/evidence/appworld/gate0a/formal-2026-08-30.json"
-)
+GATE_0A_EVIDENCE_RELATIVE_PATH = Path("data/evidence/appworld/gate0a/formal-2026-08-30.json")
 GATE_0A_EVIDENCE = REPOSITORY_ROOT / GATE_0A_EVIDENCE_RELATIVE_PATH
 FULL_GIT_OBJECT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -25,12 +26,8 @@ APPWORLD_COMMIT = "a072b7a86e7c1d5b1d7175659d750ebb9b79f10a"
 BFCL_COMPARABLE_COMMIT = "f7cf7359b7ac615a0b294831c5ba2bc95ee4a000"
 BFCL_OBSERVED_HEAD = "6ea57973c7a6097fd7c5915698c54c17c5b1b6c8"
 GATE_0A_EVIDENCE_BYTES = 741
-GATE_0A_EVIDENCE_SHA256 = (
-    "57508fde225276408238e745eb6cc932fabf6b06b3445f69961cebd865aa39a4"
-)
-GATE_0A_TASK_SET_SHA256 = (
-    "11a5fc9bb4ae1329a45fd0f7012b2b2432de539d01930f329740f012e4c30602"
-)
+GATE_0A_EVIDENCE_SHA256 = "57508fde225276408238e745eb6cc932fabf6b06b3445f69961cebd865aa39a4"
+GATE_0A_TASK_SET_SHA256 = "11a5fc9bb4ae1329a45fd0f7012b2b2432de539d01930f329740f012e4c30602"
 GATE_0A_PRIVACY_ALLOWLIST = frozenset(
     {
         "schema_version",
@@ -171,6 +168,13 @@ def _normalize_shell(block: str) -> str:
     return " ".join(block.replace("\\\n", " ").split())
 
 
+def _bash_function(markdown: str, function_name: str) -> str:
+    marker = f"{function_name}() {{\n"
+    start = markdown.index(marker)
+    end = markdown.index("\n}\n", start) + len("\n}\n")
+    return markdown[start:end]
+
+
 def test_appworld_manifest_pins_checkout_package_and_runtime() -> None:
     manifest = _load_manifest("appworld-ml2.yaml")
 
@@ -195,6 +199,7 @@ def test_appworld_manifest_records_verified_uv_and_editable_resolution_scope() -
     assert manifest["installation"] == {
         "uv_version": "0.11.8",
         "dependency_resolution": "upstream_editable",
+        "dependency_overrides": {"python-dotenv": "1.2.2"},
         "project_training_dependency_lock": {
             "status": "not_completed",
             "checksum": None,
@@ -214,13 +219,9 @@ def test_appworld_runbook_preflights_shared_root_before_creating_directories() -
     )
     assert 'case "${TOOLSHIFT_SHARED_ROOT}" in' in first_block
     assert 'echo "TOOLSHIFT_SHARED_ROOT must be an absolute path" >&2' in first_block
-    assert 'TOOLSHIFT_SHARED_ROOT="$(realpath -m -- "${TOOLSHIFT_SHARED_ROOT}")"' in (
-        normalized
-    )
+    assert 'TOOLSHIFT_SHARED_ROOT="$(realpath -m -- "${TOOLSHIFT_SHARED_ROOT}")"' in (normalized)
     assert 'if [ "${TOOLSHIFT_SHARED_ROOT}" = "/" ]; then' in first_block
-    assert 'echo "TOOLSHIFT_SHARED_ROOT must not resolve to filesystem root" >&2' in (
-        first_block
-    )
+    assert 'echo "TOOLSHIFT_SHARED_ROOT must not resolve to filesystem root" >&2' in (first_block)
     assert "readonly TOOLSHIFT_SHARED_ROOT" in first_block
 
     normalization = normalized.index("realpath -m --")
@@ -247,6 +248,16 @@ def test_appworld_runbook_configures_isolated_lfs_before_detached_checkout() -> 
     assert positions == sorted(positions)
 
 
+def test_appworld_runbook_uses_only_repository_local_lfs_configuration() -> None:
+    runbook = _read_appworld_runbook()
+    checkout_block = _normalize_shell(_bash_blocks(runbook)[0])
+
+    assert "Git LFS executable" in runbook
+    assert "available on `PATH`" in runbook
+    assert re.search(r"(?m)^\s*git lfs install(?:\s|$)", runbook) is None
+    assert 'git -C "${TOOLSHIFT_SHARED_ROOT}/repos/appworld" lfs install --local' in checkout_block
+
+
 def test_appworld_runbook_versions_are_derived_from_manifest() -> None:
     manifest = _load_manifest("appworld-ml2.yaml")
     runbook = _read_appworld_runbook()
@@ -265,7 +276,9 @@ def test_appworld_runbook_versions_are_derived_from_manifest() -> None:
     assert f"uv venv --python {python_version}" in install_block
     assert f"download data --version {data_version} --mode {data_mode}" in install_block
     assert f"Git LFS is version `{lfs_version}`" in runbook
-    assert f'test "$(uv --version)" = "uv {uv_version}"' in install_block
+    assert 'uv_runtime_version="$(uv --version)"' in install_block
+    assert f'"uv {uv_version}" | "uv {uv_version} "*)' in install_block
+    assert "Unexpected uv version" in install_block
     assert "upstream editable dependency resolution" in runbook
     assert "project training dependency lock is not complete" in runbook
     assert "no lock checksum is recorded" in runbook
@@ -486,9 +499,7 @@ def test_appworld_manifest_cross_binds_gate_0a_evidence_and_provenance() -> None
         },
         "os_exit": {
             "code": 0,
-            "artifact_sha256": (
-                "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
-            ),
+            "artifact_sha256": ("9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"),
         },
         "runtime_log": {
             "schema_version": 1,
@@ -524,9 +535,7 @@ def test_appworld_manifest_cross_binds_gate_0a_evidence_and_provenance() -> None
 
     payload = _load_unique_json(REPOSITORY_ROOT / gate["evidence"]["path"])
     assert gate["evidence"]["bytes"] == len(GATE_0A_EVIDENCE.read_bytes())
-    assert gate["evidence"]["sha256"] == hashlib.sha256(
-        GATE_0A_EVIDENCE.read_bytes()
-    ).hexdigest()
+    assert gate["evidence"]["sha256"] == hashlib.sha256(GATE_0A_EVIDENCE.read_bytes()).hexdigest()
     assert gate["appworld_commit"] == payload["pinned_appworld_commit"]
     for field_name, value in gate["protocol"].items():
         assert payload[field_name] == value
@@ -546,8 +555,7 @@ def test_appworld_runbook_records_gate_0a_without_machine_paths_or_overclaiming(
     assert "capture only safe process-log byte metadata" in normalized
     assert "delete the exact resolved private process-log path" in normalized
     assert (
-        "atomically write aggregate runtime metadata with `process_log_deleted=true`"
-        in normalized
+        "atomically write aggregate runtime metadata with `process_log_deleted=true`" in normalized
     )
     assert "promote the evidence and checksums" in normalized
     wrapper_steps = [
@@ -602,11 +610,7 @@ def test_appworld_runbook_freezes_replay_gate_runtime_safety() -> None:
     assert "scripts/verify_appworld_replay.py" in runbook
     assert "--output" in runbook
     assert "--max-tasks" not in runbook
-    assert any(
-        "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY "
-        "http_proxy https_proxy all_proxy no_proxy" in block
-        for block in normalized_blocks
-    )
+    assert any("clear_proxy_environment" in block for block in normalized_blocks)
 
 
 def test_appworld_manifest_limits_warnings_and_unresolved_claims() -> None:
@@ -626,9 +630,312 @@ def test_appworld_manifest_limits_warnings_and_unresolved_claims() -> None:
             "protected_content_included": False,
         },
     }
-    assert _unresolved_paths(manifest) == {
-        "data.integrity.official_content_checksum"
+    assert _unresolved_paths(manifest) == {"data.integrity.official_content_checksum"}
+
+
+def test_appworld_manifest_defines_private_nonformal_m3a_protocol_only() -> None:
+    manifest = _load_manifest("appworld-ml2.yaml")
+
+    assert manifest["gate_0_m3a"] == {
+        "kind": "private_nonformal_integration_smoke_protocol",
+        "upstream_sources": {
+            "repository": (f"https://github.com/StonyBrookNLP/appworld/tree/{APPWORLD_COMMIT}"),
+            "cli": (
+                "https://github.com/StonyBrookNLP/appworld/blob/"
+                f"{APPWORLD_COMMIT}/src/appworld/cli.py"
+            ),
+            "path_store": (
+                "https://github.com/StonyBrookNLP/appworld/blob/"
+                f"{APPWORLD_COMMIT}/src/appworld/common/path_store.py"
+            ),
+            "verifier": (
+                "https://github.com/StonyBrookNLP/appworld/blob/"
+                f"{APPWORLD_COMMIT}/src/appworld/verify.py"
+            ),
+        },
+        "protocol": {
+            "split": "train",
+            "seed": 100,
+            "workers": 1,
+            "transform_families": ["clean", "l1", "l2"],
+            "fresh_world_per_role": True,
+            "full_non_admin_catalog": True,
+            "formal_gate_evaluable": False,
+            "formal_gate_claim": False,
+        },
+        "evidence_policy": {
+            "plaintext_location": "external_private_appworld_root",
+            "runtime_record_committed": False,
+            "public_result_claim": False,
+            "publication_requires": ("appworld_maintainer_approved_encrypted_workflow"),
+        },
     }
+
+
+def test_appworld_runbook_freezes_private_m3a_install_and_execution_boundary() -> None:
+    runbook = _read_appworld_runbook()
+    normalized = " ".join(runbook.split())
+    normalized_blocks = [_normalize_shell(block) for block in _bash_blocks(runbook)]
+
+    assert "dedicated private `APPWORLD_ROOT`" in normalized
+    assert "umask `077`" in normalized
+    assert "mode `0700`" in normalized
+    assert "outside every Git worktree" in normalized
+    assert "node-local storage" in normalized
+    assert "--link-mode copy" in normalized
+    assert "PYTHON_DOTENV_DISABLED=1" in normalized
+    assert "PYTHONDONTWRITEBYTECODE=1" in normalized
+    assert 'APPWORLD_CACHE="${APPWORLD_ROOT}/.cache"' in normalized
+    assert "ModelScope" in normalized
+    assert "without the external proxy" in normalized
+    assert "private, non-formal M3A integration evidence" in normalized
+    assert "must never be added to Git" in normalized
+    assert "maintainer-approved encrypted workflow" in normalized
+    assert "historical Gate 0a" in normalized
+    assert "does not set precedent for M3A" in normalized
+
+    install_sequence = [
+        "git clone",
+        "lfs install --local",
+        "checkout --detach",
+        "lfs pull",
+        "uv venv",
+        "uv pip install",
+        'bin/appworld" install --repo',
+        "cp -a",
+        "download data --version",
+        "verify tests --root",
+        "scripts/verify_appworld_gate0.py",
+    ]
+    m3a_runbook = normalized[normalized.index("Ensure the Git LFS executable") :]
+    cursor = 0
+    for step in install_sequence:
+        cursor = m3a_runbook.index(step, cursor) + len(step)
+    assert all(
+        "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY" not in block
+        for block in normalized_blocks
+    )
+    assert "TOOLSHIFT_RUN_APPWORLD_GATE0_SMOKE=1" in runbook
+    assert 'test ! -e "${APPWORLD_ROOT}/tests"' in runbook
+    assert (
+        'cp -a "${TOOLSHIFT_SHARED_ROOT}/repos/appworld/tests" "${APPWORLD_ROOT}/tests"'
+    ) in normalized
+    assert "verify tasks" not in runbook.split("## Historical Gate 0a", 1)[0]
+    assert "test_normal" in runbook
+    assert "test_challenge" in runbook
+    assert "never enumerates or opens" in runbook
+
+
+def test_appworld_runbook_builds_and_runs_entire_environment_on_node_local_storage() -> None:
+    runbook = _read_appworld_runbook()
+    normalized = _normalize_shell(runbook)
+    install_block = _normalize_shell(_bash_blocks(runbook)[1])
+
+    assert 'export APPWORLD_ENV="${TOOLSHIFT_NODE_LOCAL}/venvs/appworld-0.2.0"' in install_block
+    assert "readonly APPWORLD_ENV" in install_block
+    assert 'uv venv --python 3.11.15 "${APPWORLD_ENV}"' in install_block
+    assert '"python-dotenv==1.2.2"' in install_block
+    assert '--python "${APPWORLD_ENV}/bin/python"' in normalized
+    assert '"${APPWORLD_ENV}/bin/appworld"' in normalized
+    assert '"${APPWORLD_ENV}/bin/python"' in normalized
+    assert '"${APPWORLD_ENV}/bin/pytest"' in normalized
+    assert "${TOOLSHIFT_SHARED_ROOT}/venvs" not in runbook
+
+    for block in _bash_blocks(runbook):
+        if "uv pip install" in block:
+            assert '--python "${APPWORLD_ENV}/bin/python"' in _normalize_shell(block)
+
+
+def test_appworld_runbook_normalizes_pinned_runtime_path_permissions() -> None:
+    runbook = _read_appworld_runbook()
+    install_block = _normalize_shell(_bash_blocks(runbook)[1])
+
+    download = install_block.index("download data --version 0.2.0")
+    required_after_download = [
+        'test -d "${APPWORLD_ROOT}/data"',
+        'test ! -L "${APPWORLD_ROOT}/data"',
+        'test -O "${APPWORLD_ROOT}/data"',
+        'chmod 0700 "${APPWORLD_ROOT}/data"',
+        'test -d "${APPWORLD_ROOT}/data/base_dbs"',
+        'test ! -L "${APPWORLD_ROOT}/data/base_dbs"',
+        'test -O "${APPWORLD_ROOT}/data/base_dbs"',
+        'chmod 0700 "${APPWORLD_ROOT}/data/base_dbs"',
+        'test -f "${APPWORLD_ROOT}/data/version.txt"',
+        'test ! -L "${APPWORLD_ROOT}/data/version.txt"',
+        'test -O "${APPWORLD_ROOT}/data/version.txt"',
+        'chmod 0600 "${APPWORLD_ROOT}/data/version.txt"',
+        'test -f "${APPWORLD_ROOT}/data/base_dbs/version.txt"',
+        'test ! -L "${APPWORLD_ROOT}/data/base_dbs/version.txt"',
+        'test -O "${APPWORLD_ROOT}/data/base_dbs/version.txt"',
+        'chmod 0600 "${APPWORLD_ROOT}/data/base_dbs/version.txt"',
+    ]
+    cursor = download
+    for step in required_after_download:
+        cursor = install_block.index(step, cursor) + len(step)
+
+
+def test_appworld_runbook_proxy_cleanup_is_generic_fail_closed_and_silent() -> None:
+    runbook = _read_appworld_runbook()
+    helper = _bash_function(runbook, "clear_proxy_environment")
+    synthetic_name = "MiXeD_PRIVATE_PROXY"
+    synthetic_value = "synthetic-sensitive-value"
+    script = (
+        "set -euo pipefail\n"
+        f"{helper}\n"
+        "clear_proxy_environment\n"
+        f'test -z "${{{synthetic_name}+present}}"\n'
+        'test "${SAFE_MARKER}" = "preserved"\n'
+    )
+    environment = {
+        "PATH": os.environ["PATH"],
+        synthetic_name: synthetic_value,
+        "SAFE_MARKER": "preserved",
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert synthetic_name not in result.stdout + result.stderr
+    assert synthetic_value not in result.stdout + result.stderr
+    assert "*_proxy" in helper.lower()
+    assert "compgen -e" in helper
+    assert "proxy environment cleanup failed" in helper
+    assert "before invoking any approved domestic mirror" in _normalize_shell(runbook)
+    assert runbook.count("clear_proxy_environment\n") >= 3
+
+    official_section = runbook.split("## Official verification", 1)[1].split(
+        "## Private, non-formal M3A", 1
+    )[0]
+    m3a_section = runbook.split("## Private, non-formal M3A", 1)[1].split(
+        "## Historical Gate 0a", 1
+    )[0]
+    assert official_section.index("clear_proxy_environment") < official_section.index(
+        "verify tests"
+    )
+    assert m3a_section.index("clear_proxy_environment") < m3a_section.index(
+        "scripts/verify_appworld_gate0.py"
+    )
+    assert m3a_section.index("uv pip install") < m3a_section.index("clear_proxy_environment")
+
+    gate0a_section = runbook.split("## Historical Gate 0a", 1)[1].split("## Recorded Gate 0a", 1)[0]
+    assert gate0a_section.index("uv pip install") < gate0a_section.index("clear_proxy_environment")
+    assert gate0a_section.index("clear_proxy_environment") < gate0a_section.index(
+        "TOOLSHIFT_RUN_APPWORLD_SMOKE"
+    )
+
+
+def test_appworld_runbook_privately_audits_and_safely_deletes_official_log() -> None:
+    runbook = _read_appworld_runbook()
+    official_section = runbook.split("## Official verification", 1)[1].split(
+        "## Private, non-formal M3A", 1
+    )[0]
+    normalized = _normalize_shell(official_section)
+
+    required_steps = [
+        'VERIFY_LOG="${APPWORLD_ROOT}/operator-records/official-tests.log"',
+        ': > "${VERIFY_LOG}"',
+        'chmod 0600 "${VERIFY_LOG}"',
+        '>"${VERIFY_LOG}" 2>&1',
+        "verify_status=$?",
+        'if [ "${verify_status}" -ne 0 ]; then',
+        '"${APPWORLD_ENV}/bin/python" - "${APPWORLD_ROOT}" "${VERIFY_LOG}"',
+        "os.O_NOFOLLOW",
+        "os.unlink(log_name, dir_fd=records_fd)",
+        "os.fsync(records_fd)",
+    ]
+    cursor = 0
+    for step in required_steps[:-2]:
+        cursor = normalized.index(step, cursor) + len(step)
+    unlink_position = normalized.index(required_steps[-2], cursor)
+    assert unlink_position < normalized.rindex(required_steps[-1])
+    assert "Official AppWorld test verification failed" in official_section
+    assert "Official AppWorld test verification audit failed" in official_section
+    assert "1652" in official_section
+    assert "76" in official_section
+    assert "110" in official_section
+    assert "2" in official_section
+    assert "cat " not in official_section
+    assert "tail " not in official_section
+
+
+def test_appworld_runbook_explicitly_binds_tracked_clean_checkout_check() -> None:
+    runbook = _read_appworld_runbook()
+    before_verify = runbook.split("## Official verification", 1)[0]
+    normalized = _normalize_shell(before_verify)
+
+    required_steps = [
+        '"${APPWORLD_ENV}/bin/appworld" install --repo',
+        "clear_git_environment",
+        '"${APPWORLD_ENV}/bin/python" - "${APPWORLD_CHECKOUT}"',
+        'f"--git-dir={git_directory}"',
+        'f"--work-tree={checkout}"',
+        '"rev-parse", "--show-toplevel", "--absolute-git-dir"',
+        '"ls-files", "-v", "-z"',
+        'tag == b"S" or tag.islower()',
+        '"ls-files", "--others", "-z", "--"',
+        "untracked_paths.add(raw_path)",
+        'git_directory / "info" / "attributes"',
+        '"diff-index"',
+        '"--cached"',
+        '"--no-ext-diff"',
+        '"--ignore-submodules=none"',
+        '"ls-tree", "-r", "-z", "--full-tree", "HEAD"',
+        '"cat-file", "--batch"',
+        "git_blob_sha1(payload)",
+        "head_modes = {relative: mode",
+        "lfs_pointer(expected)",
+        "hashlib.sha256()",
+        "ast.parse(",
+        "PBKDF2HMAC(",
+        "zipfile.ZipFile(",
+        "if target in seen_bundle_targets:",
+        "member_payload = archive.read(info)",
+        "if target in head_payloads:",
+        "tracked_pointer = lfs_pointer(tracked_payload)",
+        "untracked_paths != set(expected_untracked)",
+        "path.read_bytes() != expected",
+    ]
+    cursor = normalized.index(required_steps[0]) + len(required_steps[0])
+    for step in required_steps[1:]:
+        cursor = normalized.index(step, cursor) + len(step)
+    assert "core.fsmonitor=false" in before_verify
+    assert "core.hooksPath=/dev/null" in before_verify
+    assert "--no-replace-objects" in before_verify
+    assert "checkout_metadata.st_uid != os.geteuid()" in before_verify
+    assert "stat.S_IMODE(checkout_metadata.st_mode) != 0o700" in before_verify
+    assert "Pinned AppWorld checkout binding validation failed" in before_verify
+    assert "Pinned AppWorld tracked checkout is dirty" in before_verify
+
+
+def test_appworld_gate0_smoke_only_skips_before_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke_path = REPOSITORY_ROOT / "tests/smoke/test_appworld_gate0.py"
+    spec = importlib.util.spec_from_file_location("appworld_gate0_smoke_wrapper", smoke_path)
+    assert spec is not None and spec.loader is not None
+    smoke_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke_module)
+
+    monkeypatch.delenv("TOOLSHIFT_RUN_APPWORLD_GATE0_SMOKE", raising=False)
+    with pytest.raises(pytest.skip.Exception):
+        smoke_module.test_private_appworld_gate0_smoke()
+
+    monkeypatch.setenv("TOOLSHIFT_RUN_APPWORLD_GATE0_SMOKE", "1")
+
+    def fail_runtime() -> None:
+        raise RuntimeError("synthetic pinned-runtime failure")
+
+    monkeypatch.setattr(smoke_module, "run_appworld_gate0_smoke", fail_runtime)
+    with pytest.raises(RuntimeError, match="synthetic pinned-runtime failure"):
+        smoke_module.test_private_appworld_gate0_smoke()
 
 
 def test_bfcl_manifest_pins_comparable_source_and_keeps_observed_head_as_audit() -> None:
@@ -670,9 +977,7 @@ def test_bfcl_manifest_records_evaluator_and_repository_bundled_dataset() -> Non
         "revision": BFCL_COMPARABLE_COMMIT,
         "git_tree": "5e49f820dd465850cbaebc241806d2ef7b893471",
         "hugging_face": {"dataset": None, "revision": None},
-        "loading_note": (
-            "BFCL v4 is not loaded from the current BFCL v3 Hugging Face dataset."
-        ),
+        "loading_note": ("BFCL v4 is not loaded from the current BFCL v3 Hugging Face dataset."),
     }
     assert FULL_GIT_OBJECT.fullmatch(manifest["dataset"]["git_tree"])
 

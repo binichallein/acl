@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from dataclasses import FrozenInstanceError, fields
@@ -13,7 +14,9 @@ from typing import ClassVar
 
 import pytest
 
+import toolshift.benchmarks._evidence as evidence_module
 import toolshift.benchmarks.appworld_replay as replay_module
+from toolshift.benchmarks._evidence import write_private_json
 from toolshift.benchmarks.appworld_replay import (
     PINNED_APPWORLD_COMMIT,
     ReplayMode,
@@ -55,8 +58,7 @@ class _FakeModels(dict[str, _FakeAppModels]):
         rows: dict[tuple[str, str], list[tuple[int, str]]],
     ) -> None:
         super().__init__(
-            (app_name, _FakeAppModels(model_names))
-            for app_name, model_names in apps.items()
+            (app_name, _FakeAppModels(model_names)) for app_name, model_names in apps.items()
         )
         self._rows = rows
         self.clear_calls = 0
@@ -416,9 +418,7 @@ def test_managed_appworld_context_closes_once_after_body_exception() -> None:
 
 
 def test_managed_appworld_context_uses_close_all_after_constructor_failure() -> None:
-    appworld_class = _lifecycle_appworld_class(
-        constructor_error=LookupError("constructor failed")
-    )
+    appworld_class = _lifecycle_appworld_class(constructor_error=LookupError("constructor failed"))
 
     with (
         pytest.raises(LookupError, match="constructor failed"),
@@ -479,9 +479,7 @@ def test_managed_context_preserves_primary_base_exception_when_cleanup_also_fail
     primary = primary_type("primary sensitive payload")
     constructor_error = primary if failure_source == "constructor" else None
     close_error = (
-        RuntimeError("instance cleanup sensitive payload")
-        if failure_source == "body"
-        else None
+        RuntimeError("instance cleanup sensitive payload") if failure_source == "body" else None
     )
     appworld_class = _lifecycle_appworld_class(
         constructor_error=constructor_error,
@@ -564,11 +562,7 @@ def test_repetitions_use_fresh_worlds_exact_runtime_options_and_context_cleanup(
     assert len({id(world) for world in factory.worlds}) == 3
     assert len({call["experiment_name"] for call in factory.calls}) == 3
     assert all(
-        {
-            key: value
-            for key, value in call.items()
-            if key != "experiment_name"
-        }
+        {key: value for key, value in call.items() if key != "experiment_name"}
         == {
             "task_id": "train-task-unit",
             "ground_truth_mode": "full",
@@ -616,9 +610,7 @@ def test_traceback_and_exception_fail_closed_without_exposing_payloads() -> None
         seed=100,
         repetitions=3,
         world_context_factory=_RecordingFactory(
-            execution_outputs={
-                1: "Execution failed. Traceback:\nTimeoutError: sensitive payload"
-            }
+            execution_outputs={1: "Execution failed. Traceback:\nTimeoutError: sensitive payload"}
         ),
     )
     exception_result = run_task_repetitions(
@@ -1367,6 +1359,69 @@ def test_summary_is_immutable_and_contains_no_raw_ids_paths_or_payload_fields(
     write_summary_json(output, summary)
     assert json.loads(output.read_text(encoding="utf-8")) == payload
     assert exit_code_for_summary(summary) == 0
+
+
+def test_replay_writer_preserves_gate0a_bytes_and_private_mode(tmp_path: Path) -> None:
+    summary = _smoke_summary()
+    output = tmp_path / "reports" / "gate0a.json"
+
+    write_summary_json(output, summary)
+
+    expected = (
+        json.dumps(
+            summary.to_dict(),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    assert output.read_text(encoding="utf-8") == expected
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_private_json_writer_rejects_symlink_and_cleans_failed_temporary(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("PRIVATE_TARGET_CANARY", encoding="utf-8")
+    link = tmp_path / "linked.json"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        write_private_json(link, {"safe": True})
+    assert target.read_text(encoding="utf-8") == "PRIVATE_TARGET_CANARY"
+
+    output = tmp_path / "failed" / "result.json"
+    with pytest.raises(ValueError, match="Out of range float values"):
+        write_private_json(output, {"invalid": float("nan")})
+    assert not output.exists()
+    assert list(output.parent.iterdir()) == []
+
+
+def test_private_json_writer_fsyncs_before_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    real_fsync = evidence_module.os.fsync
+    real_replace = evidence_module.os.replace
+
+    def fsync(file_descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(file_descriptor)
+
+    def replace(source: str, destination: Path) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(evidence_module.os, "fsync", fsync)
+    monkeypatch.setattr(evidence_module.os, "replace", replace)
+
+    write_private_json(tmp_path / "result.json", {"safe": True})
+
+    assert events == ["fsync", "replace", "fsync"]
 
 
 def test_nonstandard_smoke_protocol_cannot_report_lifecycle_passed() -> None:
