@@ -3,13 +3,13 @@
 > **Required execution skill:** use `superpowers:executing-plans` task by task, and use
 > `superpowers:test-driven-development` for every production behavior.
 
-**Goal:** Build a pure task-scoped AppWorld semantic adapter and a separate fresh-world
-runtime that admits clean, L1 rename, and L2 parameter-restructure variants through all four
-ToolShift contract layers on one real train task, while persisting only aggregate non-formal
-smoke evidence.
+**Goal:** Build a pure per-world snapshot adapter for AppWorld's pinned full non-admin catalog
+and a separate fresh-world runtime that admits clean, L1 rename, and L2
+parameter-restructure variants through all four ToolShift contract layers on one real train
+task, while persisting non-formal results only in private external storage.
 
 **Architecture:** Protected AppWorld catalogs and oracle calls exist only inside one process.
-The adapter snapshots and validates a task catalog, but never owns a live world. A separate
+The adapter snapshots and validates the full catalog, but never owns a live world. A separate
 executor compiles surface calls through any `SemanticAdapter`, invokes the AppWorld requester,
 and captures opaque state/effect/evaluator evidence. The runner builds all contract inputs,
 evaluates them once, immediately admits the same suite object, and reduces the result to a
@@ -26,7 +26,9 @@ types, L1/L2 transforms, and four-layer contracts.
 - AppWorld remains an opt-in external runtime; no import of `appworld` at package import time.
 - Only the `train` split may be opened in M3A. No held-out split is loaded or enumerated.
 - No task ID, instruction, schema, tool name, arguments, observation, trace, state, evaluator
-  requirement, protected-derived fingerprint, proxy setting, or machine path may be committed.
+  requirement, protected-derived fingerprint, aggregate runtime result, proxy setting, or
+  machine path may be committed. Actual M3A records remain private/encrypted pending written
+  maintainer approval.
 - Base calls use the exact shape `{"name": name, "arguments": arguments}`.
 - The source adapter is one-call/one-action/one-native-call. L1 and L2 candidates must compile
   to the same ordered native calls as the clean reference.
@@ -74,6 +76,10 @@ Cover:
 - caller objects are unchanged and resulting variant content is deeply immutable;
 - all errors are static and do not contain synthetic payload values.
 
+Also reject schema properties that collide with pinned Requester control names:
+`_app_name`, `_api_name`, `client`, `raise_on_failure`, `show`, `track`, and
+`_system_datetime`.
+
 ### Step 2: Run RED
 
 ```bash
@@ -87,13 +93,19 @@ Expected: collection fails because `toolshift.adapters.appworld` does not exist.
 Move `jsonschema>=4.26,<5` from the dev-only list into core dependencies. Implement:
 
 ```python
-class AppWorldSemanticAdapter(SemanticAdapter): ...
+class AppWorldSemanticAdapter(SemanticAdapter):
+    def __init__(
+        self,
+        function_catalog: Sequence[Mapping[str, object]],
+    ) -> None: ...
+
 def build_appworld_adapter(
     function_catalog: Sequence[Mapping[str, object]],
 ) -> AppWorldSemanticAdapter: ...
 ```
 
-Construction creates one `Draft202012Validator` per snapshotted schema, calls
+Construction creates one `Draft202012Validator` with `FormatChecker` per snapshotted schema,
+calls
 `check_schema`, binds the exact `SchemaVariant`, and installs identity/root seals for the
 variant, bindings, validators, and canonical snapshots. Do not implement live execution.
 
@@ -141,22 +153,37 @@ Cover the four `SemanticAdapter` methods:
 
 ### Step 2: Write RED schema-probe tests
 
-Add:
+Add the witness generator in the adapter module and the probe builder in the benchmark layer:
 
 ```python
-def build_schema_probes(adapter: SemanticAdapter) -> tuple[SchemaProbe, ...]: ...
+def build_minimal_source_calls(
+    source_adapter: AppWorldSemanticAdapter,
+) -> tuple[Mapping[str, JSONValue], ...]: ...
+
+def build_schema_probes(
+    source_adapter: AppWorldSemanticAdapter,
+    candidate_adapter: SemanticAdapter,
+    canonical_call_to_surface: Callable[
+        [Mapping[str, JSONValue]], Mapping[str, JSONValue]
+    ],
+) -> tuple[SchemaProbe, ...]: ...
 ```
 
 The helper must work for the base adapter, `RenameAdapter`, and
-`ParameterRestructureAdapter`. It creates exactly one generic-indexed case per declared tool,
-never executes a callback or requester, and produces an instance accepted by the declared
-Draft 2020-12 schema.
+`ParameterRestructureAdapter`. It creates exactly one generic-indexed case per declared
+source/candidate tool, never executes a requester, and produces an instance accepted by both
+declared Draft 2020-12 schemas. `expected_actions` must come only from parsing the canonical
+witness with the source adapter. The candidate surface call comes only from the trusted
+transform translator (or a frozen identity translator for clean). Never call the candidate
+adapter to manufacture its own expected actions.
 
-The deterministic minimal-instance generator must cover the schema forms needed by public
+The deterministic minimal-instance generator must cover the schema forms needed by pinned
 AppWorld function catalogs: `const`, `enum`, `anyOf`/`oneOf`, nullable types, object required
 properties, arrays with `minItems`, strings with `minLength`, integer/number lower bounds, and
 booleans. It must fail closed on references, recursion, unsatisfiable branches, unknown type
-sets, or unsupported combinators. Case IDs are `schema-0000`, not tool-derived.
+sets, or unsupported combinators. Case IDs are `schema-0000`, not tool-derived. Any full
+catalog that cannot produce every witness fails closed with the private exclusion code
+`catalog_unprobeable`.
 
 ### Step 3: Run RED
 
@@ -167,9 +194,9 @@ pytest tests/unit/test_appworld_adapter.py -q
 ### Step 4: Implement the minimal pure methods and probes
 
 All public methods use `try/finally` integrity checks. Snapshot arguments before validator
-callbacks. Convert `jsonschema` exceptions to static `ValueError` messages. The probe builder
-derives expected actions by calling the candidate adapter once, so transformed names never
-need special-case logic.
+callbacks. Convert `jsonschema` exceptions to static `ValueError` messages. The source witness
+builder is implemented here; the cross-adapter `SchemaProbe` construction is added in Task 5
+so the adapter layer does not depend on contract modules.
 
 ### Step 5: Run GREEN and mutation regressions
 
@@ -201,8 +228,8 @@ Use a fake requester, fake models record-hash interface, fake tracker, and fake 
 - `AppWorldEpisodeExecutor(world, adapter)` holds one live world but exposes no reset/load API;
 - each surface call is parsed, compiled, invoked, grouped, and wrapped in exact order;
 - requester receives `_app_name`, `_api_name`, and copied arguments, with no code generation;
-- state is hashed before and after every physical call;
-- `world.save()` occurs before `world.evaluate()`;
+- the exact physical order is `pre-hash -> request -> world.save() -> post-hash`, repeated for
+  every call, followed by evaluation;
 - the final record contains initial/final state, compact evaluator score, evaluator collateral
   digest, full `ExecutionTrace`, immutable step cases, and indexed `PhysicalCallEffect` values;
 - empty episodes, execution failures, malformed requester results, save failures, and evaluator
@@ -218,10 +245,54 @@ pytest tests/unit/test_appworld_runtime.py -q
 
 ### Step 3: Implement the executor
 
-Reuse `canonical_state_sha256` and `evaluator_sha256` from `appworld_replay`. Keep protected
+Use these concrete private shapes:
+
+```python
+class AppWorldEpisodeExecutor:
+    def __init__(
+        self,
+        world: object,
+        adapter: SemanticAdapter,
+        *,
+        state_hasher: Callable[[object], str] = canonical_state_sha256,
+        evaluator_hasher: Callable[[object], str] = evaluator_sha256,
+    ) -> None: ...
+
+    def execute_plan(
+        self,
+        surface_calls: Sequence[Mapping[str, JSONValue]],
+    ) -> _EpisodeRecord: ...
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ExecutedStep:
+    surface_call: Mapping[str, JSONValue]
+    action: SemanticAction
+    base_call: Mapping[str, JSONValue]
+    base_observation: JSONValue
+    surface_observation: JSONValue
+    before_state_sha256: str
+    after_state_sha256: str
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _EpisodeRecord:
+    steps: tuple[_ExecutedStep, ...]
+    trace: ExecutionTrace
+    initial_state_sha256: str
+    final_state_sha256: str
+    evaluator_score: JSONValue
+    evaluator_digest: str
+    effects: tuple[PhysicalCallEffect, ...]
+    transition_digest: str
+```
+
+Reuse `canonical_state_sha256` and `evaluator_sha256` from `appworld_replay`. Define
+`effect_digest = SHA256(domain || before_state_sha256 || after_state_sha256)` and bind the
+ordered effects, final state, and evaluator digest into `transition_digest`. Keep protected
 records private (`repr=False`) and frozen. A compact score contains only scalar evaluator
-counts and success; it stays in memory. Effect IDs are generic indexed values whose digest
-binds the before/after whole-state hashes.
+counts and success; it stays in memory. The required physical-call order is initial hash,
+then for every call `request -> world.save() -> post-call hash`; evaluation follows the final
+save. Effect IDs are generic indexed values whose digest binds the before/after whole-state
+hashes. Unit tests and the opt-in real smoke must prove repeated `save()` is supported.
 
 ### Step 4: Run GREEN
 
@@ -249,15 +320,25 @@ git commit -m "feat: add AppWorld episode executor"
 Add a private capture function used only by the runner. With fake `world.execute`, assert:
 
 - it temporarily replaces the exact requester instance's `request` method;
-- positional and keyword `_app_name`/`_api_name` calls are captured after successful return;
+- the replacement has the exact pinned
+  `request(_app_name, _api_name, client, raise_on_failure, show, track, **data)` signature;
+- positional and keyword control arguments are forwarded but never recorded as API data;
+- returned/completed calls are captured after return, including JSON error responses when
+  `raise_on_failure=False`;
 - captured calls are native `name/arguments` values in original order;
 - failed requester calls are not appended;
-- compiled oracle text, returned observations, and call payloads are never serialized or
-  included in exceptions/repr;
+- ToolShift capture objects never serialize compiled text, observations, or call payloads and
+  never include them in exceptions/repr; AppWorld's own logs remain in private `APPWORLD_ROOT`;
 - original requester method identity is restored on success, execution failure, requester
   failure, evaluation failure, and `BaseException`;
 - an empty trace, AppWorld execution-failure prefix, or unsuccessful oracle is rejected;
-- `world.save()` precedes evaluation.
+- the Requester tracker delta must cover every captured high-level call exactly, so a low-level
+  bypass is rejected;
+- public `get/post/put/patch/delete` guards reject direct entry, including `track=False`, while
+  permitting calls reached from the wrapped high-level `request`; all guards restore in
+  `finally`;
+- no `save()` occurs inside the requester callback; one `world.save()` follows successful
+  `world.execute` and precedes evaluation.
 
 ### Step 2: Run RED
 
@@ -270,6 +351,14 @@ pytest tests/unit/test_appworld_runtime.py -q
 Read `world.task.ground_truth.compiled_solution_code` only inside the function, execute the
 official solution, and keep the resulting `_CapturedOraclePlan` private and non-serializable.
 The wrapper delegates to the original bound method exactly once and restores it in `finally`.
+Use the complete reference init profile (`ground_truth_mode=full`, `raise_on_failure=False`,
+fixed seed, unique private experiment name). The private AppWorld root is outside ToolShift
+Git, mode 0700 under umask 077; AppWorld's unavoidable execute/save/evaluate logs follow the
+documented retention policy.
+
+The pinned-runtime probe established that nested `world.save()` from inside the execute
+callback is unsupported. Per-call state/effect evidence therefore comes only from later direct
+clean/candidate replay, where the executor enforces `request -> save -> post-hash`.
 
 ### Step 4: Run GREEN and commit
 
@@ -295,11 +384,17 @@ fresh-world factory and assert one variant bundle:
 - uses separate reference, candidate, reference-reset, and candidate-reset worlds;
 - translates oracle native calls to candidate surface calls through the transform;
 - produces exactly one schema probe for every declared candidate tool;
-- creates one `DenotationCase` per executed candidate step;
+- creates one candidate-surface `DenotationCase` per executed step whose expected action,
+  base-call group, observation group, and expected surface observation come independently
+  from the clean source replay;
+- compares each actual candidate observation with that clean expectation before constructing
+  contract evidence;
 - reuses those exact case objects in `TraceEvidence.candidate_steps`;
 - aligns the same generic episode ID in `StateCase` and `TraceCase`;
 - uses cached providers that return evidence for only that exact case;
 - runs all four layers and immediately admits the exact returned suite object;
+- proves the candidate adapter canonicalizes both the canonical reference trace and the
+  transformed candidate trace;
 - never exposes or persists the suite, schema fingerprint, calls, or task identity.
 
 Add negative controls for wrong mapping, observation, physical call, effect, final state, reset
@@ -325,6 +420,29 @@ assert admitted is suite
 The function returns only a small process-local success record with counts and diagnostic
 codes; it never returns the suite or protected records. Cleanup is owned by the injected
 fresh-world context factory.
+
+Use exact-match cached providers rather than closures that accept arbitrary cases:
+
+```python
+class _StateEvidenceLookup:
+    def __init__(
+        self,
+        entries: tuple[tuple[StateCase, StateEvidence], ...],
+    ) -> None: ...
+    def __call__(self, case: StateCase) -> StateEvidence: ...
+
+class _TraceEvidenceLookup:
+    def __init__(
+        self,
+        entries: tuple[tuple[TraceCase, TraceEvidence], ...],
+    ) -> None: ...
+    def __call__(self, case: TraceCase) -> TraceEvidence: ...
+```
+
+`_TraceEvidenceLookup` is constructed with `candidate_steps=denotation_cases`, preserving the
+same tuple and exact `DenotationCase` object identities used by the denotation layer. Both
+lookups accept only the exact case object identity registered at construction; a merely equal
+replacement raises a static `ValueError`. Providers perform no world execution.
 
 ### Step 4: Run GREEN and all contract tests
 
@@ -356,13 +474,19 @@ Test an injected ordered train-task loader and world factory. Assert:
 - L1 selects an oracle-used tool and a collision-free generic alias;
 - L2 tries oracle-used tools and sorted parameter choices through the existing conservative
   restructure constructor, never deleting `default` or changing the source schema;
-- the preferred L2 case moves one proper-subset parameter; whole-wrap is not accepted for the
-  real smoke;
+- the preferred L2 case moves one proper-subset parameter. This intentionally validates the
+  paper's selective-grouping operator rather than its whole-wrap control; inability to find
+  one is a reported private smoke failure, not an eligibility relaxation;
 - ineligible tasks increment only aggregate screened/excluded counters;
 - one eligible task is used for clean, L1, and L2; each variant uses fresh worlds;
 - no eligible L2 case, empty oracle, any suite failure, cleanup failure, or wrong pin makes the
   smoke fail rather than skip;
 - only `train` is passed to the task loader.
+- every reference/clean/candidate/reset factory call shares the frozen execution flags:
+  `raise_on_failure=False`, `raise_on_extra_parameters=True`, `remote_apis_url=None`,
+  `remote_mcp_url=None`, `remote_docker=False`, `parse_datetimes=False`,
+  `wrap_response=False`, `unwrap_response=False`, and `munchify_response=False`; reference
+  alone adds `ground_truth_mode=full`.
 
 ### Step 2: Run RED
 
@@ -378,15 +502,18 @@ Add:
 def run_appworld_gate0_smoke(
     *,
     seed: int = 100,
-    task_loader: Callable[[str], Sequence[str]],
-    world_context_factory: WorldContextFactory,
+    workers: int = 1,
+    task_loader: Callable[[str], Sequence[str]] = _load_appworld_task_ids,
+    world_context_factory: WorldContextFactory = appworld_world_context,
+    pin_checker: Callable[[], None] = require_pinned_appworld_runtime,
 ) -> AppWorldGate0Summary: ...
 ```
 
 The production defaults lazily import `load_task_ids` and reuse the guarded
-`appworld_world_context`. Before loading tasks, require the pinned checkout revision, package
-version, Python 3.11.15-compatible runtime, and public data/base-DB version pins without
-printing paths.
+`appworld_world_context`. Before loading tasks, require workers exactly one, all proxy variables
+unset, a dedicated absolute non-Git private root with mode 0700, the pinned editable checkout
+revision, installed package version, Python runtime, data version, and base-DB version without
+printing paths. Do not reuse the existing sorted `TaskSet` loader.
 
 ### Step 4: Run GREEN
 
@@ -403,7 +530,7 @@ git add src/toolshift/benchmarks/appworld_gate0.py tests/unit/test_appworld_gate
 git commit -m "feat: orchestrate AppWorld Gate 0 smoke"
 ```
 
-## Task 7: Add the aggregate-only summary, private writer, and CLI
+## Task 7: Add the private aggregate record, private writer, and CLI
 
 **Files:**
 
@@ -415,10 +542,10 @@ git commit -m "feat: orchestrate AppWorld Gate 0 smoke"
 - Modify: `tests/unit/test_appworld_gate0.py`
 - Modify: `tests/test_repository_security.py`
 
-### Step 1: Write RED evidence-boundary tests
+### Step 1: Write RED private-record boundary tests
 
-Define an exact `AppWorldGate0Summary.to_dict()` key allowlist. Test type/range/cross-field
-integrity for all pins and counters, and assert:
+Define an exact operator-private `AppWorldGate0Summary.to_dict()` key allowlist. Test
+type/range/cross-field integrity for all pins and counters, and assert:
 
 ```python
 summary.mode == "smoke"
@@ -433,7 +560,8 @@ state/trace/suite canary and excludes keys containing `task_id`, `schema_sha`, `
 
 Extract the existing mode-0600 atomic JSON primitive into `_evidence.py` without changing the
 Gate 0a output. Test symlink rejection, fsync/replace behavior, temp cleanup, existing-file mode
-repair, JSON `allow_nan=False`, and nonzero CLI status for failed smoke.
+repair, JSON `allow_nan=False`, nonzero CLI status for failed smoke, and a repository scan that
+rejects any actual M3A runtime record under Git.
 
 ### Step 2: Run RED
 
@@ -444,8 +572,9 @@ pytest tests/unit/test_appworld_gate0.py tests/unit/test_appworld_replay.py \
 
 ### Step 3: Implement the summary and thin CLI
 
-The script only parses `--output`, calls the production smoke runner, writes a successful or
-failed aggregate summary, and returns `0` exactly for `smoke_passed`. It must not accept task
+The script only parses an absolute `--output` under the validated private AppWorld root, calls
+the production smoke runner, writes a successful or failed private aggregate record, and
+returns `0` exactly for `smoke_passed`. It must not accept task
 IDs, dev/test split names, raw log output paths, or proxy arguments.
 
 ### Step 4: Run GREEN and repository scans
@@ -464,7 +593,7 @@ git add src/toolshift/benchmarks/_evidence.py \
   src/toolshift/benchmarks/appworld_gate0.py \
   scripts/verify_appworld_gate0.py tests/unit/test_appworld_replay.py \
   tests/unit/test_appworld_gate0.py tests/test_repository_security.py
-git commit -m "feat: report aggregate AppWorld smoke evidence"
+git commit -m "feat: write private AppWorld smoke records"
 ```
 
 ## Task 8: Add an opt-in integration smoke and correct the ml2 runbook
@@ -479,17 +608,20 @@ git commit -m "feat: report aggregate AppWorld smoke evidence"
 
 ### Step 1: Write the opt-in smoke wrapper
 
-Mark it `pytest.mark.appworld`. Skip only when the external runtime is absent; once AppWorld
-is present, any missing pin, missing data, no L2-eligible train task, contract failure, or
-cleanup error is a test failure. Assert aggregate fields only.
+Mark it `pytest.mark.appworld`. Skip unless
+`TOOLSHIFT_RUN_APPWORLD_GATE0_SMOKE=1` is explicitly set.
+Once enabled, a missing runtime, wrong pin, missing data, no L2-eligible train task, contract
+failure, repeated-save failure, or cleanup error is a test failure and must never become a
+skip. Assert aggregate fields only.
 
 ### Step 2: Update documentation and manifest tests
 
 Document the verified install order for the pinned source:
 
 ```text
-git clone/LFS -> Python 3.11 environment -> editable install -> appworld install --repo
--> appworld download data --version 0.2.0 --mode minimal -> verify tests/tasks
+git lfs install -> clone -> checkout --detach PIN -> git lfs pull
+-> Python 3.11 environment -> editable install -> appworld install --repo
+-> download minimal data 0.2.0 into dedicated private APPWORLD_ROOT -> verify tests/tasks
 ```
 
 Document that uv cache/install staging must remain on node-local storage when the shared NFS
@@ -497,8 +629,9 @@ mount does not support uv's atomic persistence, then copy/link the finished stan
 or use `--link-mode copy`. Do not include the real shared root, proxy port, token, username,
 or host-specific secrets.
 
-Add official fixed-commit source links and state that M3A is non-formal integration evidence.
-Do not add a real smoke evidence JSON until the real run succeeds.
+Add official fixed-commit source links and state that M3A is non-formal private integration
+evidence. State explicitly that actual M3A derived records must not be added to Git without a
+maintainer-approved encrypted workflow.
 
 ### Step 3: Run local GREEN
 
@@ -508,7 +641,8 @@ pytest tests/test_benchmark_manifests.py tests/test_repository_security.py -q
 ruff check .
 ```
 
-Expected locally: one explicit opt-in skip if AppWorld is absent; all static tests pass.
+Expected locally: one explicit opt-in skip whenever the opt-in environment flag is unset; once
+set, no runtime, pin, data, contract, or cleanup failure may become a skip.
 
 ### Step 4: Commit
 
@@ -518,21 +652,37 @@ git add tests/smoke/test_appworld_gate0.py docs/environment/ml2-appworld.md \
 git commit -m "docs: add AppWorld Gate 0 smoke protocol"
 ```
 
-## Task 9: Verify the pinned external environment and run the real M3A smoke
+## Task 9: Verify the pinned external environment and run the real M3A smoke privately
 
 **External-only actions; no protected payload output.**
 
-### Step 1: Finish official AppWorld verification
+### Step 1: Finish no-task official/static verification
 
 Run in the detached pinned checkout with all proxy variables unset:
 
 ```bash
 appworld verify tests
-appworld verify tasks --num-processes 4
 ```
 
 Redirect detailed logs to a mode-0600 private external directory. Retain only exit status and
 aggregate pass/skip counts in the operator record; delete successful detailed logs.
+
+Do not use `appworld verify tasks` for M3A: at the pinned revision it always opens train and
+dev, and its multiprocessing path is not the one-worker protocol. Separately verify pins,
+proxy absence, dedicated-root permissions, package version, checkout, data, and base DB before
+opening any task.
+
+Then, before selection/full smoke, run a private train-only live compatibility probe for:
+
+- full non-admin catalog outer shape and reserved-control collisions;
+- exact Requester/low-level guard replacement/restoration and tracker coverage, including a
+  synthetic `track=False` bypass negative control;
+- I-JSON requester responses;
+- oracle capture with one post-execute save, followed by direct replay using
+  `request -> save -> post-hash` with repeated saves;
+- unique experiment lifecycle and cleanup in the dedicated 0700 root.
+
+Keep its result private and print no protected value.
 
 ### Step 2: Freeze dependencies outside Git
 
@@ -552,18 +702,12 @@ Inspect only the aggregate allowlisted JSON. Required result: `smoke_passed=true
 clean/L1/L2 admitted suite, zero diagnostics/exceptions/cleanup failures, and
 `formal_gate_passed=false`.
 
-### Step 4: Add only safe aggregate evidence
+### Step 4: Keep the result outside Git
 
-If and only if the real smoke passes, copy a manually audited aggregate summary into
-`data/evidence/appworld/gate0b-smoke/`. Re-run repository security tests before staging it.
-Never commit a failed report or private log.
-
-### Step 5: Commit
-
-```bash
-git add data/evidence/appworld/gate0b-smoke tests/test_benchmark_manifests.py
-git commit -m "data: record AppWorld Gate 0 smoke"
-```
+Manually audit the private allowlisted record and retain or delete it according to the lab's
+private policy. Do not stage it, quote it in a public PR, or call it formal Gate 0b evidence.
+Publication requires written AppWorld maintainer approval and an approved encrypted workflow;
+the official leaderboard packer is not assumed to support this train/custom artifact.
 
 ## Task 10: Full verification, review, PR, and merge
 
@@ -601,8 +745,8 @@ Resolve findings with new RED regressions before production changes.
 ### Step 4: Push a topic branch and open one PR
 
 Require duplicated GitHub push/PR checks on Python 3.10 and 3.11. Do not push directly to
-`main`. Use a conventional PR title and include the exact local/real verification summaries,
-with no protected data.
+`main`. Use a conventional PR title and include exact synthetic/local verification summaries
+only. Do not quote private real-smoke results or any protected-derived aggregate.
 
 ### Step 5: Merge and post-merge verify
 
