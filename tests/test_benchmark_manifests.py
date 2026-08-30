@@ -680,6 +680,9 @@ def test_appworld_runbook_freezes_private_m3a_install_and_execution_boundary() -
     assert "outside every Git worktree" in normalized
     assert "node-local storage" in normalized
     assert "--link-mode copy" in normalized
+    assert "PYTHON_DOTENV_DISABLED=1" in normalized
+    assert "PYTHONDONTWRITEBYTECODE=1" in normalized
+    assert 'APPWORLD_CACHE="${APPWORLD_ROOT}/.cache"' in normalized
     assert "ModelScope" in normalized
     assert "without the external proxy" in normalized
     assert "private, non-formal M3A integration evidence" in normalized
@@ -728,6 +731,7 @@ def test_appworld_runbook_builds_and_runs_entire_environment_on_node_local_stora
     assert 'export APPWORLD_ENV="${TOOLSHIFT_NODE_LOCAL}/venvs/appworld-0.2.0"' in install_block
     assert "readonly APPWORLD_ENV" in install_block
     assert 'uv venv --python 3.11.15 "${APPWORLD_ENV}"' in install_block
+    assert '"python-dotenv==1.2.2"' in install_block
     assert '--python "${APPWORLD_ENV}/bin/python"' in normalized
     assert '"${APPWORLD_ENV}/bin/appworld"' in normalized
     assert '"${APPWORLD_ENV}/bin/python"' in normalized
@@ -874,8 +878,7 @@ def test_appworld_runbook_explicitly_binds_tracked_clean_checkout_check() -> Non
         '"ls-files", "-v", "-z"',
         'tag == b"S" or tag.islower()',
         '"ls-files", "--others", "-z", "--"',
-        'raw_path.startswith(b"src/appworld.egg-info/")',
-        'b"/__pycache__/" in raw_path',
+        "untracked_paths.add(raw_path)",
         'git_directory / "info" / "attributes"',
         '"diff-index"',
         '"--cached"',
@@ -886,6 +889,11 @@ def test_appworld_runbook_explicitly_binds_tracked_clean_checkout_check() -> Non
         "git_blob_sha1(payload)",
         "lfs_pointer(expected)",
         "hashlib.sha256()",
+        "ast.parse(",
+        "PBKDF2HMAC(",
+        "zipfile.ZipFile(",
+        "untracked_paths != set(expected_untracked)",
+        "path.read_bytes() != expected",
     ]
     cursor = normalized.index(required_steps[0]) + len(required_steps[0])
     for step in required_steps[1:]:

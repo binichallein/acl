@@ -144,6 +144,14 @@ if git -C "${APPWORLD_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1; then
   echo "APPWORLD_ROOT must be outside every Git worktree" >&2
   exit 1
 fi
+export APPWORLD_CACHE="${APPWORLD_ROOT}/.cache"
+mkdir -p "${APPWORLD_CACHE}"
+chmod 0700 "${APPWORLD_CACHE}"
+test -d "${APPWORLD_CACHE}" && test ! -L "${APPWORLD_CACHE}" && test -O "${APPWORLD_CACHE}"
+test "$(stat -c '%a' -- "${APPWORLD_CACHE}")" = "700"
+export PYTHON_DOTENV_DISABLED=1
+export PYTHONDONTWRITEBYTECODE=1
+unset APPWORLD_DB_ARGS APPWORLD_DATE_TIME LOAD_ON_STARTUP
 export UV_CACHE_DIR="${TOOLSHIFT_NODE_LOCAL}/uv-cache"
 export APPWORLD_ENV="${TOOLSHIFT_NODE_LOCAL}/venvs/appworld-0.2.0"
 readonly APPWORLD_ENV
@@ -154,6 +162,7 @@ uv venv --python 3.11.15 "${APPWORLD_ENV}"
 uv pip install \
   --link-mode copy \
   --python "${APPWORLD_ENV}/bin/python" \
+  "python-dotenv==1.2.2" \
   -e "${TOOLSHIFT_SHARED_ROOT}/repos/appworld"
 cd "${TOOLSHIFT_SHARED_ROOT}/repos/appworld"
 "${APPWORLD_ENV}/bin/appworld" install --repo
@@ -184,12 +193,15 @@ test -d "${APPWORLD_CHECKOUT}/.git" && test ! -L "${APPWORLD_CHECKOUT}/.git"
 clear_git_environment
 set +e
 "${APPWORLD_ENV}/bin/python" - "${APPWORLD_CHECKOUT}" <<'PY'
+import ast
+import hashlib
+import io
 import os
 import pathlib
 import stat
 import subprocess
 import sys
-import hashlib
+import zipfile
 
 try:
     checkout = pathlib.Path(sys.argv[1]).resolve(strict=True)
@@ -279,48 +291,21 @@ try:
         tag = entry[:1]
         if tag == b"S" or tag.islower():
             raise SystemExit(3)
-    protected_source_prefixes = tuple(
-        f"src/appworld/apps/{name}/".encode("ascii")
-        for name in (
-            "admin",
-            "amazon",
-            "api_docs",
-            "file_system",
-            "gmail",
-            "phone",
-            "simple_note",
-            "splitwise",
-            "spotify",
-            "supervisor",
-            "todoist",
-            "venmo",
-        )
-    )
     untracked = run(["ls-files", "--others", "-z", "--"])
     if untracked.returncode:
         raise SystemExit(4)
+    untracked_paths = set()
     for raw_path in untracked.stdout.split(b"\0"):
-        if not raw_path or not raw_path.startswith(b"src/"):
+        if not raw_path:
             continue
         parts = raw_path.split(b"/")
-        allowed = (
-            any(raw_path.startswith(prefix) for prefix in protected_source_prefixes)
-            or raw_path.startswith(b"src/appworld.egg-info/")
-            or (b"/__pycache__/" in raw_path and raw_path.endswith(b".pyc"))
-        )
-        if not allowed or any(part in (b"", b".", b"..") for part in parts):
+        if (
+            raw_path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in parts)
+            or raw_path in untracked_paths
+        ):
             raise SystemExit(3)
-        current = checkout
-        for index, part in enumerate(parts):
-            current /= os.fsdecode(part)
-            metadata = current.lstat()
-            if metadata.st_uid != os.geteuid() or stat.S_ISLNK(metadata.st_mode):
-                raise SystemExit(3)
-            if index < len(parts) - 1:
-                if not stat.S_ISDIR(metadata.st_mode):
-                    raise SystemExit(3)
-            elif not stat.S_ISREG(metadata.st_mode):
-                raise SystemExit(3)
+        untracked_paths.add(raw_path)
     if os.path.lexists(git_directory / "info" / "attributes"):
         raise SystemExit(3)
     if run(
@@ -361,7 +346,7 @@ try:
         ):
             raise SystemExit(4)
         paths.add(raw_path)
-        entries.append((fields[0], fields[2], pathlib.Path(os.fsdecode(raw_path))))
+        entries.append((fields[0], fields[2], raw_path))
     if not entries:
         raise SystemExit(4)
 
@@ -396,8 +381,9 @@ try:
     if offset != len(batch.stdout):
         raise SystemExit(4)
 
+    head_payloads = {relative: payloads[oid] for _, oid, relative in entries}
     for mode, oid, relative in entries:
-        path = checkout / relative
+        path = checkout / os.fsdecode(relative)
         metadata = path.lstat()
         expected = payloads[oid]
         if mode == b"120000":
@@ -427,6 +413,93 @@ try:
                 digest.update(chunk)
         if digest.hexdigest() != expected_digest:
             raise SystemExit(3)
+
+    constants = ast.parse(
+        head_payloads[b"src/appworld/common/constants.py"].decode(
+            "utf-8", errors="strict"
+        )
+    )
+    literals = {}
+    for statement in constants.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id in ("PASSWORD", "SALT")
+        ):
+            name = statement.targets[0].id
+            if name in literals:
+                raise SystemExit(4)
+            literals[name] = ast.literal_eval(statement.value)
+    bundle_phrase = literals.get("PASSWORD")
+    kdf_salt = literals.get("SALT")
+    if type(bundle_phrase) is not str or type(kdf_salt) is not bytes:
+        raise SystemExit(4)
+
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    bundle_layout = (
+        (b"src/appworld/.source/apps.bundle", b"src/appworld"),
+        (b"src/appworld/.source/tests.bundle", b"tests"),
+        (b"generate/.source/tasks.bundle", b"generate/tasks"),
+        (b"generate/.source/data.bundle", b"generate"),
+    )
+    expected_untracked = {}
+    for bundle_path, base_directory in bundle_layout:
+        pointer = lfs_pointer(head_payloads[bundle_path])
+        if pointer is None:
+            raise SystemExit(4)
+        expected_digest, expected_size = pointer
+        encrypted = (checkout / os.fsdecode(bundle_path)).read_bytes()
+        if (
+            len(encrypted) != expected_size
+            or hashlib.sha256(encrypted).hexdigest() != expected_digest
+            or len(encrypted) < 17
+        ):
+            raise SystemExit(3)
+        key = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=kdf_salt,
+            iterations=100000,
+            backend=default_backend(),
+        ).derive(bundle_phrase.encode("utf-8"))
+        decryptor = Cipher(
+            algorithms.AES(key),
+            modes.CFB(encrypted[:16]),
+            backend=default_backend(),
+        ).decryptor()
+        archive_bytes = decryptor.update(encrypted[16:]) + decryptor.finalize()
+        with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
+            for info in archive.infolist():
+                raw_member = info.filename.encode("utf-8", errors="strict")
+                parts = raw_member.split(b"/")
+                if (
+                    info.is_dir()
+                    or not raw_member
+                    or raw_member.startswith(b"/")
+                    or b"\\" in raw_member
+                    or any(part in (b"", b".", b"..") for part in parts)
+                ):
+                    raise SystemExit(4)
+                target = base_directory + b"/" + raw_member
+                if target in expected_untracked or target in head_payloads:
+                    raise SystemExit(4)
+                expected_untracked[target] = archive.read(info)
+    if untracked_paths != set(expected_untracked):
+        raise SystemExit(3)
+    for raw_path, expected in expected_untracked.items():
+        path = checkout / os.fsdecode(raw_path)
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or path.read_bytes() != expected
+        ):
+            raise SystemExit(3)
 except Exception:
     raise SystemExit(4)
 PY
@@ -449,15 +522,20 @@ case "${checkout_audit_status}" in
 esac
 ```
 
-This verification installation uses upstream editable dependency resolution. The project training dependency lock is not complete, and no lock checksum is recorded.
+This verification installation uses upstream editable dependency resolution except for an
+exact `python-dotenv==1.2.2` pin. The pin makes `PYTHON_DOTENV_DISABLED=1` reproducible; Gate 0
+also checks the installed version and probes the disable behavior before importing AppWorld.
+The project training dependency lock is not complete, and no lock checksum is recorded.
 
 The two data version files below the dedicated private `APPWORLD_ROOT` must both report
 `0.2.0`. The path/size inventory and encrypted bundle hashes are recorded in the manifest;
 the path/size inventory is a structural reproducibility summary, not a content-integrity
-checksum. Installation may leave ignored decrypted source files, but the pinned checkout's
-tracked files must remain clean. At this revision, `verify tests --root` expects the unpacked
-repository tests below the selected root, so the commands copy that tree into the mode-`0700`
-private root before verification. The protected test copy never enters ToolShift Git.
+checksum. The audit decrypts the four already-verified LFS bundles in memory and requires the
+ignored unpacked files to match their exact path set and bytes; any additional untracked file,
+including caches or dotenv configuration, fails closed. It persists no protected content or
+derived fingerprint. At this revision, `verify tests --root` expects the unpacked repository
+tests below the selected root, so the commands copy that tree into the mode-`0700` private root
+before verification. The protected test copy never enters ToolShift Git.
 
 ## Official verification
 
