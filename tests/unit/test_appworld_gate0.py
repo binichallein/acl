@@ -630,11 +630,11 @@ def _install_candidate_record_corruption(
             return replace(
                 record,
                 evaluator_score={
-                    "pass_count": 0,
-                    "fail_count": 1,
-                    "total_count": 1,
-                    "num_tests": 1,
-                    "success": False,
+                    "pass_count": 2,
+                    "fail_count": 0,
+                    "total_count": 2,
+                    "num_tests": 2,
+                    "success": True,
                 },
             )
         else:  # pragma: no cover - test helper guard.
@@ -822,3 +822,83 @@ def test_private_admission_error_repr_and_codes_are_payload_safe() -> None:
     assert str(error) == "paired AppWorld execution failed"
     assert "PRIVATE" not in repr(error)
     assert "PRIVATE" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("unsuccessful_execution", "diagnostic_code"),
+    [
+        (1, "pair.reference_oracle_unsuccessful"),
+        (2, "pair.candidate_oracle_unsuccessful"),
+    ],
+)
+def test_admission_rejects_identical_well_formed_unsuccessful_scores(
+    monkeypatch: pytest.MonkeyPatch,
+    unsuccessful_execution: int,
+    diagnostic_code: str,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    source, candidate, plan, translate = _candidate("clean")
+    real_execute = gate0_module.AppWorldEpisodeExecutor.execute_plan
+
+    execution_count = 0
+
+    def unsuccessful_execute(executor: object, calls: object) -> object:
+        nonlocal execution_count
+        execution_count += 1
+        record = real_execute(executor, calls)
+        if execution_count != unsuccessful_execution:
+            return record
+        return replace(
+            record,
+            evaluator_score={
+                "pass_count": 0,
+                "fail_count": 1,
+                "total_count": 1,
+                "num_tests": 1,
+                "success": False,
+            },
+        )
+
+    monkeypatch.setattr(
+        gate0_module.AppWorldEpisodeExecutor,
+        "execute_plan",
+        unsuccessful_execute,
+    )
+
+    with pytest.raises(ValueError, match="paired AppWorld evidence failed") as raised:
+        gate0_module._admit_variant_pair(
+            source_adapter=source,
+            candidate_adapter=candidate,
+            oracle_plan=plan,
+            canonical_call_to_surface=translate,
+            world_context_factory=_WorldFactory(),
+        )
+
+    assert raised.value.diagnostic_codes == (  # type: ignore[attr-defined]
+        diagnostic_code,
+    )
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize("kind", ["rename", "restructure"])
+def test_transformed_candidate_must_be_bound_to_exact_reference_source(kind: str) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    reference_source, plan = _source_and_calls()
+    _, candidate, _, translate = _candidate(kind)
+    assert candidate.transform.source_variant == reference_source.variant
+    assert candidate.transform.source_variant is not reference_source.variant
+    factory = _WorldFactory()
+
+    with pytest.raises(ValueError, match="trusted canonical translator") as raised:
+        gate0_module._admit_variant_pair(
+            source_adapter=reference_source,
+            candidate_adapter=candidate,
+            oracle_plan=plan,
+            canonical_call_to_surface=translate,
+            world_context_factory=factory,
+        )
+
+    assert raised.value.__cause__ is None
+    assert factory.open_roles == []

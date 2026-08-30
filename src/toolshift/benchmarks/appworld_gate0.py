@@ -157,6 +157,15 @@ def _require_trusted_translator(
     if type(candidate_adapter) not in (RenameAdapter, ParameterRestructureAdapter):
         raise ValueError(_UNTRUSTED_TRANSLATOR)
     try:
+        candidate_type = type(candidate_adapter)
+        binding_validator = candidate_type.__dict__["_require_bindings"]
+        binding_validator(candidate_adapter)
+        if (
+            object.__getattribute__(candidate_adapter, "_source_adapter") is not source_adapter
+            or object.__getattribute__(candidate_adapter, "_source_adapter_seal")
+            is not source_adapter
+        ):
+            raise ValueError
         transform = candidate_adapter.transform
         expected_function = type(transform).__dict__["canonical_call_to_surface"]
         if (
@@ -358,16 +367,16 @@ def _admit_variant_pair(
         raise ValueError(_INVALID_PAIR) from None
     if type(oracle_plan) is not _CapturedOraclePlan:
         raise ValueError(_INVALID_PLAN) from None
+    translator = _require_trusted_translator(
+        source_adapter,
+        candidate_adapter,
+        canonical_call_to_surface,
+    )
 
     try:
         oracle_native_calls = oracle_plan.native_calls
         if type(oracle_native_calls) is not tuple or not oracle_native_calls:
             raise _VariantAdmissionError(_INVALID_PLAN, ("pair.invalid_oracle_plan",))
-        translator = _require_trusted_translator(
-            source_adapter,
-            candidate_adapter,
-            canonical_call_to_surface,
-        )
         schema_probes = build_schema_probes(
             source_adapter,
             candidate_adapter,
@@ -395,6 +404,10 @@ def _admit_variant_pair(
             calls=candidate_calls,
             seen_worlds=seen_worlds,
         )
+        if reference_record.evaluator_score.get("success") is not True:
+            _fail_evidence("pair.reference_oracle_unsuccessful")
+        if candidate_record.evaluator_score.get("success") is not True:
+            _fail_evidence("pair.candidate_oracle_unsuccessful")
         denotation_cases = _denotation_cases(reference_record, candidate_record)
         reference_reset = _fresh_initial_state(
             world_context_factory,
