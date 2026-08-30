@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Callable, Mapping
-from dataclasses import FrozenInstanceError
-from typing import cast
+from dataclasses import FrozenInstanceError, dataclass
+from functools import lru_cache
+from typing import cast, get_type_hints
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from hypothesis.strategies import SearchStrategy
+from jsonschema import Draft202012Validator
 
 import toolshift.transforms.rename as rename_module
 import toolshift.transforms.restructure as restructure_module
@@ -101,6 +107,165 @@ def _search_rule(
     container_name: str = "request",
 ) -> ParameterGroupRule:
     return ParameterGroupRule("search", container_name, moved_parameters)
+
+
+@dataclass(frozen=True)
+class _BijectionLayout:
+    name: str
+    property_names: tuple[str, ...]
+    required: tuple[str, ...]
+    moved: tuple[str, ...]
+
+
+_BIJECTION_LAYOUTS = (
+    _BijectionLayout(
+        "selective-required-and-optional",
+        (
+            "moved_required",
+            "moved_optional",
+            "unmoved_required",
+            "unmoved_optional",
+            " ",
+        ),
+        ("moved_required", "unmoved_required"),
+        ("moved_required", "moved_optional"),
+    ),
+    _BijectionLayout(
+        "selective-optional-only",
+        ("moved_alpha", "moved_beta", "unmoved_required", "unmoved_optional", " "),
+        ("unmoved_required",),
+        ("moved_alpha", "moved_beta"),
+    ),
+    _BijectionLayout(
+        "whole-wrap-required-and-optional",
+        ("required_value", "optional_value"),
+        ("required_value",),
+        ("required_value", "optional_value"),
+    ),
+    _BijectionLayout(
+        "whole-wrap-optional-only",
+        ("optional_alpha", "optional_beta"),
+        (),
+        ("optional_alpha", "optional_beta"),
+    ),
+)
+
+_IJSON_TEXT = st.one_of(
+    st.sampled_from(("", "雪", "e\N{COMBINING ACUTE ACCENT}", "emoji-\U0001f642")),
+    st.text(
+        alphabet=st.characters(blacklist_categories=("Cs",)),
+        max_size=12,
+    ),
+)
+_IJSON_SCALAR = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(2**53) + 1, max_value=2**53 - 1),
+    st.floats(
+        min_value=-1_000_000,
+        max_value=1_000_000,
+        allow_nan=False,
+        allow_infinity=False,
+        width=64,
+    ),
+    _IJSON_TEXT,
+)
+_BOUNDED_IJSON: SearchStrategy[JSONValue] = st.recursive(
+    _IJSON_SCALAR,
+    lambda children: st.one_of(
+        st.lists(children, max_size=3),
+        st.dictionaries(_IJSON_TEXT, children, max_size=3),
+    ),
+    max_leaves=10,
+)
+_CALL_METADATA: SearchStrategy[dict[str, JSONValue]] = st.dictionaries(
+    st.sampled_from(("request_id", "retry", "tags", "metadata")),
+    _BOUNDED_IJSON,
+    max_size=4,
+)
+
+
+def _layout_argument_strategy(layout: _BijectionLayout) -> SearchStrategy[dict[str, JSONValue]]:
+    required = {name: _BOUNDED_IJSON for name in layout.required}
+    optional = {
+        name: _BOUNDED_IJSON for name in layout.property_names if name not in layout.required
+    }
+    return st.fixed_dictionaries(required, optional=optional)
+
+
+def _layout_surface_strategy(layout: _BijectionLayout) -> SearchStrategy[dict[str, JSONValue]]:
+    """Generate valid nested instances independently of production translation."""
+
+    moved = frozenset(layout.moved)
+    inner_required = {name: _BOUNDED_IJSON for name in layout.required if name in moved}
+    inner_optional = {name: _BOUNDED_IJSON for name in layout.moved if name not in layout.required}
+    outer_required = {name: _BOUNDED_IJSON for name in layout.required if name not in moved}
+    outer_optional = {
+        name: _BOUNDED_IJSON
+        for name in layout.property_names
+        if name not in moved and name not in layout.required
+    }
+    inner = st.fixed_dictionaries(inner_required, optional=inner_optional)
+    outer = st.fixed_dictionaries(outer_required, optional=outer_optional)
+    return st.tuples(outer, inner).map(
+        lambda parts: {**parts[0], "request": parts[1]},
+    )
+
+
+def _layout_base_variant(layout: _BijectionLayout) -> SchemaVariant:
+    schema: dict[str, JSONValue] = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {name: {} for name in layout.property_names},
+        "additionalProperties": False,
+    }
+    if layout.required:
+        schema["required"] = layout.required
+    return _base_variant(search_schema=schema)
+
+
+def _expected_layout_surface_schema(layout: _BijectionLayout) -> dict[str, JSONValue]:
+    moved = frozenset(layout.moved)
+    container: dict[str, JSONValue] = {
+        "type": "object",
+        "properties": {name: {} for name in layout.moved},
+        "additionalProperties": False,
+    }
+    inner_required = tuple(name for name in layout.required if name in moved)
+    if inner_required:
+        container["required"] = inner_required
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            **{name: {} for name in layout.property_names if name not in moved},
+            "request": container,
+        },
+        "required": (*tuple(name for name in layout.required if name not in moved), "request"),
+        "additionalProperties": False,
+    }
+
+
+@lru_cache
+def _layout_transform(layout: _BijectionLayout) -> ParameterRestructureTransform:
+    return build_parameter_restructure_transform(
+        _layout_base_variant(layout),
+        rules=(ParameterGroupRule("search", "request", layout.moved),),
+        seed=17,
+    )
+
+
+def _thaw_json(value: JSONValue) -> JSONValue:
+    return cast(JSONValue, json.loads(canonical_json_bytes(value)))
+
+
+def _call_with_metadata(
+    arguments: Mapping[str, JSONValue],
+    metadata: Mapping[str, JSONValue],
+) -> dict[str, JSONValue]:
+    call: dict[str, JSONValue] = {"name": "search", "arguments": arguments}
+    call.update(metadata)
+    return call
 
 
 class _RecordingRestructureSource(SemanticAdapter):
@@ -262,6 +427,63 @@ class _RawVariantLieSource(_RecordingRestructureSource):
 class _ExplodingCallMapping(dict[str, JSONValue]):
     def items(self):
         raise RuntimeError("PRIVATE_CALLBACK_PAYLOAD")
+
+
+class _CallbackPayloadMapping(Mapping[str, JSONValue]):
+    def __init__(
+        self,
+        entries: Mapping[str, JSONValue],
+        *,
+        callback: Callable[[], None] | None = None,
+        explode: bool = True,
+    ) -> None:
+        self._entries = dict(entries)
+        self._callback = callback
+        self._explode = explode
+        self.calls = 0
+
+    def __getitem__(self, key: str) -> JSONValue:
+        return self._entries[key]
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self):
+        self.calls += 1
+        if self._callback is not None:
+            self._callback()
+        if self._explode:
+            raise RuntimeError("PRIVATE_CONSTRUCTOR_CALLBACK_PAYLOAD")
+        return self._entries.items()
+
+
+class _CallbackPayloadTools(tuple[SurfaceToolSpec, ...]):
+    calls = 0
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise RuntimeError("PRIVATE_SOURCE_TOOLS_PAYLOAD")
+
+
+class _FinalPublicLieRestructureAdapter(
+    restructure_module.ParameterRestructureAdapter,
+):
+    def __init__(
+        self,
+        source_adapter: SemanticAdapter,
+        transform: ParameterRestructureTransform,
+    ) -> None:
+        self._public_variant_lie: SchemaVariant | None = None
+        super().__init__(source_adapter, transform)
+
+    @property
+    def variant(self) -> SchemaVariant:
+        if self._public_variant_lie is not None:
+            return self._public_variant_lie
+        return super().variant
 
 
 def _apply_restructure(
@@ -1197,6 +1419,167 @@ def test_direct_transform_rejects_operator_parameter_mismatch() -> None:
         )
 
 
+def test_direct_transform_sanitizes_post_construction_operator_parameter_callback() -> None:
+    built = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+    payload = _CallbackPayloadMapping(built.operator.parameters)
+    object.__setattr__(built.operator, "parameters", payload)
+
+    with pytest.raises(TransformValidationError) as caught:
+        ParameterRestructureTransform(
+            built.source_variant,
+            built.variant,
+            built.operator,
+            built.rules,
+        )
+
+    assert str(caught.value) == "parameter restructure operator integrity validation failed"
+    assert "PRIVATE_CONSTRUCTOR_CALLBACK_PAYLOAD" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert payload.calls == 1
+
+
+def test_direct_transform_exhausts_operator_callback_before_schema_fingerprints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+    events: list[str] = []
+    _CallbackPayloadTools.calls = 0
+
+    def mutate_variants() -> None:
+        events.append("operator.items")
+        source_tools = built.source_variant.tools
+        final_tools = built.variant.tools
+        object.__setattr__(
+            built.source_variant,
+            "tools",
+            _CallbackPayloadTools(source_tools),
+        )
+        object.__setattr__(
+            built.variant,
+            "tools",
+            _CallbackPayloadTools(final_tools),
+        )
+
+    payload = _CallbackPayloadMapping(
+        built.operator.parameters,
+        callback=mutate_variants,
+        explode=False,
+    )
+    object.__setattr__(built.operator, "parameters", payload)
+    original_fingerprint = restructure_module.schema_fingerprint
+
+    def recording_fingerprint(variant: SchemaVariant) -> str:
+        if variant is built.source_variant:
+            events.append("fingerprint.source")
+        elif variant is built.variant:
+            events.append("fingerprint.final")
+        return original_fingerprint(variant)
+
+    monkeypatch.setattr(restructure_module, "schema_fingerprint", recording_fingerprint)
+
+    with pytest.raises(TransformValidationError) as caught:
+        ParameterRestructureTransform(
+            built.source_variant,
+            built.variant,
+            built.operator,
+            built.rules,
+        )
+
+    assert str(caught.value) == "parameter restructure variant integrity validation failed"
+    assert "PRIVATE_SOURCE_TOOLS_PAYLOAD" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert events == ["operator.items", "fingerprint.source"]
+    assert payload.calls == 1
+    assert _CallbackPayloadTools.calls == 0
+
+
+@pytest.mark.parametrize(
+    "target",
+    ("source_tools", "changed_input_schema", "source_manifest", "final_manifest"),
+)
+def test_direct_transform_rejects_payload_bearing_variant_roots_before_callbacks(
+    target: str,
+) -> None:
+    built = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+    payload = _CallbackPayloadMapping({"private": True})
+    _CallbackPayloadTools.calls = 0
+    if target == "source_tools":
+        object.__setattr__(
+            built.source_variant,
+            "tools",
+            _CallbackPayloadTools(built.source_variant.tools),
+        )
+    elif target == "changed_input_schema":
+        object.__setattr__(_tool(built.source_variant, "search"), "input_schema", payload)
+    elif target == "source_manifest":
+        object.__setattr__(built.source_variant, "manifest", payload)
+    else:
+        object.__setattr__(built.variant, "manifest", payload)
+
+    with pytest.raises(TransformValidationError) as caught:
+        ParameterRestructureTransform(
+            built.source_variant,
+            built.variant,
+            built.operator,
+            built.rules,
+        )
+
+    assert str(caught.value) == "parameter restructure variant integrity validation failed"
+    assert "PRIVATE" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert payload.calls == 0
+    assert _CallbackPayloadTools.calls == 0
+
+
+def test_rule_and_moved_tuple_subclasses_are_rejected_before_iteration() -> None:
+    class IterationBombTuple(tuple[object, ...]):
+        calls = 0
+
+        def __iter__(self):
+            type(self).calls += 1
+            raise RuntimeError("PRIVATE_TUPLE_ITERATION_PAYLOAD")
+
+    moved = IterationBombTuple(("query",))
+    with pytest.raises(TransformValidationError) as moved_error:
+        ParameterGroupRule("search", "request", moved)  # type: ignore[arg-type]
+    assert str(moved_error.value) == "moved_parameters must be an exact non-empty tuple"
+    assert moved_error.value.__cause__ is None
+    assert IterationBombTuple.calls == 0
+
+    built = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+    rules = IterationBombTuple(built.rules)
+    with pytest.raises(TransformValidationError) as rules_error:
+        ParameterRestructureTransform(
+            built.source_variant,
+            built.variant,
+            built.operator,
+            rules,  # type: ignore[arg-type]
+        )
+    assert (
+        str(rules_error.value)
+        == "rules must be an exact non-empty tuple of ParameterGroupRule values"
+    )
+    assert "PRIVATE_TUPLE_ITERATION_PAYLOAD" not in str(rules_error.value)
+    assert rules_error.value.__cause__ is None
+    assert IterationBombTuple.calls == 0
+
+
 def test_direct_transform_rejects_rule_operator_mismatch() -> None:
     built = build_parameter_restructure_transform(
         _base_variant(),
@@ -1375,6 +1758,7 @@ def test_variant_id_is_the_full_manifest_digest() -> None:
         None,
         False,
         0,
+        0.0,
         "",
         [],
         {},
@@ -1949,6 +2333,26 @@ class _PayloadPublicRestructureSource(_RecordingRestructureSource):
         return super().variant
 
 
+class _MutatingPublicRestructureSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant, replacement: SchemaVariant) -> None:
+        super().__init__(variant)
+        self._replacement = replacement
+        self.public_reads = 0
+
+    @property
+    def variant(self) -> SchemaVariant:
+        self.public_reads += 1
+        raw = super().variant
+        if self.public_reads == 1:
+            for field_name in ("variant_id", "tools", "manifest", "_manifest_canonical"):
+                object.__setattr__(
+                    raw,
+                    field_name,
+                    object.__getattribute__(self._replacement, field_name),
+                )
+        return raw
+
+
 def _invoke_restructure_stage(adapter: object, stage: str) -> object:
     surface_call = {
         "name": "search",
@@ -2136,6 +2540,94 @@ def test_adapter_construction_requires_exact_raw_and_public_source_binding() -> 
             _PublicLieRestructureSource(base),
             transform,
         )
+
+
+def test_adapter_construction_rejects_clean_public_with_equal_distinct_raw_source() -> None:
+    base = _base_variant()
+    transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    equal_raw = _base_variant()
+    assert equal_raw == base
+    assert equal_raw is not base
+    source = _RawVariantLieSource(equal_raw, base)
+
+    with pytest.raises(TransformValidationError) as caught:
+        restructure_module.ParameterRestructureAdapter(source, transform)
+
+    assert str(caught.value) == "source adapter binding does not match transform"
+    assert caught.value.__cause__ is None
+
+
+def test_adapter_constructor_final_recheck_catches_mutating_public_variant_callback() -> None:
+    base = _base_variant()
+    transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    replacement = SchemaVariant(
+        "replacement-v1",
+        base.tools,
+        {"operator": "replacement", "seed": 31},
+    )
+    source = _MutatingPublicRestructureSource(base, replacement)
+
+    with pytest.raises(TransformValidationError) as caught:
+        restructure_module.ParameterRestructureAdapter(source, transform)
+
+    assert str(caught.value) == "adapter binding integrity validation failed"
+    assert caught.value.__cause__ is None
+    assert source.public_reads == 1
+
+
+def test_runtime_binding_rejects_public_only_source_and_final_variant_lies() -> None:
+    valid_call = {
+        "name": "search",
+        "arguments": {"locale": "en", "request": {"query": "alpha"}},
+    }
+
+    base = _base_variant()
+    source = _RawVariantLieSource(base, base)
+    adapter = restructure_module.ParameterRestructureAdapter(
+        source,
+        build_parameter_restructure_transform(
+            base,
+            rules=(_search_rule(),),
+            seed=7,
+        ),
+    )
+    equal_public = _base_variant()
+    assert equal_public == base
+    source._public_variant = equal_public
+    with pytest.raises(TransformValidationError) as source_error:
+        adapter.surface_to_semantic(valid_call)
+    assert str(source_error.value) == "adapter binding integrity validation failed"
+    assert source_error.value.__cause__ is None
+    assert source.parse_inputs == []
+
+    base = _base_variant()
+    source = _RecordingRestructureSource(base)
+    transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    lying_adapter = _FinalPublicLieRestructureAdapter(source, transform)
+    equal_final = SchemaVariant(
+        transform.variant.variant_id,
+        transform.variant.tools,
+        transform.variant.manifest,
+    )
+    assert equal_final == transform.variant
+    lying_adapter._public_variant_lie = equal_final
+    with pytest.raises(TransformValidationError) as final_error:
+        lying_adapter.surface_to_semantic(valid_call)
+    assert str(final_error.value) == "adapter binding integrity validation failed"
+    assert final_error.value.__cause__ is None
+    assert source.parse_inputs == []
 
 
 def test_public_variant_callback_payload_is_sanitized_at_init_and_runtime() -> None:
@@ -2579,3 +3071,307 @@ def test_online_translation_uses_only_precomputed_plans_and_runtime_roots(
         assert canonical_json_bytes(transform.surface_call_to_canonical(surface)) == (
             canonical_json_bytes(canonical)
         )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    _BIJECTION_LAYOUTS,
+    ids=lambda layout: layout.name,
+)
+@settings(max_examples=64, deadline=None)
+@given(data=st.data(), metadata=_CALL_METADATA)
+def test_canonical_domain_maps_bijectively_to_surface_domain(
+    layout: _BijectionLayout,
+    data: st.DataObject,
+    metadata: dict[str, JSONValue],
+) -> None:
+    transform = _layout_transform(layout)
+    canonical_arguments = data.draw(
+        _layout_argument_strategy(layout),
+        label="canonical_arguments",
+    )
+    canonical_call = _call_with_metadata(canonical_arguments, metadata)
+    canonical_snapshot = canonical_json_bytes(canonical_call)
+    base_schema = _thaw_json(_tool(transform.source_variant, "search").input_schema)
+    surface_schema = _thaw_json(_tool(transform.variant, "search").input_schema)
+    assert isinstance(base_schema, Mapping)
+    assert isinstance(surface_schema, Mapping)
+
+    Draft202012Validator(base_schema).validate(_thaw_json(canonical_arguments))
+    surface_call = transform.canonical_call_to_surface(canonical_call)
+    surface_arguments = surface_call["arguments"]
+    Draft202012Validator(surface_schema).validate(_thaw_json(surface_arguments))
+    surface_snapshot = canonical_json_bytes(surface_call)
+    canonical_roundtrip = transform.surface_call_to_canonical(surface_call)
+    surface_roundtrip = transform.canonical_call_to_surface(canonical_roundtrip)
+
+    assert canonical_json_bytes(canonical_call) == canonical_snapshot
+    assert canonical_json_bytes(surface_call) == surface_snapshot
+    assert canonical_json_bytes(canonical_roundtrip) == canonical_snapshot
+    assert canonical_json_bytes(surface_roundtrip) == surface_snapshot
+
+
+@pytest.mark.parametrize(
+    "layout",
+    _BIJECTION_LAYOUTS,
+    ids=lambda layout: layout.name,
+)
+@settings(max_examples=64, deadline=None)
+@given(data=st.data(), metadata=_CALL_METADATA)
+def test_independently_generated_surface_domain_maps_back_bijectively(
+    layout: _BijectionLayout,
+    data: st.DataObject,
+    metadata: dict[str, JSONValue],
+) -> None:
+    transform = _layout_transform(layout)
+    surface_arguments = data.draw(
+        _layout_surface_strategy(layout),
+        label="surface_arguments",
+    )
+    surface_call = _call_with_metadata(surface_arguments, metadata)
+    surface_snapshot = canonical_json_bytes(surface_call)
+    base_schema = _thaw_json(_tool(transform.source_variant, "search").input_schema)
+    surface_schema = _thaw_json(_tool(transform.variant, "search").input_schema)
+    assert isinstance(base_schema, Mapping)
+    assert isinstance(surface_schema, Mapping)
+
+    Draft202012Validator(surface_schema).validate(_thaw_json(surface_arguments))
+    canonical_call = transform.surface_call_to_canonical(surface_call)
+    canonical_arguments = canonical_call["arguments"]
+    Draft202012Validator(base_schema).validate(_thaw_json(canonical_arguments))
+    canonical_snapshot = canonical_json_bytes(canonical_call)
+    surface_roundtrip = transform.canonical_call_to_surface(canonical_call)
+
+    assert canonical_json_bytes(surface_call) == surface_snapshot
+    assert canonical_json_bytes(canonical_call) == canonical_snapshot
+    assert canonical_json_bytes(surface_roundtrip) == surface_snapshot
+
+
+def test_optional_only_whole_wrap_has_unique_empty_surface_representation() -> None:
+    transform = _layout_transform(_BIJECTION_LAYOUTS[-1])
+    canonical_call: dict[str, JSONValue] = {"name": "search", "arguments": {}}
+    expected_surface: dict[str, JSONValue] = {
+        "name": "search",
+        "arguments": {"request": {}},
+    }
+
+    surface_call = transform.canonical_call_to_surface(canonical_call)
+
+    assert canonical_json_bytes(surface_call) == canonical_json_bytes(expected_surface)
+    assert canonical_json_bytes(transform.surface_call_to_canonical(surface_call)) == (
+        canonical_json_bytes(canonical_call)
+    )
+
+
+def test_parameter_restructure_type_hints_pin_public_and_rule_snapshot_shapes() -> None:
+    rule_hints = get_type_hints(ParameterGroupRule)
+    plan_hints = get_type_hints(restructure_module._ToolTranslationPlan)
+    builder_hints = get_type_hints(build_parameter_restructure_transform)
+    apply_hints = get_type_hints(restructure_module.apply_parameter_restructure)
+    snapshot_hints = get_type_hints(restructure_module._rule_snapshot)
+
+    assert rule_hints["tool_name"] is str
+    assert rule_hints["container_name"] is str
+    assert rule_hints["moved_parameters"] == tuple[str, ...]
+    assert plan_hints["tool_name"] is str
+    assert plan_hints["container_name"] is str
+    for field_name in (
+        "declared",
+        "moved",
+        "unmoved",
+        "required",
+        "outer_required",
+        "inner_required",
+    ):
+        assert plan_hints[field_name] == frozenset[str]
+    assert builder_hints["rules"] == tuple[ParameterGroupRule, ...]
+    assert builder_hints["return"] is ParameterRestructureTransform
+    assert apply_hints["rules"] == tuple[ParameterGroupRule, ...]
+    assert apply_hints["return"] is restructure_module.ParameterRestructureAdapter
+    assert snapshot_hints == {
+        "tool_name": str,
+        "container_name": str,
+        "moved_parameters": tuple[str, ...],
+        "return": bytes,
+    }
+
+
+@pytest.mark.parametrize(
+    "layout",
+    _BIJECTION_LAYOUTS,
+    ids=lambda layout: layout.name,
+)
+def test_bijection_layouts_build_the_independently_expected_closed_schemas(
+    layout: _BijectionLayout,
+) -> None:
+    transform = _layout_transform(layout)
+    moved = frozenset(layout.moved)
+    base_schema = _thaw_json(_tool(transform.source_variant, "search").input_schema)
+    surface_schema = _thaw_json(_tool(transform.variant, "search").input_schema)
+    assert isinstance(base_schema, Mapping)
+    assert isinstance(surface_schema, Mapping)
+
+    assert moved
+    assert moved <= frozenset(layout.property_names)
+    assert " " not in moved
+    Draft202012Validator.check_schema(base_schema)
+    Draft202012Validator.check_schema(surface_schema)
+    assert canonical_json_bytes(_tool(transform.variant, "search").input_schema) == (
+        canonical_json_bytes(_expected_layout_surface_schema(layout))
+    )
+
+
+@dataclass(frozen=True)
+class _HotPathFixture:
+    label: str
+    transform: ParameterRestructureTransform
+    adapter: restructure_module.ParameterRestructureAdapter
+    canonical_call: Mapping[str, JSONValue]
+    surface_call: Mapping[str, JSONValue]
+
+
+def _hot_path_fixture(label: str, optional_property_count: int) -> _HotPathFixture:
+    properties: dict[str, JSONValue] = {
+        "required_moved": {"type": "string"},
+    }
+    properties.update(
+        {
+            f"optional_{index:05d}": {"type": ("string", "null")}
+            for index in range(optional_property_count)
+        }
+    )
+    tools = (
+        SurfaceToolSpec(
+            "search",
+            "Large changed tool",
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": properties,
+                "required": ("required_moved",),
+                "additionalProperties": False,
+            },
+        ),
+        *(
+            SurfaceToolSpec(
+                f"identity_{index}",
+                "Identity tool",
+                {
+                    "type": "object",
+                    "properties": {"value": {}},
+                    "additionalProperties": False,
+                },
+            )
+            for index in range(8)
+        ),
+    )
+    base = SchemaVariant(
+        f"hot-path-{label}",
+        tools,
+        {"operator": "identity", "seed": 23},
+    )
+    transform = build_parameter_restructure_transform(
+        base,
+        rules=(ParameterGroupRule("search", "request", ("required_moved",)),),
+        seed=29,
+    )
+    source = _RecordingRestructureSource(base)
+    adapter = restructure_module.ParameterRestructureAdapter(source, transform)
+    canonical_call: dict[str, JSONValue] = {
+        "name": "search",
+        "arguments": {"required_moved": "tiny"},
+        "metadata": {"retry": False},
+    }
+    surface_call = transform.canonical_call_to_surface(canonical_call)
+    return _HotPathFixture(label, transform, adapter, canonical_call, surface_call)
+
+
+def _exercise_hot_path(
+    fixture: _HotPathFixture,
+    tools_reads: dict[str, int],
+) -> None:
+    transform = fixture.transform
+    adapter = fixture.adapter
+    before = tools_reads[fixture.label]
+    surface_call = transform.canonical_call_to_surface(fixture.canonical_call)
+    assert tools_reads[fixture.label] - before == 2
+    before = tools_reads[fixture.label]
+    canonical_call = transform.surface_call_to_canonical(fixture.surface_call)
+    assert tools_reads[fixture.label] - before == 2
+    assert canonical_json_bytes(surface_call) == canonical_json_bytes(fixture.surface_call)
+    assert canonical_json_bytes(canonical_call) == canonical_json_bytes(fixture.canonical_call)
+
+    before = tools_reads[fixture.label]
+    actions = adapter.surface_to_semantic(fixture.surface_call)
+    assert tools_reads[fixture.label] - before == 6
+    before = tools_reads[fixture.label]
+    base_calls = adapter.semantic_to_base_calls(actions[0])
+    assert tools_reads[fixture.label] - before == 4
+    observation: JSONValue = {"ok": True}
+    groups = ((observation,),)
+    before = tools_reads[fixture.label]
+    assert adapter.base_observation_to_surface(fixture.surface_call, actions, groups) is observation
+    assert tools_reads[fixture.label] - before == 6
+    trace = ExecutionTrace((fixture.surface_call,), actions, base_calls)
+    before = tools_reads[fixture.label]
+    result = adapter.canonicalize_trace(trace)
+    assert tools_reads[fixture.label] - before == 6
+    assert result is trace.semantic_actions
+
+
+def test_large_schema_tiny_call_online_path_never_revisits_schema_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    small = _hot_path_fixture("small", 3)
+    large = _hot_path_fixture("large", 3_200)
+
+    def unexpected_construction_read(*args: object, **kwargs: object) -> object:
+        pytest.fail("online path performed construction-time schema work")
+
+    for name in (
+        "schema_fingerprint",
+        "canonical_json_bytes",
+        "_admit_changed_schema",
+        "_schema_node_contains_forbidden_keyword",
+        "_rewrite_tool",
+        "_build_restructured_tools",
+        "_build_translation_plans",
+        "build_transformed_variant",
+        "_normalize_rules",
+        "_operator_parameters",
+        "_transform_snapshot",
+        "_make_schema_runtime_seal",
+        "_make_operator_runtime_seal",
+        "_make_mapping_root_seal",
+    ):
+        monkeypatch.setattr(restructure_module, name, unexpected_construction_read)
+
+    field_names = ("name", "description", "input_schema")
+
+    def forbidden_tool_field_read(instance: SurfaceToolSpec) -> object:
+        pytest.fail("online path read a SurfaceToolSpec field")
+
+    for name in field_names:
+        monkeypatch.setattr(SurfaceToolSpec, name, property(forbidden_tool_field_read))
+
+    tools_descriptor = SchemaVariant.__dict__["tools"]
+    owners = {
+        id(small.transform.source_variant): small.label,
+        id(small.transform.variant): small.label,
+        id(large.transform.source_variant): large.label,
+        id(large.transform.variant): large.label,
+    }
+    tools_reads = {small.label: 0, large.label: 0}
+
+    def counted_tools_read(instance: SchemaVariant) -> tuple[SurfaceToolSpec, ...]:
+        label = owners.get(id(instance))
+        if label is not None:
+            tools_reads[label] += 1
+        return cast(tuple[SurfaceToolSpec, ...], tools_descriptor.__get__(instance, SchemaVariant))
+
+    monkeypatch.setattr(SchemaVariant, "tools", property(counted_tools_read))
+
+    _exercise_hot_path(small, tools_reads)
+    _exercise_hot_path(large, tools_reads)
+
+    assert tools_reads == {"small": 26, "large": 26}
