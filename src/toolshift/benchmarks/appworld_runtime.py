@@ -8,6 +8,7 @@ never closes, resets, or rolls that world back.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -34,7 +35,11 @@ from toolshift.types import (
 _CONFIGURATION_ERROR = "AppWorld executor configuration is invalid"
 _EXECUTION_ERROR = "AppWorld episode execution failed"
 _INTEGRITY_ERROR = "AppWorld executor integrity validation failed"
+_ORACLE_CAPTURE_ERROR = "AppWorld oracle capture failed"
+_ORACLE_INTEGRITY_ERROR = "AppWorld oracle capture integrity validation failed"
+_EXECUTION_FAILURE_PREFIX = "Execution failed. Traceback:"
 _CALL_KEYS = frozenset({"name", "arguments"})
+_CAPTURE_METHOD_NAMES = ("request", "get", "post", "put", "patch", "delete")
 _REQUESTER_CONTROL_NAMES = frozenset(
     {
         "_api_name",
@@ -60,6 +65,10 @@ _ResultT = TypeVar("_ResultT")
 
 class _ExecutorIntegrityError(ValueError):
     """Internal marker converted to one payload-free public error."""
+
+
+class _OracleIntegrityError(ValueError):
+    """Internal oracle-capture marker converted to a static public error."""
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -90,6 +99,27 @@ class _EpisodeRecord:
     evaluator_digest: str
     effects: tuple[PhysicalCallEffect, ...]
     transition_digest: str
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _CapturedOraclePlan:
+    native_calls: tuple[Mapping[str, JSONValue], ...]
+
+    def __post_init__(self) -> None:
+        try:
+            if type(self.native_calls) is not tuple or not self.native_calls:
+                raise ValueError
+            rebuilt = tuple(_snapshot_native_call(call)[0] for call in self.native_calls)
+        except BaseException:
+            raise ValueError(_ORACLE_CAPTURE_ERROR) from None
+        object.__setattr__(self, "native_calls", rebuilt)
+
+    def __reduce__(self) -> object:
+        raise TypeError("AppWorld oracle plans cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("AppWorld oracle plans cannot be serialized")
 
 
 def _make_callable_seal(value: object) -> _CallableSeal:
@@ -284,6 +314,322 @@ def _transition_digest(
             }
         )
     ).hexdigest()
+
+
+def _capture_oracle_plan(world: object) -> _CapturedOraclePlan:
+    """Capture calls from the pinned trusted oracle's ordinary instance dispatch.
+
+    Exact-instance patches cannot generally intercept an explicit
+    ``type(requester).verb(...)`` call or a previously cached bound alias.  The
+    private compatibility probe must verify that the pinned oracle makes no such
+    untracked bypass; this function deliberately performs no class/global patch.
+    """
+
+    primary_error: BaseException | None = None
+    result: _CapturedOraclePlan | None = None
+    final_integrity_failure = False
+    post_capture_finalizer: Callable[[], bool] | None = None
+    try:
+        requester = world.requester
+        raw_instance_slots = object.__getattribute__(requester, "__dict__")
+        if type(raw_instance_slots) is not dict:
+            raise ValueError
+        raw_states = {
+            name: (name in raw_instance_slots, raw_instance_slots.get(name))
+            for name in _CAPTURE_METHOD_NAMES
+        }
+        original_seals = {
+            name: _make_callable_seal(getattr(requester, name)) for name in _CAPTURE_METHOD_NAMES
+        }
+        execute_seal = _make_callable_seal(world.execute)
+        evaluate_seal = _make_callable_seal(world.evaluate)
+        task = world.task
+        ground_truth = task.ground_truth
+        compiled_solution_code = ground_truth.compiled_solution_code
+        if type(compiled_solution_code) is not str:
+            raise ValueError
+        tracker_root = requester.requests
+        if type(tracker_root) is not list:
+            raise ValueError
+        initial_tracker_length = len(tracker_root)
+        all_original_seals = (*original_seals.values(), execute_seal, evaluate_seal)
+        seal_entries = tuple(
+            (seal, seal.callback, seal.bound_self, seal.bound_function)
+            for seal in all_original_seals
+        )
+
+        request_parameters = tuple(
+            inspect.signature(original_seals["request"].callback).parameters.values()
+        )
+        if (
+            tuple(parameter.name for parameter in request_parameters)
+            != (
+                "_app_name",
+                "_api_name",
+                "client",
+                "raise_on_failure",
+                "show",
+                "track",
+                "data",
+            )
+            or tuple(parameter.kind for parameter in request_parameters)
+            != (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_KEYWORD,
+            )
+            or request_parameters[0].default is not inspect.Parameter.empty
+            or request_parameters[1].default is not inspect.Parameter.empty
+            or request_parameters[2].default is not None
+            or request_parameters[3].default is not None
+            or request_parameters[4].default is not False
+            or request_parameters[5].default is not True
+        ):
+            raise ValueError
+
+        captured_calls: list[Mapping[str, JSONValue]] = []
+        active_capability: list[object | None] = [None]
+        sticky_violation = [False]
+        low_level_capability = object()
+        patch_values: dict[str, object] = {}
+        patch_seals: dict[str, _CallableSeal] = {}
+
+        def require_seal_shape(
+            seal: _CallableSeal,
+            entry: tuple[object, object, object, object],
+        ) -> None:
+            if (
+                type(seal) is not _CallableSeal
+                or seal is not entry[0]
+                or seal.callback is not entry[1]
+                or seal.bound_self is not entry[2]
+                or seal.bound_function is not entry[3]
+            ):
+                raise _OracleIntegrityError
+
+        def require_integrity(*, patched: bool) -> None:
+            try:
+                if (
+                    world.requester is not requester
+                    or world.task is not task
+                    or task.ground_truth is not ground_truth
+                    or ground_truth.compiled_solution_code is not compiled_solution_code
+                    or object.__getattribute__(requester, "__dict__") is not raw_instance_slots
+                    or requester.requests is not tracker_root
+                    or type(tracker_root) is not list
+                    or not _callable_matches(world.execute, execute_seal)
+                    or not _callable_matches(world.evaluate, evaluate_seal)
+                ):
+                    raise _OracleIntegrityError
+                for seal, entry in zip(all_original_seals, seal_entries, strict=True):
+                    require_seal_shape(seal, entry)
+                expected_seals = patch_seals if patched else original_seals
+                expected_values = patch_values if patched else raw_states
+                for name in _CAPTURE_METHOD_NAMES:
+                    if patched:
+                        if raw_instance_slots.get(name) is not expected_values[
+                            name
+                        ] or not _callable_matches(
+                            getattr(requester, name),
+                            expected_seals[name],
+                        ):
+                            raise _OracleIntegrityError
+                    else:
+                        existed, raw_value = expected_values[name]
+                        if (
+                            (name in raw_instance_slots) != existed
+                            or (existed and raw_instance_slots.get(name) is not raw_value)
+                            or not _callable_matches(
+                                getattr(requester, name),
+                                expected_seals[name],
+                            )
+                        ):
+                            raise _OracleIntegrityError
+            except _OracleIntegrityError:
+                raise
+            except BaseException:
+                raise _OracleIntegrityError from None
+
+        def finalize_restored_methods() -> bool:
+            integrity_failed = False
+            try:
+                require_integrity(patched=False)
+            except BaseException:
+                integrity_failed = True
+            for name in reversed(_CAPTURE_METHOD_NAMES):
+                try:
+                    existed, raw_value = raw_states[name]
+                    current_exists = name in raw_instance_slots
+                    current_value = raw_instance_slots.get(name)
+                    if existed and (not current_exists or current_value is not raw_value):
+                        setattr(requester, name, raw_value)
+                    elif not existed and current_exists:
+                        delattr(requester, name)
+                except BaseException:
+                    integrity_failed = True
+            try:
+                require_integrity(patched=False)
+            except BaseException:
+                integrity_failed = True
+            return integrity_failed
+
+        post_capture_finalizer = finalize_restored_methods
+
+        def guarded_verb(name: str) -> Callable[..., object]:
+            original = original_seals[name].callback
+
+            def guard(self: object, *args: object, **kwargs: object) -> object:
+                if self is not requester or active_capability[0] is not low_level_capability:
+                    sticky_violation[0] = True
+                    raise _OracleIntegrityError
+                require_integrity(patched=True)
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    require_integrity(patched=True)
+
+            return guard
+
+        def capture_request(
+            self: object,
+            _app_name: object,
+            _api_name: object,
+            client: object = None,
+            raise_on_failure: object = None,
+            show: object = False,
+            track: object = True,
+            **data: object,
+        ) -> object:
+            if (
+                self is not requester
+                or active_capability[0] is not None
+                or track is not True
+                or "_system_datetime" in data
+                or type(_app_name) is not str
+                or type(_api_name) is not str
+            ):
+                sticky_violation[0] = True
+                raise _OracleIntegrityError
+            try:
+                native_call, _, _, _ = _snapshot_native_call(
+                    {"name": _app_name + "__" + _api_name, "arguments": data}
+                )
+            except BaseException:
+                sticky_violation[0] = True
+                raise _OracleIntegrityError from None
+            require_integrity(patched=True)
+            before_length = len(tracker_root)
+            active_capability[0] = low_level_capability
+            try:
+                call_result = original_seals["request"].callback(
+                    _app_name,
+                    _api_name,
+                    client=client,
+                    raise_on_failure=raise_on_failure,
+                    show=show,
+                    track=track,
+                    **data,
+                )
+            finally:
+                active_capability[0] = None
+            require_integrity(patched=True)
+            if len(tracker_root) != before_length + 1:
+                raise _OracleIntegrityError
+            captured_calls.append(native_call)
+            return call_result
+
+        patch_values["request"] = MethodType(capture_request, requester)
+        for verb_name in _CAPTURE_METHOD_NAMES[1:]:
+            patch_values[verb_name] = MethodType(guarded_verb(verb_name), requester)
+        patch_seals = {name: _make_callable_seal(value) for name, value in patch_values.items()}
+
+        execution_output: object | None = None
+        execution_error: BaseException | None = None
+        attempted_patches: list[str] = []
+        patching_complete = False
+        restoration_failed = False
+        try:
+            require_integrity(patched=False)
+            for name in _CAPTURE_METHOD_NAMES:
+                attempted_patches.append(name)
+                setattr(requester, name, patch_values[name])
+                if raw_instance_slots.get(name) is not patch_values[name]:
+                    raise _OracleIntegrityError
+            patching_complete = True
+            require_integrity(patched=True)
+            execution_output = execute_seal.callback(
+                compiled_solution_code + "\nsolution(apis, requester)"
+            )
+        except BaseException as error:
+            execution_error = error
+        finally:
+            if patching_complete:
+                try:
+                    require_integrity(patched=True)
+                except BaseException:
+                    restoration_failed = True
+            for name in reversed(attempted_patches):
+                try:
+                    existed, raw_value = raw_states[name]
+                    if existed:
+                        setattr(requester, name, raw_value)
+                    elif name in raw_instance_slots:
+                        delattr(requester, name)
+                except BaseException:
+                    restoration_failed = True
+            try:
+                require_integrity(patched=False)
+            except BaseException:
+                restoration_failed = True
+
+        if restoration_failed:
+            raise _OracleIntegrityError
+        if execution_error is not None:
+            raise execution_error
+        if sticky_violation[0]:
+            raise _OracleIntegrityError
+        if (
+            type(execution_output) is not str
+            or not execution_output
+            or execution_output.startswith(_EXECUTION_FAILURE_PREFIX)
+            or not captured_calls
+            or len(tracker_root) != initial_tracker_length + len(captured_calls)
+        ):
+            raise ValueError
+        require_integrity(patched=False)
+        try:
+            tracker = evaluate_seal.callback(suppress_errors=False)
+        finally:
+            require_integrity(patched=False)
+        try:
+            evaluator_score = _compact_evaluator_score(tracker)
+        finally:
+            require_integrity(patched=False)
+        if evaluator_score["success"] is not True:
+            raise ValueError
+        result = _CapturedOraclePlan(tuple(captured_calls))
+    except BaseException as error:
+        primary_error = error
+    finally:
+        if post_capture_finalizer is not None:
+            try:
+                final_integrity_failure = post_capture_finalizer()
+            except BaseException:
+                final_integrity_failure = True
+
+    if final_integrity_failure or isinstance(primary_error, _OracleIntegrityError):
+        raise ValueError(_ORACLE_INTEGRITY_ERROR) from None
+    if primary_error is not None:
+        if isinstance(primary_error, Exception):
+            raise ValueError(_ORACLE_CAPTURE_ERROR) from None
+        raise primary_error
+    if result is None:
+        raise ValueError(_ORACLE_CAPTURE_ERROR) from None
+    return result
 
 
 class AppWorldEpisodeExecutor:

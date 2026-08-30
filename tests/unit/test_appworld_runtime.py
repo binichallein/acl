@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
+import pickle
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
+from dataclasses import asdict, fields
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,6 +32,9 @@ _EFFECT_DOMAIN = b"toolshift.appworld.effect.v1\0"
 _TRANSITION_DOMAIN = b"toolshift.appworld.transition.v1\0"
 _EXECUTION_ERROR = "AppWorld episode execution failed"
 _INTEGRITY_ERROR = "AppWorld executor integrity validation failed"
+_ORACLE_CAPTURE_ERROR = "AppWorld oracle capture failed"
+_ORACLE_INTEGRITY_ERROR = "AppWorld oracle capture integrity validation failed"
+_CAPTURE_METHOD_NAMES = ("request", "get", "post", "put", "patch", "delete")
 
 
 def _sha(value: object) -> str:
@@ -117,6 +126,154 @@ class _World:
 
     def execute(self, code: str) -> str:  # pragma: no cover - must never be called.
         raise AssertionError(code)
+
+
+class _CaptureRequester:
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+        self.requests: list[object] = []
+        self.request_error: BaseException | None = None
+        self.request_hook: Callable[[], None] | None = None
+        self.request_response: object = {"ok": True}
+
+    def request(
+        self,
+        _app_name: str,
+        _api_name: str,
+        client: object = None,
+        raise_on_failure: object = None,
+        show: object = False,
+        track: object = True,
+        **data: object,
+    ) -> object:
+        self.events.append(
+            ("delegate", _app_name, _api_name, client, raise_on_failure, show, track, data)
+        )
+        if self.request_hook is not None:
+            self.request_hook()
+        if self.request_error is not None:
+            raise self.request_error
+        self.post("/native", track=track)
+        self.requests.append({"method": "POST", "data": dict(data)})
+        return self.request_response
+
+    def get(self, *args: object, **kwargs: object) -> object:
+        self.events.append(("get", args, kwargs))
+        return {"ok": True}
+
+    def post(self, *args: object, **kwargs: object) -> object:
+        self.events.append(("post", args, kwargs))
+        return {"ok": True}
+
+    def put(self, *args: object, **kwargs: object) -> object:
+        self.events.append(("put", args, kwargs))
+        return {"ok": True}
+
+    def patch(self, *args: object, **kwargs: object) -> object:
+        self.events.append(("patch", args, kwargs))
+        return {"ok": True}
+
+    def delete(self, *args: object, **kwargs: object) -> object:
+        self.events.append(("delete", args, kwargs))
+        return {"ok": True}
+
+
+class _PartialPatchRequester(_CaptureRequester):
+    def __init__(self, events: list[object], *, fail_after_write: bool) -> None:
+        super().__init__(events)
+        self.fail_after_write = fail_after_write
+        self.patch_failure_armed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "put" and object.__getattribute__(self, "__dict__").get(
+            "patch_failure_armed", False
+        ):
+            object.__setattr__(self, "patch_failure_armed", False)
+            if object.__getattribute__(self, "fail_after_write"):
+                object.__setattr__(self, name, value)
+            raise RuntimeError("PRIVATE_PARTIAL_PATCH")
+        object.__setattr__(self, name, value)
+
+
+class _RestorationFailingRequester(_CaptureRequester):
+    def __init__(self, events: list[object]) -> None:
+        super().__init__(events)
+        self.restoration_failure_armed = True
+
+    def __delattr__(self, name: str) -> None:
+        if name == "request" and object.__getattribute__(self, "__dict__").get(
+            "restoration_failure_armed", False
+        ):
+            object.__setattr__(self, "restoration_failure_armed", False)
+            raise RuntimeError("PRIVATE_RESTORATION")
+        object.__delattr__(self, name)
+
+
+class _CaptureWorld:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.requester = _CaptureRequester(self.events)
+        self.task = SimpleNamespace(
+            ground_truth=SimpleNamespace(
+                compiled_solution_code="def solution(apis, requester): return None"
+            )
+        )
+        self.executed_code: str | None = None
+        self.execute_calls = 0
+        self.execute_error: BaseException | None = None
+        self.execute_hook: Callable[[_CaptureWorld], None] | None = None
+        self.execution_output: object = "ok"
+        self.evaluate_calls: list[bool] = []
+        self.evaluate_error: BaseException | None = None
+        self.evaluate_hook: Callable[[_CaptureWorld], None] | None = None
+        self.evaluate_tracker: object = _Tracker()
+        self.save_calls = 0
+
+    def execute(self, code: str) -> object:
+        self.execute_calls += 1
+        self.executed_code = code
+        if self.execute_error is not None:
+            raise self.execute_error
+        if self.execute_hook is not None:
+            self.execute_hook(self)
+        else:
+            self.requester.request(
+                "notes",
+                "create_note",
+                client="client-token",
+                raise_on_failure=False,
+                show=True,
+                track=True,
+                title="private-title",
+            )
+        return self.execution_output
+
+    def evaluate(self, *, suppress_errors: bool) -> object:
+        self.evaluate_calls.append(suppress_errors)
+        if self.evaluate_error is not None:
+            raise self.evaluate_error
+        if self.evaluate_hook is not None:
+            self.evaluate_hook(self)
+        return self.evaluate_tracker
+
+    def save(self) -> None:
+        self.save_calls += 1
+
+
+def _capture_method_snapshot(requester: object) -> dict[str, tuple[bool, object | None]]:
+    raw = object.__getattribute__(requester, "__dict__")
+    return {name: (name in raw, raw.get(name)) for name in _CAPTURE_METHOD_NAMES}
+
+
+def _assert_capture_methods_restored(
+    requester: object,
+    snapshot: Mapping[str, tuple[bool, object | None]],
+) -> None:
+    raw = object.__getattribute__(requester, "__dict__")
+    for name, (existed, value) in snapshot.items():
+        assert (name in raw) is existed
+        if existed:
+            assert raw[name] is value
 
 
 class _ReturningSaveWorld(_World):
@@ -327,6 +484,707 @@ def test_runtime_module_has_no_import_time_appworld_dependency() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_capture_oracle_plan_records_native_calls_and_restores_methods() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    requester = world.requester
+    original_request = requester.request
+    original_verbs = tuple(
+        getattr(requester, name) for name in ("get", "post", "put", "patch", "delete")
+    )
+
+    plan = _capture_oracle_plan(world)
+
+    assert plan.native_calls == (
+        {"name": "notes__create_note", "arguments": {"title": "private-title"}},
+    )
+    assert world.executed_code == (
+        world.task.ground_truth.compiled_solution_code + "\nsolution(apis, requester)"
+    )
+    assert world.evaluate_calls == [False]
+    assert world.save_calls == 0
+    assert requester.request.__self__ is original_request.__self__
+    assert requester.request.__func__ is original_request.__func__
+    for name, original in zip(
+        ("get", "post", "put", "patch", "delete"), original_verbs, strict=True
+    ):
+        restored = getattr(requester, name)
+        assert restored.__self__ is original.__self__
+        assert restored.__func__ is original.__func__
+
+
+def test_capture_request_has_pinned_signature_and_forwards_only_controls() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    observed_signature: inspect.Signature | None = None
+    nested = {"value": [1, 2]}
+    world.requester.request_response = {"error": "private-response"}
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        nonlocal observed_signature
+        observed_signature = inspect.signature(capture_world.requester.request)
+        capture_world.requester.request(
+            "notes",
+            "create_note",
+            "client-value",
+            False,
+            True,
+            True,
+            payload=nested,
+        )
+        nested["value"].append(3)
+
+    world.execute_hook = execute_hook
+
+    plan = _capture_oracle_plan(world)
+
+    assert observed_signature is not None
+    parameters = tuple(observed_signature.parameters.values())
+    assert tuple(parameter.name for parameter in parameters) == (
+        "_app_name",
+        "_api_name",
+        "client",
+        "raise_on_failure",
+        "show",
+        "track",
+        "data",
+    )
+    assert tuple(parameter.kind for parameter in parameters) == (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.VAR_KEYWORD,
+    )
+    assert tuple(parameter.default for parameter in parameters[2:6]) == (
+        None,
+        None,
+        False,
+        True,
+    )
+    assert plan.native_calls == (
+        {
+            "name": "notes__create_note",
+            "arguments": {"payload": {"value": (1, 2)}},
+        },
+    )
+    delegate = next(event for event in world.events if event[0] == "delegate")
+    assert delegate[3:7] == ("client-value", False, True, True)
+
+
+def test_captured_oracle_plan_is_private_frozen_and_explicitly_nonserializable() -> None:
+    from toolshift.benchmarks.appworld_runtime import (
+        _capture_oracle_plan,
+        _CapturedOraclePlan,
+    )
+
+    world = _CaptureWorld()
+    plan = _capture_oracle_plan(world)
+
+    assert tuple(field.name for field in fields(plan)) == ("native_calls",)
+    assert repr(plan).startswith("<toolshift.benchmarks.appworld_runtime._CapturedOraclePlan")
+    assert "private-title" not in repr(plan)
+    assert world.task.ground_truth.compiled_solution_code not in repr(plan)
+    assert plan != _CapturedOraclePlan(plan.native_calls)
+    with pytest.raises(TypeError, match=r"^AppWorld oracle plans cannot be serialized$"):
+        pickle.dumps(plan)
+    with pytest.raises(TypeError):
+        json.dumps(plan)
+    with pytest.raises(AttributeError, match=r"^frozen JSON mappings are immutable$"):
+        asdict(plan)
+    with pytest.raises((AttributeError, TypeError)):
+        plan.native_calls[0]["arguments"]["title"] = "changed"  # type: ignore[index]
+
+
+def test_captured_plan_constructor_requires_tuple_and_rebuilds_mutable_calls() -> None:
+    from toolshift.benchmarks.appworld_runtime import _CapturedOraclePlan
+
+    mutable = {"name": "notes__create_note", "arguments": {"items": [1, 2]}}
+    plan = _CapturedOraclePlan((mutable,))
+    mutable["arguments"]["items"].append(3)  # type: ignore[index,union-attr]
+
+    assert plan.native_calls == ({"name": "notes__create_note", "arguments": {"items": (1, 2)}},)
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _CapturedOraclePlan([mutable])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _CapturedOraclePlan(())
+
+
+def test_capture_restores_all_requester_methods_before_evaluation() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    requester = world.requester
+    restored_before_evaluate = False
+
+    def evaluate_hook(capture_world: _CaptureWorld) -> None:
+        nonlocal restored_before_evaluate
+        assert capture_world is world
+        assert not (set(requester.__dict__) & {"request", "get", "post", "put", "patch", "delete"})
+        assert requester.request.__func__ is _CaptureRequester.request
+        restored_before_evaluate = True
+
+    world.evaluate_hook = evaluate_hook
+
+    _capture_oracle_plan(world)
+
+    assert restored_before_evaluate is True
+
+
+@pytest.mark.parametrize(
+    ("execution_output", "execute_error", "make_empty"),
+    [
+        ("", None, False),
+        ("Execution failed. Traceback:\nPRIVATE", None, False),
+        (object(), None, False),
+        ("ok", RuntimeError("PRIVATE_EXECUTE"), False),
+        ("ok", None, True),
+    ],
+)
+def test_capture_rejects_terminal_execute_failures_after_exact_restoration(
+    execution_output: object,
+    execute_error: BaseException | None,
+    make_empty: bool,
+) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    world.execution_output = execution_output
+    world.execute_error = execute_error
+    if make_empty:
+        world.execute_hook = lambda capture_world: None
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$") as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value.__cause__ is None
+    assert "PRIVATE" not in str(raised.value)
+    assert world.execute_calls == 1
+    assert world.evaluate_calls == []
+    assert world.save_calls == 0
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+@pytest.mark.parametrize(
+    "tracker",
+    [
+        _Tracker(pass_count=1, num_tests=2, success=False),
+        _Tracker(pass_count=2, num_tests=2, success=False),
+        _Tracker(pass_count=2, num_tests=1, success=True),
+    ],
+)
+def test_capture_requires_a_valid_successful_compact_evaluator(tracker: object) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    world.evaluate_tracker = tracker
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.execute_calls == 1
+    assert world.evaluate_calls == [False]
+    assert world.save_calls == 0
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+def test_evaluate_binding_mutation_overrides_a_baseexception_with_integrity() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    snapshot = _capture_method_snapshot(world.requester)
+
+    def mutate_and_interrupt(capture_world: _CaptureWorld) -> None:
+        capture_world.evaluate = lambda *, suppress_errors: _Tracker()  # type: ignore[method-assign]
+        raise KeyboardInterrupt("PRIVATE_EVALUATE")
+
+    world.evaluate_hook = mutate_and_interrupt
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$") as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value.__cause__ is None
+    assert "PRIVATE" not in str(raised.value)
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+def test_evaluate_requester_mutation_is_repaired_before_integrity_return() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    snapshot = _capture_method_snapshot(world.requester)
+
+    def mutate_and_interrupt(capture_world: _CaptureWorld) -> None:
+        capture_world.requester.request = lambda *args, **kwargs: {"forged": True}  # type: ignore[method-assign]
+        raise KeyboardInterrupt("PRIVATE_EVALUATE")
+
+    world.evaluate_hook = mutate_and_interrupt
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+def test_caught_invalid_high_level_call_is_a_sticky_capture_violation() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        with suppress(ValueError):
+            capture_world.requester.request("bad-name", "api", value=1)
+        capture_world.requester.request("notes", "create_note", value=2)
+
+    world.execute_hook = execute_hook
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.evaluate_calls == []
+
+
+@pytest.mark.parametrize(
+    "invalid_call",
+    [
+        "track_false",
+        "system_datetime",
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+    ],
+)
+def test_direct_or_untracked_calls_are_sticky_before_low_level_side_effects(
+    invalid_call: str,
+) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        try:
+            if invalid_call == "track_false":
+                capture_world.requester.request("notes", "create_note", track=False, value=0)
+            elif invalid_call == "system_datetime":
+                capture_world.requester.request(
+                    "notes",
+                    "create_note",
+                    _system_datetime="PRIVATE_DATETIME",
+                    value=0,
+                )
+            else:
+                getattr(capture_world.requester, invalid_call)("/direct", track=False)
+        except ValueError:
+            pass
+        capture_world.requester.request("notes", "create_note", value=1)
+
+    world.execute_hook = execute_hook
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert sum(event[0] == "delegate" for event in world.events) == 1
+    assert sum(event[0] == "post" for event in world.events) == 1
+    assert not any(event[0] in {"get", "put", "patch", "delete"} for event in world.events)
+    assert world.evaluate_calls == []
+    assert world.save_calls == 0
+
+
+def test_low_level_class_bypass_is_rejected_by_terminal_tracker_delta() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        requester = capture_world.requester
+        _CaptureRequester.post(requester, "/bypass", track=False)
+        requester.requests.append({"method": "POST", "bypass": True})
+        requester.request("notes", "create_note", value=1)
+
+    world.execute_hook = execute_hook
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.evaluate_calls == []
+
+
+def test_failed_delegate_is_not_appended_when_execution_recovers() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        capture_world.requester.request_error = RuntimeError("PRIVATE_DELEGATE")
+        with suppress(RuntimeError):
+            capture_world.requester.request("notes", "failed", value=0)
+        capture_world.requester.request_error = None
+        capture_world.requester.request("notes", "create_note", value=1)
+
+    world.execute_hook = execute_hook
+
+    plan = _capture_oracle_plan(world)
+
+    assert plan.native_calls == ({"name": "notes__create_note", "arguments": {"value": 1}},)
+    assert len(world.requester.requests) == 1
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("failure_stage", ["request", "execute", "evaluate"])
+def test_clean_baseexceptions_propagate_after_exact_method_restoration(
+    error_type: type[BaseException],
+    failure_stage: str,
+) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    error = error_type("PRIVATE_BASEEXCEPTION")
+    if failure_stage == "request":
+        world.requester.request_error = error
+    elif failure_stage == "execute":
+        world.execute_error = error
+    else:
+        world.evaluate_error = error
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(error_type) as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value is error
+    _assert_capture_methods_restored(world.requester, snapshot)
+    assert world.save_calls == 0
+
+
+@pytest.mark.parametrize("fail_after_write", [False, True])
+def test_partial_patch_installation_rolls_back_in_reverse_without_execution(
+    fail_after_write: bool,
+) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    world.requester = _PartialPatchRequester(
+        world.events,
+        fail_after_write=fail_after_write,
+    )
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$") as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value.__cause__ is None
+    assert "PRIVATE" not in str(raised.value)
+    assert world.execute_calls == 0
+    assert world.evaluate_calls == []
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+def test_raw_instance_overrides_are_restored_by_exact_identity() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    requester = world.requester
+    requester.request = requester.request  # type: ignore[method-assign]
+    requester.post = requester.post  # type: ignore[method-assign]
+    snapshot = _capture_method_snapshot(requester)
+
+    plan = _capture_oracle_plan(world)
+
+    assert len(plan.native_calls) == 1
+    _assert_capture_methods_restored(requester, snapshot)
+    assert requester.__dict__["request"] is snapshot["request"][1]
+    assert requester.__dict__["post"] is snapshot["post"][1]
+
+
+def test_restoration_failure_overrides_baseexception_with_static_integrity() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    world.requester = _RestorationFailingRequester(world.events)
+    world.execute_error = KeyboardInterrupt("PRIVATE_PRIMARY")
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$") as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value.__cause__ is None
+    assert "PRIVATE" not in str(raised.value)
+    assert world.evaluate_calls == []
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+def test_original_request_signature_is_rejected_before_any_patch_or_execution() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    class BadSignatureRequester(_CaptureRequester):
+        def request(self, app: str, api: str, **data: object) -> object:
+            return super().request(app, api, **data)
+
+    world = _CaptureWorld()
+    world.requester = BadSignatureRequester(world.events)
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.execute_calls == 0
+    assert world.evaluate_calls == []
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+def test_original_request_signature_requires_exact_boolean_defaults() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    class BoolSpoofSignatureRequester(_CaptureRequester):
+        def request(
+            self,
+            _app_name: str,
+            _api_name: str,
+            client: object = None,
+            raise_on_failure: object = None,
+            show: object = 0,
+            track: object = 1,
+            **data: object,
+        ) -> object:
+            return super().request(
+                _app_name,
+                _api_name,
+                client,
+                raise_on_failure,
+                show,
+                track,
+                **data,
+            )
+
+    world = _CaptureWorld()
+    world.requester = BoolSpoofSignatureRequester(world.events)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.execute_calls == 0
+
+
+def test_tracker_getter_seal_mutation_is_detected_after_compaction() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    class MutatingTracker:
+        @property
+        def pass_count(self) -> int:
+            world.task = SimpleNamespace(ground_truth=world.task.ground_truth)
+            return 2
+
+        fail_count = 0
+        total_count = 2
+        num_tests = 2
+        success = True
+
+    world.evaluate_tracker = MutatingTracker()
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$"):
+        _capture_oracle_plan(world)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "requester",
+        "task",
+        "ground_truth",
+        "compiled_code",
+        "execute",
+        "evaluate",
+        "patched_method",
+        "tracker_root",
+    ],
+)
+def test_execute_callback_binding_and_tracker_mutations_fail_integrity(
+    mutation: str,
+) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    original_requester = world.requester
+    snapshot = _capture_method_snapshot(original_requester)
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        capture_world.requester.request("notes", "create_note", value=1)
+        if mutation == "requester":
+            capture_world.requester = _CaptureRequester(capture_world.events)
+        elif mutation == "task":
+            capture_world.task = SimpleNamespace(ground_truth=capture_world.task.ground_truth)
+        elif mutation == "ground_truth":
+            capture_world.task.ground_truth = SimpleNamespace(
+                compiled_solution_code=capture_world.task.ground_truth.compiled_solution_code
+            )
+        elif mutation == "compiled_code":
+            current = capture_world.task.ground_truth.compiled_solution_code
+            replacement = current.encode().decode()
+            assert replacement == current and replacement is not current
+            capture_world.task.ground_truth.compiled_solution_code = replacement
+        elif mutation == "execute":
+            capture_world.execute = lambda code: "ok"  # type: ignore[method-assign]
+        elif mutation == "evaluate":
+            capture_world.evaluate = lambda *, suppress_errors: _Tracker()  # type: ignore[method-assign]
+        elif mutation == "patched_method":
+            capture_world.requester.post = lambda *args, **kwargs: {"forged": True}  # type: ignore[method-assign]
+        else:
+            capture_world.requester.requests = list(capture_world.requester.requests)
+
+    world.execute_hook = execute_hook
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$") as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value.__cause__ is None
+    assert world.evaluate_calls == []
+    _assert_capture_methods_restored(original_requester, snapshot)
+
+
+def test_binding_mutation_overrides_execute_baseexception_with_integrity() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        capture_world.execute = lambda code: "forged"  # type: ignore[method-assign]
+        raise KeyboardInterrupt("PRIVATE_PRIMARY")
+
+    world.execute_hook = execute_hook
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$") as raised:
+        _capture_oracle_plan(world)
+
+    assert raised.value.__cause__ is None
+    assert "PRIVATE" not in str(raised.value)
+
+
+def test_tracker_root_must_be_an_exact_builtin_list_before_patching() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    class ListSubclass(list[object]):
+        pass
+
+    world = _CaptureWorld()
+    world.requester.requests = ListSubclass()
+    snapshot = _capture_method_snapshot(world.requester)
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.execute_calls == 0
+    _assert_capture_methods_restored(world.requester, snapshot)
+
+
+@pytest.mark.parametrize("mutation", ["extra_entry", "root_replacement"])
+def test_each_completed_request_requires_exact_tracker_root_and_delta(mutation: str) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def mutate_tracker() -> None:
+        if mutation == "extra_entry":
+            world.requester.requests.append({"extra": True})
+        else:
+            world.requester.requests = []
+
+    world.requester.request_hook = mutate_tracker
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_INTEGRITY_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    assert world.evaluate_calls == []
+
+
+def test_multiple_completed_calls_are_captured_in_native_order() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+
+    def execute_hook(capture_world: _CaptureWorld) -> None:
+        capture_world.requester.request("notes", "first", index=1)
+        capture_world.requester.request("calendar", "second", index=2)
+
+    world.execute_hook = execute_hook
+
+    plan = _capture_oracle_plan(world)
+
+    assert plan.native_calls == (
+        {"name": "notes__first", "arguments": {"index": 1}},
+        {"name": "calendar__second", "arguments": {"index": 2}},
+    )
+
+
+@pytest.mark.parametrize("failure_stage", ["execute", "evaluate"])
+def test_raw_instance_overrides_restore_on_failure(failure_stage: str) -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    world = _CaptureWorld()
+    requester = world.requester
+    requester.request = requester.request  # type: ignore[method-assign]
+    requester.delete = requester.delete  # type: ignore[method-assign]
+    snapshot = _capture_method_snapshot(requester)
+    if failure_stage == "execute":
+        world.execute_error = RuntimeError("PRIVATE_EXECUTE")
+    else:
+        world.evaluate_error = RuntimeError("PRIVATE_EVALUATE")
+
+    with pytest.raises(ValueError, match=f"^{_ORACLE_CAPTURE_ERROR}$"):
+        _capture_oracle_plan(world)
+
+    _assert_capture_methods_restored(requester, snapshot)
+
+
+def test_rollout_calls_identity_attested_execute_and_evaluate_callbacks() -> None:
+    from toolshift.benchmarks.appworld_runtime import _capture_oracle_plan
+
+    class AlternatingWorld(_CaptureWorld):
+        def __init__(self) -> None:
+            super().__init__()
+            self.armed = False
+            self.forged_calls = 0
+
+        def __getattribute__(self, name: str) -> object:
+            if (
+                name in {"execute", "evaluate"}
+                and object.__getattribute__(self, "armed")
+                and sys._getframe(1).f_code.co_name == "_capture_oracle_plan"
+            ):
+
+                def forged(*args: object, **kwargs: object) -> object:
+                    del args, kwargs
+                    object.__setattr__(
+                        self,
+                        "forged_calls",
+                        object.__getattribute__(self, "forged_calls") + 1,
+                    )
+                    return "forged"
+
+                return forged
+            return super().__getattribute__(name)
+
+        def execute(self, code: str) -> object:
+            self.armed = True
+            return super().execute(code)
+
+    world = AlternatingWorld()
+
+    plan = _capture_oracle_plan(world)
+
+    assert len(plan.native_calls) == 1
+    assert world.forged_calls == 0
+    assert world.evaluate_calls == [False]
 
 
 def test_execute_plan_runs_two_calls_in_the_fixed_physical_order() -> None:
