@@ -155,7 +155,15 @@ unset APPWORLD_DB_ARGS APPWORLD_DATE_TIME LOAD_ON_STARTUP
 export UV_CACHE_DIR="${TOOLSHIFT_NODE_LOCAL}/uv-cache"
 export APPWORLD_ENV="${TOOLSHIFT_NODE_LOCAL}/venvs/appworld-0.2.0"
 readonly APPWORLD_ENV
-test "$(uv --version)" = "uv 0.11.8"
+uv_runtime_version="$(uv --version)"
+case "${uv_runtime_version}" in
+  "uv 0.11.8" | "uv 0.11.8 "*) ;;
+  *)
+    echo "Unexpected uv version" >&2
+    exit 1
+    ;;
+esac
+unset uv_runtime_version
 mkdir -p "${UV_CACHE_DIR}" "$(dirname -- "${APPWORLD_ENV}")"
 test ! -e "${APPWORLD_ENV}"
 uv venv --python 3.11.15 "${APPWORLD_ENV}"

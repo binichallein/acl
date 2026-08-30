@@ -275,7 +275,9 @@ def test_appworld_runbook_versions_are_derived_from_manifest() -> None:
     assert f"uv venv --python {python_version}" in install_block
     assert f"download data --version {data_version} --mode {data_mode}" in install_block
     assert f"Git LFS is version `{lfs_version}`" in runbook
-    assert f'test "$(uv --version)" = "uv {uv_version}"' in install_block
+    assert 'uv_runtime_version="$(uv --version)"' in install_block
+    assert f'"uv {uv_version}" | "uv {uv_version} "*)' in install_block
+    assert "Unexpected uv version" in install_block
     assert "upstream editable dependency resolution" in runbook
     assert "project training dependency lock is not complete" in runbook
     assert "no lock checksum is recorded" in runbook
