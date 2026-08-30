@@ -224,6 +224,8 @@ Use a fake requester, fake models record-hash interface, fake tracker, and fake 
 
 - importing the module never imports `appworld`;
 - `AppWorldEpisodeExecutor(world, adapter)` holds one live world but exposes no reset/load API;
+- the executor is one-shot: success, `Exception`, and `BaseException` paths all consume it,
+  and re-entry is rejected before the new plan is inspected;
 - each surface call is parsed, compiled, invoked, grouped, and wrapped in exact order;
 - requester receives `_app_name`, `_api_name`, and copied arguments, with no code generation;
 - the exact physical order is `pre-hash -> request -> world.save() -> post-hash`, repeated for
@@ -233,7 +235,17 @@ Use a fake requester, fake models record-hash interface, fake tracker, and fake 
 - empty episodes, execution failures, malformed requester results, save failures, and evaluator
   failures fail closed;
 - public exceptions and `repr` never reveal world, name, argument, observation, URL, or path;
-- executor and requester bindings are restored/guarded after callback mutation or exceptions.
+- executor and requester bindings are guarded after callback mutation or exceptions.
+
+Task 3 installs and restores no monkeypatches; exact requester and low-level-method restoration
+belongs to Task 4. World construction, close, reset, and the one-live-world-per-process invariant
+belong to the injected context/orchestrator. The complete surface plan is snapshotted before its
+first callback. Each step has exactly one action and one base call, independently recomputes its
+pre- and post-state hashes, and requires every later pre-hash to equal the prior post-hash. A
+requester return is saved and post-hashed before validation, its root must be an exact built-in
+`dict` or `list`, and the duck-typed `save()` return value is ignored. Evaluation uses
+`suppress_errors=False` exactly once after the final post-hash. A well-formed compact evaluator
+record may contain `success: false`; Task 4 rejects an unsuccessful reference oracle.
 
 ### Step 2: Run RED
 
@@ -286,11 +298,14 @@ class _EpisodeRecord:
 Reuse `canonical_state_sha256` and `evaluator_sha256` from `appworld_replay`. Define
 `effect_digest = SHA256(domain || before_state_sha256 || after_state_sha256)` and bind the
 ordered effects, final state, and evaluator digest into `transition_digest`. Keep protected
-records private (`repr=False`) and frozen. A compact score contains only scalar evaluator
-counts and success; it stays in memory. The required physical-call order is initial hash,
-then for every call `request -> world.save() -> post-call hash`; evaluation follows the final
-save. Effect IDs are generic indexed values whose digest binds the before/after whole-state
-hashes. Unit tests and the opt-in real smoke must prove repeated `save()` is supported.
+records private (`repr=False`) and frozen. A compact score contains exactly `pass_count`,
+`fail_count`, `total_count`, `num_tests`, and `success`; it stays in memory. The pinned tracker
+invariants are `total_count == pass_count + fail_count`, `total_count <= num_tests`, and
+`success == (pass_count == num_tests)`. The required physical-call order for every step is
+`parse -> compile -> pre-call hash -> request -> world.save() -> post-call hash ->
+snapshot/wrap`; evaluation follows the final post-call hash. Effect IDs are generic indexed
+values whose digest binds the before/after whole-state hashes. Unit tests and the opt-in real
+smoke must prove repeated `save()` is supported.
 
 ### Step 4: Run GREEN
 
