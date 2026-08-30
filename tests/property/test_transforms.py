@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
+from typing import get_type_hints
 
 import pytest
 from hypothesis import given, settings
@@ -676,7 +677,10 @@ _SAFE_TEXT = st.text(
     max_size=20,
 )
 _SAFE_KEY = _SAFE_TEXT
-_JSON_SCALAR = st.none() | st.booleans() | st.integers(-(2**53 - 1), 2**53 - 1) | _SAFE_TEXT
+_FINITE_FLOAT = st.floats(allow_nan=False, allow_infinity=False, width=64)
+_JSON_SCALAR = (
+    st.none() | st.booleans() | st.integers(-(2**53 - 1), 2**53 - 1) | _FINITE_FLOAT | _SAFE_TEXT
+)
 _JSON_VALUE = st.recursive(
     _JSON_SCALAR,
     lambda children: (
@@ -1103,6 +1107,7 @@ def test_canonical_call_translation_rejects_alias_and_unknown_names() -> None:
 class _RecordingIdentityAdapter(SemanticAdapter):
     def __init__(self, variant: SchemaVariant) -> None:
         super().__init__(variant)
+        self._tool_names = frozenset(tool.name for tool in variant.tools)
         self.parse_inputs: list[Mapping[str, JSONValue]] = []
         self.parse_results: list[tuple[SemanticAction, ...]] = []
         self.compile_inputs: list[SemanticAction] = []
@@ -1123,7 +1128,7 @@ class _RecordingIdentityAdapter(SemanticAdapter):
         self.parse_inputs.append(surface_call)
         name = surface_call.get("name")
         arguments = surface_call.get("arguments")
-        if type(name) is not str or name not in {tool.name for tool in self.variant.tools}:
+        if type(name) is not str or name not in self._tool_names:
             raise ValueError("source parse payload PRIVATE_PARSE")
         if not isinstance(arguments, Mapping):
             raise ValueError("source parse payload PRIVATE_PARSE")
@@ -1206,6 +1211,23 @@ def test_rename_adapter_delegates_the_actual_pipeline_objects_exactly_once() -> 
     assert len(source.parse_inputs) == len(source.compile_inputs) == len(source.wrap_inputs) == 1
 
 
+def test_name_mapping_annotations_remain_string_to_string_until_manifest_boundary() -> None:
+    expected = Mapping[str, str]
+    transform_hints = get_type_hints(RenameTransform)
+    assert transform_hints["canonical_to_surface"] == expected
+    assert transform_hints["_surface_to_canonical"] == expected
+    for helper in (
+        rename_module._freeze_name_mapping,
+        rename_module._snapshot_full_transform_mapping,
+        rename_module._resolved_external_mapping,
+        rename_module._validated_full_mapping,
+    ):
+        assert get_type_hints(helper)["return"] == expected
+    assert get_type_hints(rename_module._transform_snapshot)["mapping"] == expected
+    assert get_type_hints(build_rename_transform)["tool_name_mapping"] == expected
+    assert get_type_hints(apply_rename)["tool_name_mapping"] == expected
+
+
 def test_large_schema_online_adapter_never_rebuilds_or_traverses_schema_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1238,11 +1260,44 @@ def test_large_schema_online_adapter_never_rebuilds_or_traverses_schema_graph(
     monkeypatch.setattr(rename_module, "_make_operator_runtime_seal", unexpected_deep_validation)
     monkeypatch.setattr(rename_module, "_make_mapping_root_seal", unexpected_deep_validation)
     monkeypatch.setattr(transform_base_module, "schema_fingerprint", unexpected_deep_validation)
-    for value in range(5):
-        actions = adapter.surface_to_semantic(
-            {"name": "renamed_0", "arguments": {"field_0": str(value)}}
+
+    tools_slot = SchemaVariant.__dict__["tools"]
+    tools_root_reads = 0
+
+    def counted_tools_root_access(variant: SchemaVariant) -> object:
+        nonlocal tools_root_reads
+        tools_root_reads += 1
+        return tools_slot.__get__(variant, SchemaVariant)
+
+    monkeypatch.setattr(
+        SchemaVariant,
+        "tools",
+        property(counted_tools_root_access),
+    )
+
+    def unexpected_tool_node_access(tool: SurfaceToolSpec) -> object:
+        pytest.fail("online adapter traversed a SurfaceToolSpec node")
+
+    for field_name in ("name", "description", "input_schema"):
+        monkeypatch.setattr(
+            SurfaceToolSpec,
+            field_name,
+            property(unexpected_tool_node_access),
         )
+    for value in range(5):
+        surface_call = {"name": "renamed_0", "arguments": {"field_0": str(value)}}
+        actions = adapter.surface_to_semantic(surface_call)
         adapter.semantic_to_base_calls(actions[0])
+        observation: JSONValue = {"value": str(value)}
+        assert (
+            adapter.base_observation_to_surface(
+                surface_call,
+                actions,
+                ((observation,),),
+            )
+            is observation
+        )
+    assert tools_root_reads == 5 * (6 + 4 + 6)
 
 
 def test_public_variant_callback_payload_is_sanitized_at_init_and_runtime() -> None:
@@ -1292,6 +1347,12 @@ def test_apply_rename_rejects_implicit_adapter_stacking_without_compose_contract
             tool_name_mapping={"lookup": "find"},
             seed=8,
         )
+
+
+def test_rename_composition_unsupported_message_has_one_declared_constant() -> None:
+    assert getattr(rename_module, "_COMPOSITION_UNSUPPORTED_MESSAGE", None) == (
+        "rename composition requires the explicit compose transform"
+    )
 
 
 def test_direct_transform_constructor_rejects_manual_nested_rename() -> None:

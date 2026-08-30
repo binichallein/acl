@@ -29,6 +29,7 @@ from toolshift.types import (
 _RENAME_OPERATOR = "tool_name_rename"
 _RENAME_LEVEL = "L1"
 _RENAME_ABI_TAG = b"toolshift.transform.tool-name-rename.v1"
+_COMPOSITION_UNSUPPORTED_MESSAGE = "rename composition requires the explicit compose transform"
 TOOL_NAME_RENAME_VERSION_HASH = hashlib.sha256(_RENAME_ABI_TAG).hexdigest()
 _ADAPTER_VARIANT_SLOT = SemanticAdapter.__dict__["_variant"]
 _RENAME_INTEGRITY_TOKEN = object()
@@ -56,7 +57,14 @@ def _freeze_transform_mapping(value: object) -> Mapping[str, JSONValue]:
         raise TransformValidationError("transform mapping must be valid I-JSON") from None
 
 
-def _snapshot_full_transform_mapping(value: object) -> Mapping[str, JSONValue]:
+def _freeze_name_mapping(value: object) -> Mapping[str, str]:
+    frozen = _freeze_transform_mapping(value)
+    if any(type(alias) is not str for alias in frozen.values()):
+        raise TransformValidationError("name mapping values must be strings")
+    return cast(Mapping[str, str], frozen)
+
+
+def _snapshot_full_transform_mapping(value: object) -> Mapping[str, str]:
     if not isinstance(value, Mapping):
         raise TransformValidationError("transform mapping must be valid I-JSON")
     try:
@@ -72,7 +80,7 @@ def _snapshot_full_transform_mapping(value: object) -> Mapping[str, JSONValue]:
         if key in snapshot:
             raise TransformValidationError("transform mapping contains a duplicate canonical tool")
         snapshot[key] = entry[1]
-    return _freeze_transform_mapping(snapshot)
+    return _freeze_name_mapping(snapshot)
 
 
 def _snapshot_external_mapping_entries(
@@ -93,7 +101,7 @@ def _snapshot_external_mapping_entries(
 def _resolved_external_mapping(
     base_variant: SchemaVariant,
     entries: tuple[tuple[object, object], ...],
-) -> Mapping[str, JSONValue]:
+) -> Mapping[str, str]:
     canonical_names = tuple(tool.name for tool in base_variant.tools)
     canonical_set = set(canonical_names)
     if not entries:
@@ -115,15 +123,15 @@ def _resolved_external_mapping(
     for canonical, alias in resolved.items():
         if alias != canonical and alias in canonical_set:
             raise TransformValidationError("renamed aliases must be fresh canonical names")
-    return _freeze_transform_mapping(resolved)
+    return _freeze_name_mapping(resolved)
 
 
 def _validated_full_mapping(
     source_variant: SchemaVariant,
     value: object,
-) -> Mapping[str, JSONValue]:
+) -> Mapping[str, str]:
     try:
-        frozen = _freeze_transform_mapping(value)
+        frozen = _freeze_name_mapping(value)
         canonical_names = tuple(tool.name for tool in source_variant.tools)
         if set(frozen) != set(canonical_names):
             raise TransformValidationError("rename mapping does not cover every canonical tool")
@@ -139,7 +147,7 @@ def _validated_full_mapping(
         canonical_set = set(canonical_names)
         if any(alias != name and alias in canonical_set for name, alias in resolved.items()):
             raise TransformValidationError("renamed aliases must be fresh canonical names")
-        return _freeze_transform_mapping(resolved)
+        return _freeze_name_mapping(resolved)
     except TransformValidationError:
         raise
     except Exception:
@@ -172,7 +180,7 @@ def _transform_snapshot(
     source_fingerprint: str,
     variant_fingerprint: str,
     operator_manifest: Mapping[str, JSONValue],
-    mapping: Mapping[str, JSONValue],
+    mapping: Mapping[str, str],
 ) -> bytes:
     return canonical_json_bytes(
         {
@@ -306,6 +314,220 @@ def _operator_runtime_seal_matches(seal: _OperatorRuntimeSeal) -> bool:
         return False
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedRenameConstruction:
+    mapping: Mapping[str, str]
+    operator_manifest: Mapping[str, JSONValue]
+    source_fingerprint: str
+    variant_fingerprint: str
+
+
+def _attest_rename_callback_boundaries(
+    source_variant: object,
+    variant: object,
+    operator: object,
+    canonical_to_surface: object,
+) -> tuple[
+    SchemaVariant,
+    SchemaVariant,
+    OperatorManifestEntry,
+    Mapping[str, str],
+    Mapping[str, JSONValue],
+    str,
+    str,
+]:
+    if type(source_variant) is not SchemaVariant or type(variant) is not SchemaVariant:
+        raise TransformValidationError("rename variants must be exact SchemaVariant values")
+    if type(operator) is not OperatorManifestEntry:
+        raise TransformValidationError("rename operator must be an OperatorManifestEntry")
+    typed_source = cast(SchemaVariant, source_variant)
+    typed_variant = cast(SchemaVariant, variant)
+    typed_operator = cast(OperatorManifestEntry, operator)
+
+    # Exhaust caller-owned mapping callbacks first, including any parameters
+    # graph injected into a tampered operator. Variant attestation happens only
+    # after both callback boundaries have completed.
+    mapping_snapshot = _snapshot_full_transform_mapping(canonical_to_surface)
+    try:
+        operator_manifest = typed_operator.as_manifest()
+    except Exception:
+        raise TransformValidationError("rename operator integrity validation failed") from None
+    try:
+        source_fingerprint = schema_fingerprint(typed_source)
+        variant_fingerprint = schema_fingerprint(typed_variant)
+    except Exception:
+        raise TransformValidationError("rename variant integrity validation failed") from None
+    if typed_source.manifest.get("kind") == "toolshift_interface_variant":
+        raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
+    return (
+        typed_source,
+        typed_variant,
+        typed_operator,
+        mapping_snapshot,
+        operator_manifest,
+        source_fingerprint,
+        variant_fingerprint,
+    )
+
+
+def _require_rename_operator_matches_mapping(
+    operator: OperatorManifestEntry,
+    operator_manifest: Mapping[str, JSONValue],
+    mapping: Mapping[str, str],
+) -> None:
+    if (
+        operator.operator != _RENAME_OPERATOR
+        or operator.level != _RENAME_LEVEL
+        or operator.version_hash != TOOL_NAME_RENAME_VERSION_HASH
+    ):
+        raise TransformValidationError("rename operator metadata is invalid")
+    expected_parameters = _freeze_transform_mapping({"mapping": {"tools": mapping}})
+    operator_parameters = operator_manifest.get("parameters")
+    if not isinstance(operator_parameters, Mapping) or canonical_json_bytes(
+        operator_parameters
+    ) != canonical_json_bytes(expected_parameters):
+        raise TransformValidationError("rename operator parameters do not match mapping")
+
+
+def _require_rename_variant_matches(
+    source_variant: SchemaVariant,
+    variant: SchemaVariant,
+    operator: OperatorManifestEntry,
+    mapping: Mapping[str, str],
+) -> None:
+    try:
+        master_seed = variant.manifest["seed"]
+        if type(master_seed) is not int:
+            raise TransformValidationError("rename manifest seed is invalid")
+        expected_tools = tuple(
+            SurfaceToolSpec(
+                mapping[tool.name],
+                tool.description,
+                tool.input_schema,
+            )
+            for tool in source_variant.tools
+        )
+        expected_variant = build_transformed_variant(
+            source_variant,
+            expected_tools,
+            seed=master_seed,
+            operators=(operator,),
+        )
+        if variant != expected_variant:
+            raise TransformValidationError("rename variant does not match operator manifest")
+    except TransformValidationError:
+        raise
+    except Exception:
+        raise TransformValidationError("rename variant integrity validation failed") from None
+
+
+def _validate_rename_construction(
+    source_variant: object,
+    variant: object,
+    operator: object,
+    canonical_to_surface: object,
+) -> _ValidatedRenameConstruction:
+    (
+        typed_source,
+        typed_variant,
+        typed_operator,
+        mapping_snapshot,
+        operator_manifest,
+        source_fingerprint,
+        variant_fingerprint,
+    ) = _attest_rename_callback_boundaries(
+        source_variant,
+        variant,
+        operator,
+        canonical_to_surface,
+    )
+    mapping = _validated_full_mapping(typed_source, mapping_snapshot)
+    _require_rename_operator_matches_mapping(
+        typed_operator,
+        operator_manifest,
+        mapping,
+    )
+    _require_rename_variant_matches(
+        typed_source,
+        typed_variant,
+        typed_operator,
+        mapping,
+    )
+    return _ValidatedRenameConstruction(
+        mapping,
+        operator_manifest,
+        source_fingerprint,
+        variant_fingerprint,
+    )
+
+
+def _validated_trace_snapshot(trace: object) -> ExecutionTrace:
+    if type(trace) is not ExecutionTrace or not _execution_trace_has_canonical_shape(trace):
+        raise TransformValidationError("trace is invalid")
+    typed_trace = cast(ExecutionTrace, trace)
+    rebuilt = ExecutionTrace(
+        typed_trace.surface_calls,
+        typed_trace.semantic_actions,
+        typed_trace.base_calls,
+    )
+    if rebuilt != typed_trace:
+        raise TransformValidationError("trace is invalid")
+    return typed_trace
+
+
+def _trace_name_uses_final_surface(
+    name: object,
+    canonical_names: set[str],
+    changed_canonical: set[str],
+    changed_surface: set[str],
+) -> bool | None:
+    if type(name) is not str:
+        raise TransformValidationError("trace surface call is invalid")
+    if name in changed_canonical:
+        return False
+    if name in changed_surface:
+        return True
+    if name not in canonical_names:
+        raise TransformValidationError("trace surface call has an unknown tool")
+    return None
+
+
+def _trace_uses_final_surface(
+    trace: ExecutionTrace,
+    mapping: Mapping[str, str],
+) -> bool:
+    canonical_names = set(mapping)
+    changed_canonical = {canonical for canonical, alias in mapping.items() if canonical != alias}
+    changed_surface = {alias for canonical, alias in mapping.items() if canonical != alias}
+    modes = {
+        _trace_name_uses_final_surface(
+            call.get("name"),
+            canonical_names,
+            changed_canonical,
+            changed_surface,
+        )
+        for call in trace.surface_calls
+    }
+    if False in modes and True in modes:
+        raise TransformValidationError("trace mixes canonical and renamed surface modes")
+    return True in modes
+
+
+def _translate_trace_to_source(
+    trace: ExecutionTrace,
+    inverse_mapping: Mapping[str, str],
+) -> ExecutionTrace:
+    translated = tuple(
+        _replace_call_name(
+            call,
+            inverse_mapping,
+            context="trace surface call",
+        )
+        for call in trace.surface_calls
+    )
+    return ExecutionTrace(translated, trace.semantic_actions, trace.base_calls)
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class RenameTransform:
     """An immutable pure rename with bidirectional surface-call translation."""
@@ -313,8 +535,8 @@ class RenameTransform:
     source_variant: SchemaVariant
     variant: SchemaVariant
     operator: OperatorManifestEntry
-    canonical_to_surface: Mapping[str, JSONValue]
-    _surface_to_canonical: Mapping[str, JSONValue] = field(init=False, repr=False)
+    canonical_to_surface: Mapping[str, str]
+    _surface_to_canonical: Mapping[str, str] = field(init=False, repr=False)
     _source_schema_fingerprint: str = field(init=False, repr=False)
     _variant_schema_fingerprint: str = field(init=False, repr=False)
     _canonical_snapshot: bytes = field(init=False, repr=False)
@@ -330,79 +552,39 @@ class RenameTransform:
     __hash__ = None
 
     def __post_init__(self) -> None:
-        if (
-            type(self.source_variant) is not SchemaVariant
-            or type(self.variant) is not SchemaVariant
-        ):
-            raise TransformValidationError("rename variants must be exact SchemaVariant values")
-        if type(self.operator) is not OperatorManifestEntry:
-            raise TransformValidationError("rename operator must be an OperatorManifestEntry")
-        # Exhaust caller-owned mapping callbacks first, including any parameters
-        # graph injected into a tampered operator.  Variant attestation happens
-        # only after both callback boundaries have completed.
-        mapping_snapshot = _snapshot_full_transform_mapping(self.canonical_to_surface)
-        try:
-            operator_manifest = self.operator.as_manifest()
-        except Exception:
-            raise TransformValidationError("rename operator integrity validation failed") from None
-        try:
-            source_fingerprint = schema_fingerprint(self.source_variant)
-            variant_fingerprint = schema_fingerprint(self.variant)
-        except Exception:
-            raise TransformValidationError("rename variant integrity validation failed") from None
-        if self.source_variant.manifest.get("kind") == "toolshift_interface_variant":
-            raise TransformValidationError(
-                "rename composition requires the explicit compose transform"
-            )
-        mapping = _validated_full_mapping(self.source_variant, mapping_snapshot)
-        if (
-            self.operator.operator != _RENAME_OPERATOR
-            or self.operator.level != _RENAME_LEVEL
-            or self.operator.version_hash != TOOL_NAME_RENAME_VERSION_HASH
-        ):
-            raise TransformValidationError("rename operator metadata is invalid")
-        expected_parameters = _freeze_transform_mapping({"mapping": {"tools": mapping}})
-        operator_parameters = operator_manifest.get("parameters")
-        if not isinstance(operator_parameters, Mapping) or canonical_json_bytes(
-            operator_parameters
-        ) != canonical_json_bytes(expected_parameters):
-            raise TransformValidationError("rename operator parameters do not match mapping")
-        try:
-            master_seed = self.variant.manifest["seed"]
-            if type(master_seed) is not int:
-                raise TransformValidationError("rename manifest seed is invalid")
-            expected_tools = tuple(
-                SurfaceToolSpec(
-                    cast(str, mapping[tool.name]),
-                    tool.description,
-                    tool.input_schema,
-                )
-                for tool in self.source_variant.tools
-            )
-            expected_variant = build_transformed_variant(
-                self.source_variant,
-                expected_tools,
-                seed=master_seed,
-                operators=(self.operator,),
-            )
-            if self.variant != expected_variant:
-                raise TransformValidationError("rename variant does not match operator manifest")
-        except TransformValidationError:
-            raise
-        except Exception:
-            raise TransformValidationError("rename variant integrity validation failed") from None
-        inverse = {cast(str, alias): canonical for canonical, alias in mapping.items()}
-        inverse_mapping = _freeze_transform_mapping(inverse)
+        construction = _validate_rename_construction(
+            self.source_variant,
+            self.variant,
+            self.operator,
+            self.canonical_to_surface,
+        )
+        self._install_validated_construction(construction)
+
+    def _install_validated_construction(
+        self,
+        construction: _ValidatedRenameConstruction,
+    ) -> None:
+        mapping = construction.mapping
+        inverse = {alias: canonical for canonical, alias in mapping.items()}
+        inverse_mapping = _freeze_name_mapping(inverse)
         canonical = _transform_snapshot(
-            source_fingerprint,
-            variant_fingerprint,
-            operator_manifest,
+            construction.source_fingerprint,
+            construction.variant_fingerprint,
+            construction.operator_manifest,
             mapping,
         )
         object.__setattr__(self, "canonical_to_surface", mapping)
         object.__setattr__(self, "_surface_to_canonical", inverse_mapping)
-        object.__setattr__(self, "_source_schema_fingerprint", source_fingerprint)
-        object.__setattr__(self, "_variant_schema_fingerprint", variant_fingerprint)
+        object.__setattr__(
+            self,
+            "_source_schema_fingerprint",
+            construction.source_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "_variant_schema_fingerprint",
+            construction.variant_fingerprint,
+        )
         object.__setattr__(self, "_canonical_snapshot", canonical)
         snapshot_fingerprint = hashlib.sha256(canonical).hexdigest()
         object.__setattr__(
@@ -413,12 +595,18 @@ class RenameTransform:
         object.__setattr__(
             self,
             "_source_runtime_seal",
-            _make_schema_runtime_seal(self.source_variant, source_fingerprint),
+            _make_schema_runtime_seal(
+                self.source_variant,
+                construction.source_fingerprint,
+            ),
         )
         object.__setattr__(
             self,
             "_variant_runtime_seal",
-            _make_schema_runtime_seal(self.variant, variant_fingerprint),
+            _make_schema_runtime_seal(
+                self.variant,
+                construction.variant_fingerprint,
+            ),
         )
         object.__setattr__(
             self,
@@ -487,8 +675,11 @@ class RenameTransform:
         """Translate only a final-surface call into the source interface."""
 
         self._require_integrity()
-        mapping = cast(Mapping[str, str], self._surface_to_canonical)
-        return _replace_call_name(call, mapping, context="surface call")
+        return _replace_call_name(
+            call,
+            self._surface_to_canonical,
+            context="surface call",
+        )
 
     def canonical_call_to_surface(
         self,
@@ -497,50 +688,19 @@ class RenameTransform:
         """Translate only a canonical source call into the final interface."""
 
         self._require_integrity()
-        mapping = cast(Mapping[str, str], self.canonical_to_surface)
-        return _replace_call_name(call, mapping, context="canonical call")
+        return _replace_call_name(
+            call,
+            self.canonical_to_surface,
+            context="canonical call",
+        )
 
     def _trace_for_source(self, trace: ExecutionTrace) -> ExecutionTrace:
         self._require_integrity()
         try:
-            if type(trace) is not ExecutionTrace or not _execution_trace_has_canonical_shape(trace):
-                raise TransformValidationError("trace is invalid")
-            rebuilt = ExecutionTrace(trace.surface_calls, trace.semantic_actions, trace.base_calls)
-            if rebuilt != trace:
-                raise TransformValidationError("trace is invalid")
-            canonical_names = set(self.canonical_to_surface)
-            changed_canonical = {
-                canonical
-                for canonical, alias in self.canonical_to_surface.items()
-                if canonical != alias
-            }
-            changed_surface = {
-                cast(str, alias)
-                for canonical, alias in self.canonical_to_surface.items()
-                if canonical != alias
-            }
-            saw_canonical = False
-            saw_surface = False
-            for call in trace.surface_calls:
-                name = call.get("name")
-                if type(name) is not str:
-                    raise TransformValidationError("trace surface call is invalid")
-                if name in changed_canonical:
-                    saw_canonical = True
-                elif name in changed_surface:
-                    saw_surface = True
-                elif name not in canonical_names:
-                    raise TransformValidationError("trace surface call has an unknown tool")
-            if saw_canonical and saw_surface:
-                raise TransformValidationError("trace mixes canonical and renamed surface modes")
-            if not saw_surface:
-                return trace
-            inverse = cast(Mapping[str, str], self._surface_to_canonical)
-            translated = tuple(
-                _replace_call_name(call, inverse, context="trace surface call")
-                for call in trace.surface_calls
-            )
-            return ExecutionTrace(translated, trace.semantic_actions, trace.base_calls)
+            validated = _validated_trace_snapshot(trace)
+            if not _trace_uses_final_surface(validated, self.canonical_to_surface):
+                return validated
+            return _translate_trace_to_source(validated, self._surface_to_canonical)
         except TransformValidationError:
             raise
         except Exception:
@@ -564,7 +724,7 @@ def build_rename_transform(
     except Exception:
         raise TransformValidationError("base_variant must be a valid SchemaVariant") from None
     if base_variant.manifest.get("kind") == "toolshift_interface_variant":
-        raise TransformValidationError("rename composition requires the explicit compose transform")
+        raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
     resolved = _resolved_external_mapping(base_variant, entries)
     operator_seed = derive_operator_seed(
         seed,
@@ -583,7 +743,7 @@ def build_rename_transform(
     )
     tools = tuple(
         SurfaceToolSpec(
-            cast(str, resolved[tool.name]),
+            resolved[tool.name],
             tool.description,
             tool.input_schema,
         )
@@ -616,17 +776,13 @@ class RenameAdapter(SemanticAdapter):
         if not isinstance(source_adapter, SemanticAdapter):
             raise TransformValidationError("source_adapter must be a SemanticAdapter")
         if isinstance(source_adapter, RenameAdapter):
-            raise TransformValidationError(
-                "rename composition requires the explicit compose transform"
-            )
+            raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
         if type(transform) is not RenameTransform:
             raise TransformValidationError("transform must be a RenameTransform")
         transform._require_integrity()
         source_variant = transform.source_variant
         if source_variant.manifest.get("kind") == "toolshift_interface_variant":
-            raise TransformValidationError(
-                "rename composition requires the explicit compose transform"
-            )
+            raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
         try:
             source_public = source_adapter.variant
             source_raw = _raw_adapter_variant(source_adapter)
@@ -760,7 +916,7 @@ def apply_rename(
     if not isinstance(source_adapter, SemanticAdapter):
         raise TransformValidationError("source_adapter must be a SemanticAdapter")
     if isinstance(source_adapter, RenameAdapter):
-        raise TransformValidationError("rename composition requires the explicit compose transform")
+        raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
     try:
         source_variant = _raw_adapter_variant(source_adapter)
     except Exception:
