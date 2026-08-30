@@ -517,6 +517,55 @@ def test_restructure_module_exports_adapter_and_apply_helper() -> None:
     ]
 
 
+def test_transforms_package_exports_parameter_restructure_public_api() -> None:
+    import toolshift.transforms as transforms_module
+    from toolshift.transforms import (
+        PARAMETER_RESTRUCTURE_VERSION_HASH as package_version_hash,
+    )
+    from toolshift.transforms import (
+        ParameterGroupRule as PackageParameterGroupRule,
+    )
+    from toolshift.transforms import (
+        ParameterRestructureAdapter as PackageParameterRestructureAdapter,
+    )
+    from toolshift.transforms import (
+        ParameterRestructureTransform as PackageParameterRestructureTransform,
+    )
+    from toolshift.transforms import (
+        apply_parameter_restructure as package_apply_parameter_restructure,
+    )
+    from toolshift.transforms import (
+        build_parameter_restructure_transform as package_build_parameter_restructure_transform,
+    )
+
+    assert package_version_hash is PARAMETER_RESTRUCTURE_VERSION_HASH
+    assert PackageParameterGroupRule is ParameterGroupRule
+    assert PackageParameterRestructureAdapter is restructure_module.ParameterRestructureAdapter
+    assert PackageParameterRestructureTransform is ParameterRestructureTransform
+    assert package_apply_parameter_restructure is restructure_module.apply_parameter_restructure
+    assert package_build_parameter_restructure_transform is build_parameter_restructure_transform
+    assert transforms_module.__all__ == [
+        "PARAMETER_RESTRUCTURE_VERSION_HASH",
+        "TOOL_NAME_RENAME_VERSION_HASH",
+        "TRANSFORM_MANIFEST_SCHEMA_VERSION_HASH",
+        "OperatorManifestEntry",
+        "ParameterGroupRule",
+        "ParameterRestructureAdapter",
+        "ParameterRestructureTransform",
+        "RenameAdapter",
+        "RenameTransform",
+        "TransformValidationError",
+        "apply_parameter_restructure",
+        "apply_rename",
+        "build_parameter_restructure_transform",
+        "build_rename_transform",
+        "build_transform_manifest",
+        "build_transformed_variant",
+        "derive_operator_seed",
+    ]
+    assert all(not name.startswith("_") for name in transforms_module.__all__)
+
+
 def test_parameter_group_rule_is_normalized_frozen_unhashable_value() -> None:
     rule = _search_rule(("query", "limit"))
     equivalent = _search_rule(("limit", "query"))
