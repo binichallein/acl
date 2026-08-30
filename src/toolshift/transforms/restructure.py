@@ -83,6 +83,10 @@ _MAPPING_SUBSCHEMA_KEYS = frozenset(
 )
 
 
+def _is_schema_node(value: object) -> bool:
+    return type(value) is bool or isinstance(value, Mapping)
+
+
 def _require_non_blank_utf8(value: object, message: str) -> str:
     if type(value) is not str or not value.strip():
         raise TransformValidationError(message)
@@ -196,7 +200,7 @@ def _single_subschemas_contain_forbidden_keyword(value: Mapping[object, object])
         if key not in value:
             continue
         child = value[key]
-        if isinstance(child, (list, tuple)):
+        if not _is_schema_node(child):
             return True
         if _schema_node_contains_forbidden_keyword(child):
             return True
@@ -204,19 +208,33 @@ def _single_subschemas_contain_forbidden_keyword(value: Mapping[object, object])
 
 
 def _array_subschemas_contain_forbidden_keyword(value: Mapping[object, object]) -> bool:
-    return any(
-        isinstance(children, (list, tuple))
-        and any(_schema_node_contains_forbidden_keyword(child) for child in children)
-        for children in (value.get(key) for key in _ARRAY_SUBSCHEMA_KEYS)
-    )
+    for key in _ARRAY_SUBSCHEMA_KEYS:
+        if key not in value:
+            continue
+        children = value[key]
+        if type(children) not in (list, tuple):
+            return True
+        if any(
+            not _is_schema_node(child) or _schema_node_contains_forbidden_keyword(child)
+            for child in children
+        ):
+            return True
+    return False
 
 
 def _mapping_subschemas_contain_forbidden_keyword(value: Mapping[object, object]) -> bool:
-    return any(
-        isinstance(children, Mapping)
-        and any(_schema_node_contains_forbidden_keyword(child) for child in children.values())
-        for children in (value.get(key) for key in _MAPPING_SUBSCHEMA_KEYS)
-    )
+    for key in _MAPPING_SUBSCHEMA_KEYS:
+        if key not in value:
+            continue
+        children = value[key]
+        if not isinstance(children, Mapping):
+            return True
+        if any(
+            not _is_schema_node(child) or _schema_node_contains_forbidden_keyword(child)
+            for child in children.values()
+        ):
+            return True
+    return False
 
 
 def _dependencies_contain_forbidden_keyword(value: Mapping[object, object]) -> bool:
@@ -507,7 +525,6 @@ def _validate_construction(
         ) from None
     if typed_source.manifest.get("kind") == "toolshift_interface_variant":
         raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
-    _build_restructured_tools(typed_source, normalized)
     _require_operator_matches_rules(typed_operator, operator_manifest, normalized)
     _require_variant_matches_rules(typed_source, typed_variant, typed_operator, normalized)
     return _ValidatedConstruction(

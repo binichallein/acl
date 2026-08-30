@@ -564,6 +564,124 @@ def test_builder_rejects_non_schema_property_value() -> None:
 
 
 @pytest.mark.parametrize(
+    ("keyword", "bad_value"),
+    [
+        ("items", "PRIVATE_SINGLE"),
+        ("additionalProperties", 7),
+        ("not", None),
+        ("contains", 1.5),
+        ("contentSchema", "PRIVATE_CONTENT"),
+        ("else", "PRIVATE_ELSE"),
+        ("if", "PRIVATE_IF"),
+        ("propertyNames", [{"type": "string"}]),
+        ("then", ({"type": "string"},)),
+        ("unevaluatedItems", "PRIVATE_UNEVALUATED_ITEMS"),
+        ("unevaluatedProperties", ({"type": "string"},)),
+    ],
+)
+def test_builder_rejects_invalid_single_schema_keyword_shape(
+    keyword: str,
+    bad_value: JSONValue,
+) -> None:
+    schema = _search_schema()
+    properties = cast(dict[str, JSONValue], schema["properties"])
+    properties["query"] = {"type": "string", keyword: bad_value}
+
+    with pytest.raises(TransformValidationError) as caught:
+        build_parameter_restructure_transform(
+            _base_variant(search_schema=schema),
+            rules=(_search_rule(("query",)),),
+            seed=7,
+        )
+
+    assert str(caught.value) == "parameter restructure source schema is unsupported"
+
+
+@pytest.mark.parametrize(
+    ("keyword", "bad_value"),
+    [
+        ("allOf", {"title": "PRIVATE_CONTAINER", "type": "string"}),
+        ("anyOf", "PRIVATE_ARRAY"),
+        ("oneOf", ({"type": "string"}, "PRIVATE_CHILD")),
+        ("prefixItems", [True, "PRIVATE_CHILD"]),
+    ],
+)
+def test_builder_rejects_invalid_schema_array_keyword_shape(
+    keyword: str,
+    bad_value: JSONValue,
+) -> None:
+    schema = _search_schema()
+    properties = cast(dict[str, JSONValue], schema["properties"])
+    properties["query"] = {"type": "string", keyword: bad_value}
+
+    with pytest.raises(TransformValidationError) as caught:
+        build_parameter_restructure_transform(
+            _base_variant(search_schema=schema),
+            rules=(_search_rule(("query",)),),
+            seed=7,
+        )
+
+    assert str(caught.value) == "parameter restructure source schema is unsupported"
+
+
+@pytest.mark.parametrize(
+    ("keyword", "bad_value"),
+    [
+        ("properties", "PRIVATE_MAPPING"),
+        ("$defs", ({"const": "PRIVATE_CONTAINER"},)),
+        ("definitions", {"x": "PRIVATE_CHILD"}),
+        ("patternProperties", {"^x$": "PRIVATE_CHILD"}),
+        ("dependentSchemas", {"x": "PRIVATE_CHILD"}),
+    ],
+)
+def test_builder_rejects_invalid_schema_mapping_keyword_shape(
+    keyword: str,
+    bad_value: JSONValue,
+) -> None:
+    schema = _search_schema()
+    properties = cast(dict[str, JSONValue], schema["properties"])
+    properties["query"] = {"type": "string", keyword: bad_value}
+
+    with pytest.raises(TransformValidationError) as caught:
+        build_parameter_restructure_transform(
+            _base_variant(search_schema=schema),
+            rules=(_search_rule(("query",)),),
+            seed=7,
+        )
+
+    assert str(caught.value) == "parameter restructure source schema is unsupported"
+
+
+def test_builder_accepts_valid_nested_schema_keyword_shapes() -> None:
+    schema = _search_schema()
+    properties = cast(dict[str, JSONValue], schema["properties"])
+    query_schema: dict[str, JSONValue] = {
+        "type": "object",
+        "propertyNames": True,
+        "additionalProperties": {"type": "string"},
+        "allOf": [True, {"type": "object"}],
+        "properties": {
+            "flag": False,
+            "count": {"type": "integer"},
+        },
+    }
+    properties["query"] = query_schema
+
+    transform = build_parameter_restructure_transform(
+        _base_variant(search_schema=schema),
+        rules=(_search_rule(("query",)),),
+        seed=7,
+    )
+
+    request = _properties(_tool(transform.variant, "search"))["request"]
+    assert isinstance(request, Mapping)
+    moved = request["properties"]
+    assert isinstance(moved, Mapping)
+    source_query = _properties(_tool(transform.source_variant, "search"))["query"]
+    assert moved["query"] == source_query
+
+
+@pytest.mark.parametrize(
     ("keyword", "value"),
     [
         ("$ref", "#/$defs/private"),
@@ -722,13 +840,21 @@ def test_forbidden_words_in_property_names_and_instance_data_are_allowed() -> No
                     "examples": (),
                 },
             },
+            "choice": {
+                "enum": (
+                    {
+                        "$schema": "PRIVATE_DIALECT",
+                        "$ref": "PRIVATE_REF",
+                    },
+                ),
+            },
         },
         "additionalProperties": False,
     }
 
     transform = build_parameter_restructure_transform(
         _base_variant(search_schema=schema),
-        rules=(_search_rule(("$ref", "payload")),),
+        rules=(_search_rule(("$ref", "choice", "payload")),),
         seed=7,
     )
 
@@ -738,6 +864,7 @@ def test_forbidden_words_in_property_names_and_instance_data_are_allowed() -> No
     moved = request["properties"]
     assert isinstance(moved, Mapping)
     assert moved["payload"] == schema["properties"]["payload"]  # type: ignore[index]
+    assert moved["choice"] == schema["properties"]["choice"]  # type: ignore[index]
 
 
 def test_forbidden_keyword_inside_applicator_schema_is_rejected() -> None:
