@@ -22,7 +22,10 @@ def _variant_has_interface_manifest(value: object, error_message: str) -> bool:
     if type(value) is not SchemaVariant:
         return False
     try:
-        return value.manifest.get("kind") == "toolshift_interface_variant"
+        kind = value.manifest.get("kind")
+        if type(kind) is not str:
+            return False
+        return kind == "toolshift_interface_variant"
     except Exception:
         raise TransformValidationError(error_message) from None
 

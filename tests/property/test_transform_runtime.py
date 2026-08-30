@@ -15,6 +15,7 @@ from toolshift.transforms._runtime import (
     _mapping_root_seal_matches,
     _operator_runtime_seal_matches,
     _schema_runtime_seal_matches,
+    _variant_has_interface_manifest,
 )
 from toolshift.transforms.base import OperatorManifestEntry, TransformValidationError
 from toolshift.types import SchemaVariant, SurfaceToolSpec
@@ -52,6 +53,36 @@ def _operator() -> OperatorManifestEntry:
         "a" * 64,
         {"rules": {"search": {"container": "request"}}},
     )
+
+
+class _TruthinessBomb:
+    def __bool__(self) -> bool:
+        raise RuntimeError("PRIVATE_TRUTH_PAYLOAD")
+
+
+class _EqualityBomb:
+    def __eq__(self, other: object) -> object:
+        return _TruthinessBomb()
+
+
+class _EqualityBombManifest(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        return _EqualityBomb()
+
+    def __iter__(self):
+        return iter(("kind",))
+
+    def __len__(self) -> int:
+        return 1
+
+
+def test_interface_manifest_probe_returns_exact_bool_without_external_equality() -> None:
+    variant = _variant()
+    object.__setattr__(variant, "manifest", _EqualityBombManifest())
+
+    result = _variant_has_interface_manifest(variant, "manifest probe failed")
+
+    assert result is False
 
 
 def test_delegate_checks_before_and_after_operation_and_preserves_identity() -> None:

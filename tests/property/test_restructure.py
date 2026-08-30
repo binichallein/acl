@@ -189,11 +189,58 @@ class _ExplodingManifestMapping(Mapping[str, JSONValue]):
         return 1
 
 
+class _TruthinessBomb:
+    def __bool__(self) -> bool:
+        raise RuntimeError("PRIVATE_TRUTH_PAYLOAD")
+
+
+class _EqualityBomb:
+    def __eq__(self, other: object) -> object:
+        return _TruthinessBomb()
+
+
+class _EqualityBombManifest(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        return _EqualityBomb()
+
+    def __iter__(self):
+        return iter(("kind",))
+
+    def __len__(self) -> int:
+        return 1
+
+
 class _ManifestPayloadPublicSource(_RecordingRestructureSource):
     def __init__(self, variant: SchemaVariant) -> None:
         super().__init__(variant)
         public_variant = _base_variant()
         object.__setattr__(public_variant, "manifest", _ExplodingManifestMapping())
+        self._public_variant = public_variant
+
+    @property
+    def variant(self) -> SchemaVariant:
+        return self._public_variant
+
+
+class _ManifestTruthPublicSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        public_variant = _base_variant()
+        object.__setattr__(public_variant, "manifest", _EqualityBombManifest())
+        self._public_variant = public_variant
+
+    @property
+    def variant(self) -> SchemaVariant:
+        return self._public_variant
+
+
+class _ManifestTruthRawSource(_RecordingRestructureSource):
+    def __init__(
+        self,
+        raw_variant: SchemaVariant,
+        public_variant: SchemaVariant,
+    ) -> None:
+        super().__init__(raw_variant)
         self._public_variant = public_variant
 
     @property
@@ -2311,6 +2358,70 @@ def test_cross_composition_manifest_probes_sanitize_raw_callback_payloads() -> N
         with pytest.raises(TransformValidationError) as caught:
             apply(source, **kwargs)
         assert "PRIVATE_MANIFEST_PAYLOAD" not in str(caught.value)
+        assert caught.value.__cause__ is None
+
+
+def test_cross_composition_manifest_probes_do_not_leak_public_truthiness() -> None:
+    base = _base_variant()
+    source = _ManifestTruthPublicSource(base)
+    restructure_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    rename_transform = rename_module.build_rename_transform(
+        base,
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+
+    for constructor, transform in (
+        (restructure_module.ParameterRestructureAdapter, restructure_transform),
+        (rename_module.RenameAdapter, rename_transform),
+    ):
+        with pytest.raises(TransformValidationError) as caught:
+            constructor(source, transform)
+        assert "PRIVATE_TRUTH_PAYLOAD" not in str(caught.value)
+        assert caught.value.__cause__ is None
+
+
+def test_cross_composition_manifest_probes_do_not_leak_raw_truthiness() -> None:
+    base = _base_variant()
+    raw_variant = _base_variant()
+    object.__setattr__(raw_variant, "manifest", _EqualityBombManifest())
+    source = _ManifestTruthRawSource(raw_variant, base)
+    restructure_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    rename_transform = rename_module.build_rename_transform(
+        base,
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+
+    for constructor, transform in (
+        (restructure_module.ParameterRestructureAdapter, restructure_transform),
+        (rename_module.RenameAdapter, rename_transform),
+    ):
+        with pytest.raises(TransformValidationError) as caught:
+            constructor(source, transform)
+        assert "PRIVATE_TRUTH_PAYLOAD" not in str(caught.value)
+        assert caught.value.__cause__ is None
+
+    for apply in (
+        restructure_module.apply_parameter_restructure,
+        rename_module.apply_rename,
+    ):
+        kwargs: dict[str, object]
+        if apply is restructure_module.apply_parameter_restructure:
+            kwargs = {"rules": (_search_rule(),), "seed": 7}
+        else:
+            kwargs = {"tool_name_mapping": {"search": "lookup"}, "seed": 13}
+        with pytest.raises(TransformValidationError) as caught:
+            apply(source, **kwargs)
+        assert "PRIVATE_TRUTH_PAYLOAD" not in str(caught.value)
         assert caught.value.__cause__ is None
 
 
