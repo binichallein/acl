@@ -95,11 +95,11 @@
 
 1. 从 AppWorld train/dev 分层抽取 100-150 个任务，不查看 test_normal/test_challenge 单题结果。
 2. 每题运行 clean 加 5 个变体，每变体 4 次 paired rollout；先用 4B，再用 7B/8B 复核。
-3. 比较 Base、已有 clean checkpoint、canonical wrapper 和 uniform randomization。
+3. 比较 Base、已有 clean checkpoint、uniform randomization、只看 surface schema/docs 的 generic normalizer，以及拥有 clean schema/exact inverse 的 privileged oracle canonicalizer。
 4. 输出 clean-to-worst drop、TC-Worst、paired flip、regret、长度/工具数分层曲线。
 5. 使用按 task 配对 bootstrap 给出 95% CI，并基于 pilot 方差做正式评测 power analysis。
 
-**Gate 1：** 至少两个 L2/L3 家族出现可重复的 10-15pp clean-to-worst gap，且 wrapper 后仍保留有意义差距；否则停止算法开发或升级变换。
+**Gate 1：** 至少两个 L2/L3 家族出现可重复的 10-15pp clean-to-worst gap，且等信息 generic normalizer 后仍保留有意义差距；privileged oracle 用作双射 L1/L2 的可消除性上界。若 generic normalizer 恢复超过 90%，将该 family 降为 H1/机制控制并升级 L3。
 
 ## Task 5：打通强基线（W4）
 
@@ -115,7 +115,7 @@
 
 1. 建立成功、可验证 milestone、副作用、surface/physical call cost 奖励。
 2. 用小数据写 one-step training smoke test，确认 loss、KL、梯度和 checkpoint 正常。
-3. 实现 Clean-GRPO、DR-GRPO、Global-CVaR-GRPO 和 wrapper+GRPO。
+3. 实现 Clean-GRPO、DR-GRPO、Global-CVaR-GRPO、generic normalizer+GRPO；另实现 privileged oracle canonicalizer 作为双射 L1/L2 ceiling，二者分开报告。
 4. 用相同 rollout、token、tool-call 和训练步数预算运行短实验。
 5. 审计 reward hacking；如 proxy reward 与 AppWorld gold evaluator 分离，先修评分器。
 
