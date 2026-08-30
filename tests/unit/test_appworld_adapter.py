@@ -415,6 +415,31 @@ def test_catalog_construction_audits_ref_targets_hidden_under_unknown_keys() -> 
 
 
 @pytest.mark.parametrize(
+    "target",
+    [{"type": 7}, {"type": "object", "required": "PRIVATE_REQUIRED_CANARY"}],
+    ids=["invalid-type", "invalid-required"],
+)
+def test_catalog_construction_meta_validates_hidden_local_ref_targets(
+    target: dict[str, object],
+) -> None:
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": "#/x-private/target"}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["x-private"] = {"target": target}
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert "PRIVATE_" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
     "reference",
     [
         "#missing-anchor",

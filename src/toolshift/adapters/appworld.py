@@ -320,6 +320,11 @@ def _schema_format_entries(
                 target = _resolve_local_json_pointer(schema, node["$ref"])
                 if type(target) not in (bool, dict):
                     raise _SchemaSnapshotError
+                if type(target) is dict:
+                    try:
+                        Draft202012Validator.check_schema(target)
+                    except Exception:
+                        raise _SchemaSnapshotError from None
                 visit(target, active)
 
             for keyword in _SINGLE_SUBSCHEMA_KEYS:
