@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from types import MappingProxyType
 from typing import TypeVar, cast
 
@@ -31,6 +33,7 @@ _SEMANTIC_ACTION_ERROR = "AppWorld semantic action is invalid"
 _OBSERVATION_ERROR = "AppWorld observation group is invalid"
 _TRACE_ERROR = "AppWorld execution trace is invalid"
 _INTEGRITY_ERROR = "AppWorld adapter integrity validation failed"
+_WITNESS_ERROR = "AppWorld catalog is unprobeable"
 _OUTER_KEYS = frozenset({"type", "function"})
 _FUNCTION_KEYS = frozenset({"name", "description", "parameters"})
 _CALL_KEYS = frozenset({"name", "arguments"})
@@ -98,6 +101,53 @@ _MAPPING_SUBSCHEMA_KEYS = frozenset(
         "properties",
     }
 )
+_WITNESS_ANNOTATION_KEYS = frozenset(
+    {
+        "$comment",
+        "default",
+        "deprecated",
+        "description",
+        "examples",
+        "readOnly",
+        "title",
+        "writeOnly",
+    }
+)
+_WITNESS_KEYWORDS = _WITNESS_ANNOTATION_KEYS | frozenset(
+    {
+        "additionalProperties",
+        "anyOf",
+        "const",
+        "enum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "items",
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+        "multipleOf",
+        "oneOf",
+        "properties",
+        "required",
+        "type",
+    }
+)
+_WITNESS_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_MAX_WITNESS_SCHEMA_DEPTH = 64
+_MAX_WITNESS_STRING_LENGTH = 4096
+_MAX_WITNESS_ARRAY_ITEMS = 256
+_MAX_WITNESS_NUMERIC_CANDIDATES = 32
+_MAX_WITNESS_CANDIDATES = 32
+_MAX_WITNESS_VALUE_NODES = 4096
+_MAX_WITNESS_CANONICAL_BYTES = 1024 * 1024
+_MAX_WITNESS_CANDIDATE_POOL_BYTES = 4 * _MAX_WITNESS_CANONICAL_BYTES
+_MAX_SAFE_INTEGER = 2**53 - 1
 _APPWORLD_ADAPTER_INTEGRITY_TOKEN = object()
 _ResultT = TypeVar("_ResultT")
 _FormatRaises = type[Exception] | tuple[type[Exception], ...]
@@ -114,6 +164,23 @@ class _SchemaSnapshotError(ValueError):
 
 class _AdapterIntegrityError(ValueError):
     """Internal marker kept distinct from malformed external values."""
+
+
+class _WitnessGenerationError(ValueError):
+    """Internal marker converted to one payload-free public error."""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _WitnessValueBudget:
+    nodes: int
+    canonical_bytes: int
+    depth: int
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _WitnessCandidateSet:
+    raw: tuple[JSONValue, ...]
+    valid: tuple[JSONValue, ...]
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
@@ -649,6 +716,933 @@ def _actions_equal(left: SemanticAction, right: SemanticAction) -> bool:
         return False
 
 
+def _witness_effective_type(schema: dict[str, object]) -> str | None:
+    type_value = schema.get("type")
+    if type_value is None:
+        return None
+    if type(type_value) is str and type_value in _WITNESS_TYPES:
+        return type_value
+    if (
+        type(type_value) is list
+        and len(type_value) == 2
+        and all(type(item) is str for item in type_value)
+        and len(set(type_value)) == 2
+        and "null" in type_value
+    ):
+        non_null = next(item for item in type_value if item != "null")
+        if non_null in _WITNESS_TYPES - {"null"}:
+            return cast(str, non_null)
+    raise _WitnessGenerationError
+
+
+def _canonical_scalar_size(value: bool | int | float | str | None) -> int:
+    try:
+        return len(
+            json.dumps(
+                value,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+    except Exception:
+        raise _WitnessGenerationError from None
+
+
+def _require_witness_value_budget(budget: _WitnessValueBudget) -> None:
+    if (
+        budget.nodes > _MAX_WITNESS_VALUE_NODES
+        or budget.canonical_bytes > _MAX_WITNESS_CANONICAL_BYTES
+        or budget.depth > _MAX_WITNESS_SCHEMA_DEPTH
+    ):
+        raise _WitnessGenerationError
+
+
+def _audit_witness_value_budget(value: object) -> _WitnessValueBudget:
+    def visit(
+        item: object,
+        container_depth: int,
+        active: set[int],
+    ) -> _WitnessValueBudget:
+        if container_depth > _MAX_WITNESS_SCHEMA_DEPTH:
+            raise _WitnessGenerationError
+        if item is None or type(item) is bool:
+            budget = _WitnessValueBudget(1, _canonical_scalar_size(item), 0)
+            _require_witness_value_budget(budget)
+            return budget
+        if type(item) is str:
+            if len(item) > _MAX_WITNESS_STRING_LENGTH:
+                raise _WitnessGenerationError
+            budget = _WitnessValueBudget(1, _canonical_scalar_size(item), 0)
+            _require_witness_value_budget(budget)
+            return budget
+        if type(item) is int:
+            if not -_MAX_SAFE_INTEGER <= item <= _MAX_SAFE_INTEGER:
+                raise _WitnessGenerationError
+            budget = _WitnessValueBudget(1, _canonical_scalar_size(item), 0)
+            _require_witness_value_budget(budget)
+            return budget
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise _WitnessGenerationError
+            budget = _WitnessValueBudget(1, _canonical_scalar_size(item), 0)
+            _require_witness_value_budget(budget)
+            return budget
+        if type(item) not in (list, dict):
+            raise _WitnessGenerationError
+
+        identity = id(item)
+        if identity in active:
+            raise _WitnessGenerationError
+        active.add(identity)
+        try:
+            if len(item) > _MAX_WITNESS_ARRAY_ITEMS:
+                raise _WitnessGenerationError
+            nodes = 1
+            canonical_bytes = 2
+            maximum_child_depth = 0
+            entries = (
+                ((None, child) for child in item)
+                if type(item) is list
+                else item.items()
+            )
+            for position, (key, child) in enumerate(entries):
+                if position:
+                    canonical_bytes += 1
+                if type(item) is dict:
+                    if type(key) is not str or len(key) > _MAX_WITNESS_STRING_LENGTH:
+                        raise _WitnessGenerationError
+                    canonical_bytes += _canonical_scalar_size(key) + 1
+                child_budget = visit(child, container_depth + 1, active)
+                nodes += child_budget.nodes
+                canonical_bytes += child_budget.canonical_bytes
+                maximum_child_depth = max(maximum_child_depth, child_budget.depth)
+                _require_witness_value_budget(
+                    _WitnessValueBudget(
+                        nodes,
+                        canonical_bytes,
+                        maximum_child_depth + 1,
+                    )
+                )
+            budget = _WitnessValueBudget(
+                nodes,
+                canonical_bytes,
+                maximum_child_depth + 1,
+            )
+            _require_witness_value_budget(budget)
+            return budget
+        finally:
+            active.remove(identity)
+
+    return visit(value, 0, set())
+
+
+def _project_uniform_array_budget(item: object, length: int) -> _WitnessValueBudget:
+    if length == 0:
+        budget = _WitnessValueBudget(1, 2, 1)
+        _require_witness_value_budget(budget)
+        return budget
+    item_budget = _audit_witness_value_budget(item)
+    budget = _WitnessValueBudget(
+        1 + length * item_budget.nodes,
+        2 + length * item_budget.canonical_bytes + max(0, length - 1),
+        item_budget.depth + 1,
+    )
+    _require_witness_value_budget(budget)
+    return budget
+
+
+def _materialize_uniform_array(item: JSONValue, length: int) -> list[JSONValue]:
+    return [item for _ in range(length)]
+
+
+def _project_object_candidate_budget(
+    values: Mapping[str, JSONValue],
+    name: str,
+    value: JSONValue,
+) -> _WitnessValueBudget:
+    if type(name) is not str or len(name) > _MAX_WITNESS_STRING_LENGTH:
+        raise _WitnessGenerationError
+    projected_length = len(values) + int(name not in values)
+    if projected_length > _MAX_WITNESS_ARRAY_ITEMS:
+        raise _WitnessGenerationError
+
+    nodes = 1
+    canonical_bytes = 2
+    maximum_child_depth = 0
+    position = 0
+    found = False
+    for key, current in values.items():
+        if type(key) is not str or len(key) > _MAX_WITNESS_STRING_LENGTH:
+            raise _WitnessGenerationError
+        if position:
+            canonical_bytes += 1
+        if key == name:
+            current = value
+            found = True
+        child_budget = _audit_witness_value_budget(current)
+        nodes += child_budget.nodes
+        canonical_bytes += _canonical_scalar_size(key) + 1
+        canonical_bytes += child_budget.canonical_bytes
+        maximum_child_depth = max(maximum_child_depth, child_budget.depth)
+        _require_witness_value_budget(
+            _WitnessValueBudget(
+                nodes,
+                canonical_bytes,
+                maximum_child_depth + 1,
+            )
+        )
+        position += 1
+
+    if not found:
+        if position:
+            canonical_bytes += 1
+        child_budget = _audit_witness_value_budget(value)
+        nodes += child_budget.nodes
+        canonical_bytes += _canonical_scalar_size(name) + 1
+        canonical_bytes += child_budget.canonical_bytes
+        maximum_child_depth = max(maximum_child_depth, child_budget.depth)
+
+    budget = _WitnessValueBudget(
+        nodes,
+        canonical_bytes,
+        maximum_child_depth + 1,
+    )
+    _require_witness_value_budget(budget)
+    return budget
+
+
+def _materialize_object_candidate(
+    values: Mapping[str, JSONValue],
+    name: str,
+    value: JSONValue,
+) -> dict[str, JSONValue]:
+    candidate = dict(values)
+    candidate[name] = value
+    return candidate
+
+
+def _audit_witness_schema(node: object, depth: int = 0) -> None:
+    if depth > _MAX_WITNESS_SCHEMA_DEPTH:
+        raise _WitnessGenerationError
+    if type(node) is bool:
+        return
+    if type(node) is not dict or not set(node).issubset(_WITNESS_KEYWORDS):
+        raise _WitnessGenerationError
+
+    combinators = tuple(key for key in ("anyOf", "oneOf") if key in node)
+    if combinators:
+        if len(combinators) != 1 or not set(node).issubset(
+            _WITNESS_ANNOTATION_KEYS | {combinators[0]}
+        ):
+            raise _WitnessGenerationError
+        branches = node[combinators[0]]
+        if (
+            type(branches) is not list
+            or not branches
+            or len(branches) > _MAX_WITNESS_CANDIDATES
+        ):
+            raise _WitnessGenerationError
+        for branch in branches:
+            _audit_witness_schema(branch, depth + 1)
+        return
+
+    effective_type = _witness_effective_type(node)
+    common_keys = _WITNESS_ANNOTATION_KEYS | {"const", "enum", "type"}
+    type_keys: dict[str, frozenset[str]] = {
+        "array": frozenset({"items", "minItems", "maxItems"}),
+        "boolean": frozenset(),
+        "integer": frozenset(
+            {
+                "exclusiveMaximum",
+                "exclusiveMinimum",
+                "maximum",
+                "minimum",
+                "multipleOf",
+            }
+        ),
+        "null": frozenset(),
+        "number": frozenset(
+            {
+                "exclusiveMaximum",
+                "exclusiveMinimum",
+                "maximum",
+                "minimum",
+                "multipleOf",
+            }
+        ),
+        "object": frozenset({"additionalProperties", "properties", "required"}),
+        "string": frozenset({"format", "maxLength", "minLength"}),
+    }
+    allowed = common_keys if effective_type is None else common_keys | type_keys[effective_type]
+    if not set(node).issubset(allowed):
+        raise _WitnessGenerationError
+    if effective_type is None and not ({"const", "enum"} & set(node)) and (
+        set(node) - _WITNESS_ANNOTATION_KEYS
+    ):
+        raise _WitnessGenerationError
+
+    if "enum" in node:
+        enum_values = node["enum"]
+        if (
+            type(enum_values) is not list
+            or not enum_values
+            or len(enum_values) > _MAX_WITNESS_CANDIDATES
+        ):
+            raise _WitnessGenerationError
+        for enum_value in enum_values:
+            _audit_witness_value_budget(enum_value)
+    if "const" in node:
+        _audit_witness_value_budget(node["const"])
+
+    if effective_type == "string":
+        minimum_length = node.get("minLength", 0)
+        maximum_length = node.get("maxLength")
+        if (
+            type(minimum_length) is not int
+            or minimum_length < 0
+            or minimum_length > _MAX_WITNESS_STRING_LENGTH
+            or (
+                maximum_length is not None
+                and (type(maximum_length) is not int or maximum_length < 0)
+            )
+        ):
+            raise _WitnessGenerationError
+        format_name = node.get("format")
+        if format_name is not None and (
+            type(format_name) is not str
+            or format_name not in _SUPPORTED_DRAFT202012_FORMATS
+        ):
+            raise _WitnessGenerationError
+
+    if effective_type == "array":
+        minimum_items = node.get("minItems", 0)
+        maximum_items = node.get("maxItems")
+        if (
+            type(minimum_items) is not int
+            or minimum_items < 0
+            or minimum_items > _MAX_WITNESS_ARRAY_ITEMS
+            or (
+                maximum_items is not None
+                and (type(maximum_items) is not int or maximum_items < 0)
+            )
+        ):
+            raise _WitnessGenerationError
+        if "items" in node:
+            _audit_witness_schema(node["items"], depth + 1)
+
+    if effective_type == "object":
+        properties = node.get("properties", {})
+        required = node.get("required", [])
+        additional = node.get("additionalProperties", True)
+        if (
+            type(properties) is not dict
+            or len(properties) > _MAX_WITNESS_ARRAY_ITEMS
+            or type(required) is not list
+            or len(required) > _MAX_WITNESS_ARRAY_ITEMS
+            or any(type(name) is not str or name not in properties for name in required)
+            or len(required) != len(set(required))
+            or type(additional) is not bool
+        ):
+            raise _WitnessGenerationError
+        for property_schema in properties.values():
+            _audit_witness_schema(property_schema, depth + 1)
+
+    if effective_type in {"integer", "number"}:
+        for keyword in (
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "maximum",
+            "minimum",
+            "multipleOf",
+        ):
+            if keyword in node and (
+                type(node[keyword]) not in (int, float)
+                or not math.isfinite(node[keyword])
+            ):
+                raise _WitnessGenerationError
+        if "multipleOf" in node and cast(int | float, node["multipleOf"]) <= 0:
+            raise _WitnessGenerationError
+        if effective_type == "integer" and "multipleOf" in node and type(
+            node["multipleOf"]
+        ) is not int:
+            raise _WitnessGenerationError
+
+
+def _plain_witness_value(value: object) -> JSONValue:
+    try:
+        _audit_witness_value_budget(value)
+        frozen = _snapshot_runtime_json(value, _WITNESS_ERROR)
+        plain = cast(JSONValue, _plain_json(frozen, _WITNESS_ERROR))
+        _audit_witness_value_budget(plain)
+        return plain
+    except Exception:
+        raise _WitnessGenerationError from None
+
+
+def _candidate_preference(value: JSONValue) -> tuple[object, ...]:
+    if value is None:
+        return (0,)
+    if type(value) is bool:
+        return (1, int(value))
+    if type(value) in (int, float):
+        numeric = cast(int | float, value)
+        return (2, abs(numeric), numeric, type(value).__name__)
+    if type(value) is str:
+        return (3, len(value), value)
+    if type(value) is list:
+        return (
+            4,
+            len(value),
+            tuple(_candidate_preference(item) for item in value),
+        )
+    if type(value) is dict:
+        return (
+            5,
+            len(value),
+            tuple(
+                (key, _candidate_preference(cast(JSONValue, item)))
+                for key, item in sorted(value.items())
+            ),
+        )
+    raise _WitnessGenerationError
+
+
+def _candidate_sort_key(value: object) -> tuple[object, ...]:
+    try:
+        plain = _plain_witness_value(value)
+        return (*_candidate_preference(plain), canonical_json_bytes(plain))
+    except _WitnessGenerationError:
+        raise
+    except Exception:
+        raise _WitnessGenerationError from None
+
+
+def _bounded_distinct_candidates(
+    values: Sequence[object],
+    *,
+    limit: int = _MAX_WITNESS_CANDIDATES,
+) -> tuple[JSONValue, ...]:
+    try:
+        distinct: dict[bytes, JSONValue] = {}
+        aggregate_bytes = 0
+        for value in values:
+            plain = _plain_witness_value(value)
+            canonical = canonical_json_bytes(plain)
+            if canonical not in distinct:
+                aggregate_bytes += len(canonical)
+                if aggregate_bytes > _MAX_WITNESS_CANDIDATE_POOL_BYTES:
+                    raise _WitnessGenerationError
+                distinct[canonical] = plain
+            if len(distinct) > limit:
+                raise _WitnessGenerationError
+        return tuple(sorted(distinct.values(), key=_candidate_sort_key))
+    except _WitnessGenerationError:
+        raise
+    except Exception:
+        raise _WitnessGenerationError from None
+
+
+def _ascii_hostname_candidate(length: int) -> str | None:
+    if length < 1 or length > 253:
+        return None
+    labels: list[str] = []
+    remaining = length
+    while remaining > 63:
+        label_length = min(63, remaining - 2)
+        if label_length < 1:
+            return None
+        labels.append("a" * label_length)
+        remaining -= label_length + 1
+    labels.append("a" * remaining)
+    return ".".join(labels)
+
+
+def _string_format_candidates(
+    format_name: str,
+    minimum_length: int,
+    maximum_length: int | None,
+) -> tuple[str, ...]:
+    base: dict[str, str] = {
+        "date": "2000-01-01",
+        "date-time": "2000-01-01T00:00:00Z",
+        "duration": "P0D",
+        "email": "a@example.com",
+        "hostname": "a",
+        "idn-email": "a@example.com",
+        "idn-hostname": "a",
+        "ipv4": "0.0.0.0",
+        "ipv6": "::",
+        "iri": "https://example.com/",
+        "iri-reference": "",
+        "json-pointer": "",
+        "regex": "",
+        "relative-json-pointer": "0",
+        "time": "00:00:00Z",
+        "uri": "https://example.com/",
+        "uri-reference": "",
+        "uri-template": "",
+        "uuid": "00000000-0000-0000-0000-000000000000",
+    }
+    if format_name not in base:
+        raise _WitnessGenerationError
+    values = [base[format_name]]
+    if format_name in {"email", "idn-email"}:
+        values.append("@")
+    elif format_name in {"iri", "uri"}:
+        values.append("a:b")
+    length_hints: set[int] = set()
+    if not any(
+        len(value) >= minimum_length
+        and (maximum_length is None or len(value) <= maximum_length)
+        for value in values
+    ):
+        length_hints.add(minimum_length)
+        if maximum_length is not None and maximum_length <= _MAX_WITNESS_STRING_LENGTH:
+            length_hints.add(maximum_length)
+    if maximum_length is not None and maximum_length < _MAX_WITNESS_STRING_LENGTH:
+        length_hints.add(maximum_length + 1)
+    for desired in sorted(set(length_hints)):
+        if desired < 0 or desired > _MAX_WITNESS_STRING_LENGTH:
+            raise _WitnessGenerationError
+        if format_name in {"email", "idn-email"}:
+            if desired >= 3:
+                local_length = min(64, desired - 2)
+                domain = _ascii_hostname_candidate(desired - local_length - 1)
+                if domain is not None:
+                    values.append("a" * local_length + "@" + domain)
+        elif format_name in {"hostname", "idn-hostname"}:
+            hostname = _ascii_hostname_candidate(desired)
+            if hostname is not None:
+                values.append(hostname)
+        elif format_name in {"iri", "uri"} and desired >= 3:
+            values.append("a:" + "b" * (desired - 2))
+        elif format_name in {"iri-reference", "uri-reference", "uri-template", "regex"}:
+            values.append("a" * desired)
+        elif format_name == "json-pointer":
+            values.append("" if desired == 0 else "/" + "a" * (desired - 1))
+        elif format_name == "relative-json-pointer" and desired >= 1:
+            values.append("0" if desired == 1 else "0/" + "a" * (desired - 2))
+        elif format_name == "date-time" and desired >= 22:
+            values.append(
+                "2000-01-01T00:00:00." + "0" * (desired - 21) + "Z"
+            )
+        elif format_name == "time" and desired >= 11:
+            values.append("00:00:00." + "0" * (desired - 10) + "Z")
+        elif format_name == "duration" and desired >= 3:
+            values.append("P" + "1" * (desired - 2) + "D")
+        elif format_name == "ipv4" and 7 <= desired <= 15:
+            extra_digits = desired - 7
+            octet_lengths = [1, 1, 1, 1]
+            for index in range(4):
+                added = min(2, extra_digits)
+                octet_lengths[index] += added
+                extra_digits -= added
+            values.append(".".join("1" * length for length in octet_lengths))
+    if format_name == "ipv6":
+        values.extend(("::1", "2001:db8::1", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"))
+    return tuple(values)
+
+
+def _fraction(value: object) -> Fraction:
+    if type(value) is int:
+        return Fraction(value)
+    if type(value) is float and math.isfinite(value):
+        return Fraction(str(value))
+    raise _WitnessGenerationError
+
+
+def _numeric_bounds(
+    schema: dict[str, object],
+) -> tuple[tuple[Fraction, bool] | None, tuple[Fraction, bool] | None]:
+    lower: tuple[Fraction, bool] | None = None
+    upper: tuple[Fraction, bool] | None = None
+    for keyword, exclusive in (("minimum", False), ("exclusiveMinimum", True)):
+        if keyword not in schema:
+            continue
+        current = (_fraction(schema[keyword]), exclusive)
+        if lower is None or current[0] > lower[0] or (
+            current[0] == lower[0] and current[1]
+        ):
+            lower = current
+    for keyword, exclusive in (("maximum", False), ("exclusiveMaximum", True)):
+        if keyword not in schema:
+            continue
+        current = (_fraction(schema[keyword]), exclusive)
+        if upper is None or current[0] < upper[0] or (
+            current[0] == upper[0] and current[1]
+        ):
+            upper = current
+    return lower, upper
+
+
+def _lower_lattice_index(bound: tuple[Fraction, bool], step: Fraction) -> int:
+    ratio = bound[0] / step
+    index = math.ceil(ratio)
+    return index + 1 if bound[1] and ratio.denominator == 1 else index
+
+
+def _upper_lattice_index(bound: tuple[Fraction, bool], step: Fraction) -> int:
+    ratio = bound[0] / step
+    index = math.floor(ratio)
+    return index - 1 if bound[1] and ratio.denominator == 1 else index
+
+
+def _fraction_json_number(value: Fraction, *, integer: bool) -> int | float:
+    if integer:
+        if value.denominator != 1 or not -_MAX_SAFE_INTEGER <= value.numerator <= _MAX_SAFE_INTEGER:
+            raise _WitnessGenerationError
+        return value.numerator
+    if value.denominator == 1 and -_MAX_SAFE_INTEGER <= value.numerator <= _MAX_SAFE_INTEGER:
+        return value.numerator
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise _WitnessGenerationError
+    return converted
+
+
+def _lattice_numeric_candidates(
+    schema: dict[str, object],
+    *,
+    integer: bool,
+) -> tuple[int | float, ...]:
+    lower, upper = _numeric_bounds(schema)
+    declared_multiple = schema.get("multipleOf", 1)
+    if integer:
+        multiple = _fraction(declared_multiple)
+        step = Fraction(abs(multiple.numerator))
+    else:
+        step = _fraction(declared_multiple)
+
+    lower_index = _lower_lattice_index(lower, step) if lower is not None else None
+    upper_index = _upper_lattice_index(upper, step) if upper is not None else None
+    if lower_index is not None and lower_index > 0:
+        closest = lower_index
+    elif upper_index is not None and upper_index < 0:
+        closest = upper_index
+    else:
+        closest = 0
+
+    indices = {closest + offset for offset in range(-2, 3)}
+    if lower_index is not None:
+        indices.update((lower_index - 1, lower_index, lower_index + 1))
+    if upper_index is not None:
+        indices.update((upper_index - 1, upper_index, upper_index + 1))
+    candidates: list[int | float] = []
+    for index in sorted(indices):
+        try:
+            candidates.append(_fraction_json_number(step * index, integer=integer))
+        except _WitnessGenerationError:
+            continue
+        if not integer:
+            operational = cast(int | float, declared_multiple) * index
+            if (
+                (
+                    type(operational) is int
+                    and -_MAX_SAFE_INTEGER <= operational <= _MAX_SAFE_INTEGER
+                )
+                or (type(operational) is float and math.isfinite(operational))
+            ):
+                candidates.append(operational)
+    return tuple(candidates[:_MAX_WITNESS_NUMERIC_CANDIDATES])
+
+
+def _free_number_candidates(schema: dict[str, object]) -> tuple[int | float, ...]:
+    lower, upper = _numeric_bounds(schema)
+    values: list[int | float] = [0, 0.5, -0.5, 1, -1]
+    for bound in (lower, upper):
+        if bound is None:
+            continue
+        try:
+            exact = _fraction_json_number(bound[0], integer=False)
+            values.append(exact)
+            values.extend(
+                (
+                    math.nextafter(float(exact), -math.inf),
+                    math.nextafter(float(exact), math.inf),
+                )
+            )
+        except (OverflowError, _WitnessGenerationError):
+            continue
+    return tuple(values[:_MAX_WITNESS_NUMERIC_CANDIDATES])
+
+
+def _prioritized_witness_candidates(
+    candidates: _WitnessCandidateSet,
+) -> tuple[JSONValue, ...]:
+    prioritized: list[JSONValue] = []
+    seen: set[bytes] = set()
+    aggregate_bytes = 0
+    for group in (candidates.valid, candidates.raw):
+        for candidate in group:
+            canonical = canonical_json_bytes(candidate)
+            if canonical in seen:
+                continue
+            aggregate_bytes += len(canonical)
+            if aggregate_bytes > _MAX_WITNESS_CANDIDATE_POOL_BYTES:
+                raise _WitnessGenerationError
+            seen.add(canonical)
+            prioritized.append(candidate)
+            if len(prioritized) >= _MAX_WITNESS_CANDIDATES:
+                return tuple(prioritized)
+    return tuple(prioritized)
+
+
+def _offer_bounded_witness_candidate(
+    pool: dict[bytes, JSONValue],
+    canonical: bytes,
+    candidate: JSONValue,
+) -> None:
+    if canonical in pool:
+        return
+    pool[canonical] = candidate
+    if len(pool) <= _MAX_WITNESS_CANDIDATES:
+        return
+    worst = max(
+        pool,
+        key=lambda key: (*_candidate_preference(pool[key]), key),
+    )
+    del pool[worst]
+
+
+def _raw_witness_candidates_once(
+    schema: object,
+    format_entries: tuple[tuple[str, _FormatCheckerEntry], ...],
+    depth: int,
+) -> tuple[JSONValue, ...]:
+    if depth > _MAX_WITNESS_SCHEMA_DEPTH:
+        raise _WitnessGenerationError
+    if type(schema) is bool:
+        return (None,) if schema else ()
+    if type(schema) is not dict:
+        raise _WitnessGenerationError
+
+    if "const" in schema:
+        return _bounded_distinct_candidates((schema["const"],))
+    if "enum" in schema:
+        enum_values = schema["enum"]
+        if type(enum_values) is not list:
+            raise _WitnessGenerationError
+        return _bounded_distinct_candidates(enum_values)
+    if "anyOf" in schema or "oneOf" in schema:
+        raise _WitnessGenerationError
+
+    effective_type = _witness_effective_type(schema)
+    if effective_type is None:
+        return (None,)
+    type_value = schema.get("type")
+    nullable = type(type_value) is list
+    candidates: list[object] = [None] if nullable else []
+
+    if effective_type == "null":
+        candidates.append(None)
+    elif effective_type == "boolean":
+        candidates.extend((False, True))
+    elif effective_type == "string":
+        minimum_length = cast(int, schema.get("minLength", 0))
+        maximum_length = schema.get("maxLength")
+        length_hints = {minimum_length}
+        if minimum_length < _MAX_WITNESS_STRING_LENGTH:
+            length_hints.add(minimum_length + 1)
+        if type(maximum_length) is int:
+            if maximum_length <= _MAX_WITNESS_STRING_LENGTH:
+                length_hints.add(maximum_length)
+            if maximum_length < _MAX_WITNESS_STRING_LENGTH:
+                length_hints.add(maximum_length + 1)
+        format_name = schema.get("format")
+        if format_name is None:
+            candidates.extend("a" * length for length in sorted(length_hints))
+        elif type(format_name) is str:
+            candidates.extend(
+                _string_format_candidates(
+                    format_name,
+                    minimum_length,
+                    cast(int | None, maximum_length),
+                )
+            )
+        else:
+            raise _WitnessGenerationError
+    elif effective_type == "array":
+        minimum_items = cast(int, schema.get("minItems", 0))
+        maximum_items = schema.get("maxItems")
+        item_schema = schema.get("items", True)
+        item_candidate_set = _witness_candidate_set(
+            item_schema,
+            format_entries,
+            depth + 1,
+        )
+        item_candidates = _prioritized_witness_candidates(item_candidate_set)
+        lengths = {minimum_items}
+        if minimum_items < _MAX_WITNESS_ARRAY_ITEMS:
+            lengths.add(minimum_items + 1)
+        if type(maximum_items) is int:
+            if maximum_items <= _MAX_WITNESS_ARRAY_ITEMS:
+                lengths.add(maximum_items)
+            if maximum_items < _MAX_WITNESS_ARRAY_ITEMS:
+                lengths.add(maximum_items + 1)
+        ordered_lengths = sorted(lengths)
+        items_per_length = max(
+            1,
+            (_MAX_WITNESS_CANDIDATES - len(candidates)) // len(ordered_lengths),
+        )
+        for length in ordered_lengths:
+            if length == 0:
+                _project_uniform_array_budget(None, 0)
+                candidates.append(_materialize_uniform_array(None, 0))
+                continue
+            for item in item_candidates[:items_per_length]:
+                if len(candidates) >= _MAX_WITNESS_CANDIDATES:
+                    break
+                _project_uniform_array_budget(item, length)
+                candidates.append(_materialize_uniform_array(item, length))
+            if len(candidates) >= _MAX_WITNESS_CANDIDATES:
+                break
+    elif effective_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if type(properties) is not dict or type(required) is not list:
+            raise _WitnessGenerationError
+        witness: dict[str, JSONValue] = {}
+        required_candidates: dict[str, tuple[JSONValue, ...]] = {}
+        for name in sorted(required):
+            property_candidate_set = _witness_candidate_set(
+                properties[name],
+                format_entries,
+                depth + 1,
+            )
+            if not property_candidate_set.valid:
+                return ()
+            required_candidates[name] = _prioritized_witness_candidates(
+                property_candidate_set
+            )
+            selected = property_candidate_set.valid[0]
+            _project_object_candidate_budget(witness, name, selected)
+            witness = _materialize_object_candidate(witness, name, selected)
+        candidates.append(witness)
+        for name in sorted(required_candidates):
+            for alternative in required_candidates[name][1:]:
+                if len(candidates) >= _MAX_WITNESS_CANDIDATES:
+                    break
+                _project_object_candidate_budget(witness, name, alternative)
+                neighbor = _materialize_object_candidate(
+                    witness,
+                    name,
+                    alternative,
+                )
+                candidates.append(neighbor)
+        for name in sorted(set(properties) - set(required)):
+            if len(candidates) >= _MAX_WITNESS_CANDIDATES:
+                break
+            property_candidate_set = _witness_candidate_set(
+                properties[name],
+                format_entries,
+                depth + 1,
+            )
+            property_candidates = _prioritized_witness_candidates(
+                property_candidate_set
+            )
+            for property_candidate in property_candidates:
+                if len(candidates) >= _MAX_WITNESS_CANDIDATES:
+                    break
+                _project_object_candidate_budget(witness, name, property_candidate)
+                neighbor = _materialize_object_candidate(
+                    witness,
+                    name,
+                    property_candidate,
+                )
+                candidates.append(neighbor)
+    elif effective_type == "integer":
+        candidates.extend(_lattice_numeric_candidates(schema, integer=True))
+    elif effective_type == "number":
+        if "multipleOf" in schema:
+            candidates.extend(_lattice_numeric_candidates(schema, integer=False))
+        else:
+            candidates.extend(_free_number_candidates(schema))
+    else:  # pragma: no cover - effective type is exhaustively audited.
+        raise _WitnessGenerationError
+    return _bounded_distinct_candidates(candidates)
+
+
+def _witness_candidate_set(
+    schema: object,
+    format_entries: tuple[tuple[str, _FormatCheckerEntry], ...],
+    depth: int = 0,
+) -> _WitnessCandidateSet:
+    try:
+        validator = Draft202012Validator(
+            schema,
+            format_checker=_new_format_checker(format_entries),
+            registry=Registry(),
+        )
+        if type(schema) is dict and ("anyOf" in schema or "oneOf" in schema):
+            combinator = "anyOf" if "anyOf" in schema else "oneOf"
+            branches = schema[combinator]
+            if type(branches) is not list:
+                raise _WitnessGenerationError
+            raw_pool: dict[bytes, JSONValue] = {}
+            valid_pool: dict[bytes, JSONValue] = {}
+            aggregate_bytes = 0
+            for branch in branches:
+                branch_candidates = _witness_candidate_set(
+                    branch,
+                    format_entries,
+                    depth + 1,
+                )
+                if combinator == "anyOf":
+                    prioritized = branch_candidates.valid[:1]
+                else:
+                    prioritized = _prioritized_witness_candidates(
+                        branch_candidates
+                    )
+                for candidate in prioritized:
+                    canonical = canonical_json_bytes(candidate)
+                    aggregate_bytes += len(canonical)
+                    if aggregate_bytes > _MAX_WITNESS_CANDIDATE_POOL_BYTES:
+                        raise _WitnessGenerationError
+                    _offer_bounded_witness_candidate(
+                        raw_pool,
+                        canonical,
+                        candidate,
+                    )
+                    if validator.is_valid(candidate):
+                        _offer_bounded_witness_candidate(
+                            valid_pool,
+                            canonical,
+                            candidate,
+                        )
+            raw = tuple(
+                sorted(raw_pool.values(), key=_candidate_sort_key)[
+                    :_MAX_WITNESS_CANDIDATES
+                ]
+            )
+            valid = tuple(
+                sorted(valid_pool.values(), key=_candidate_sort_key)[
+                    :_MAX_WITNESS_CANDIDATES
+                ]
+            )
+            return _WitnessCandidateSet(raw, valid)
+
+        generated = _raw_witness_candidates_once(schema, format_entries, depth)
+        valid = tuple(
+            sorted(
+                (
+                    candidate
+                    for candidate in generated
+                    if validator.is_valid(candidate)
+                ),
+                key=_candidate_sort_key,
+            )[:_MAX_WITNESS_CANDIDATES]
+        )
+        return _WitnessCandidateSet(
+            generated[:_MAX_WITNESS_CANDIDATES],
+            valid,
+        )
+    except _AdapterIntegrityError:
+        raise
+    except Exception:
+        raise _WitnessGenerationError from None
+
+
 class AppWorldSemanticAdapter(SemanticAdapter):
     """Immutable snapshot of one world's full non-admin AppWorld catalog."""
 
@@ -887,7 +1881,7 @@ class AppWorldSemanticAdapter(SemanticAdapter):
             try:
                 return operation()
             except _AdapterIntegrityError:
-                raise
+                raise ValueError(_INTEGRITY_ERROR) from None
             except Exception:
                 raise ValueError(error_message) from None
         finally:
@@ -1066,4 +2060,112 @@ def build_appworld_adapter(
     return AppWorldSemanticAdapter(function_catalog)
 
 
-__all__ = ["AppWorldSemanticAdapter", "build_appworld_adapter"]
+def build_minimal_source_calls(
+    source_adapter: AppWorldSemanticAdapter,
+) -> tuple[Mapping[str, JSONValue], ...]:
+    """Build one deterministic, side-effect-free schema witness per source tool."""
+
+    if type(source_adapter) is not AppWorldSemanticAdapter:
+        raise ValueError(_WITNESS_ERROR)
+
+    final_integrity_seals: list[_ToolRuntimeSeal] = []
+
+    def build() -> tuple[Mapping[str, JSONValue], ...]:
+        try:
+            runtime_seals = object.__getattribute__(
+                source_adapter,
+                "_binding_runtime_seals",
+            )
+            if type(runtime_seals) is not tuple or not runtime_seals:
+                raise _WitnessGenerationError
+            final_integrity_seals.extend(runtime_seals)
+
+            audited: list[tuple[_ToolRuntimeSeal, dict[str, object]]] = []
+            for seal in runtime_seals:
+                source_adapter._require_selected_schema_integrity(seal)
+                try:
+                    schema = _plain_json(cast(JSONValue, seal.schema), _WITNESS_ERROR)
+                    if type(schema) is not dict:
+                        raise _WitnessGenerationError
+                    _audit_witness_schema(schema)
+                    audited.append((seal, schema))
+                finally:
+                    source_adapter._require_selected_schema_integrity(seal)
+
+            calls: list[Mapping[str, JSONValue]] = []
+            for seal, schema in audited:
+                source_adapter._require_selected_schema_integrity(seal)
+                try:
+                    format_entries = _schema_format_entries(schema)
+                    candidates = _witness_candidate_set(
+                        schema,
+                        format_entries,
+                    ).valid
+                    if not candidates or type(candidates[0]) is not dict:
+                        raise _WitnessGenerationError
+                    arguments = cast(dict[str, JSONValue], candidates[0])
+
+                    fresh_validator = Draft202012Validator(
+                        schema,
+                        format_checker=_new_format_checker(format_entries),
+                        registry=Registry(),
+                    )
+                    fresh_arguments = _plain_witness_value(arguments)
+                    if type(fresh_arguments) is not dict:
+                        raise _WitnessGenerationError
+                    fresh_validator.validate(fresh_arguments)
+
+                    frozen_arguments = _snapshot_runtime_mapping(
+                        arguments,
+                        _WITNESS_ERROR,
+                    )
+                    source_adapter._validate_arguments(
+                        seal,
+                        frozen_arguments,
+                        _WITNESS_ERROR,
+                    )
+                    call = _snapshot_runtime_mapping(
+                        {"name": seal.name, "arguments": frozen_arguments},
+                        _WITNESS_ERROR,
+                    )
+                    if set(call) != _CALL_KEYS:
+                        raise _WitnessGenerationError
+                    calls.append(call)
+                finally:
+                    source_adapter._require_selected_schema_integrity(seal)
+
+            for (seal, _schema), call in zip(audited, calls, strict=True):
+                source_adapter._require_selected_schema_integrity(seal)
+                try:
+                    actions = source_adapter.surface_to_semantic(call)
+                    if type(actions) is not tuple or len(actions) != 1:
+                        raise _WitnessGenerationError
+                    expected_arguments = call.get("arguments")
+                    if not isinstance(expected_arguments, Mapping) or not _actions_equal(
+                        actions[0],
+                        SemanticAction(seal.name, expected_arguments),
+                    ):
+                        raise _WitnessGenerationError
+                finally:
+                    source_adapter._require_selected_schema_integrity(seal)
+            return tuple(calls)
+        except (_AdapterIntegrityError, _WitnessGenerationError):
+            raise
+        except Exception:
+            raise _WitnessGenerationError from None
+
+    def build_with_full_integrity_check() -> tuple[Mapping[str, JSONValue], ...]:
+        try:
+            return build()
+        finally:
+            for seal in final_integrity_seals:
+                source_adapter._require_selected_schema_integrity(seal)
+
+    return source_adapter._guarded(build_with_full_integrity_check, _WITNESS_ERROR)
+
+
+__all__ = [
+    "AppWorldSemanticAdapter",
+    "build_appworld_adapter",
+    "build_minimal_source_calls",
+]

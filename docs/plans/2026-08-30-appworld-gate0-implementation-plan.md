@@ -129,11 +129,12 @@ git add pyproject.toml src/toolshift/adapters/appworld.py \
 git commit -m "feat: add AppWorld catalog adapter"
 ```
 
-## Task 2: Implement the pure semantic codec and full-catalog probes
+## Task 2: Implement the pure semantic codec and full-catalog source witnesses
 
 **Files:**
 
 - Modify: `src/toolshift/adapters/appworld.py`
+- Modify: `src/toolshift/adapters/__init__.py`
 - Modify: `tests/unit/test_appworld_adapter.py`
 
 ### Step 1: Write RED semantic-method tests
@@ -149,43 +150,36 @@ Cover the four `SemanticAdapter` methods:
 - wrap exactly one action and one singleton observation group;
 - preserve nested JSON and key absence, and deeply freeze outputs;
 - canonicalize only internally consistent `ExecutionTrace` values;
+- accept a structurally consistent empty `ExecutionTrace`; rejecting an empty captured oracle
+  trajectory belongs to Task 4, not to the pure semantic codec;
 - reject reordered, extra, missing, hybrid, or tampered trace channels;
 - recheck integrity before and after callback-bearing input is consumed;
 - return payload-free `ValueError` messages on all rejected inputs.
 
-### Step 2: Write RED schema-probe tests
+### Step 2: Write RED source-witness tests
 
-Add the witness generator in the adapter module and the probe builder in the benchmark layer:
+Add only the source witness generator in the adapter module:
 
 ```python
 def build_minimal_source_calls(
     source_adapter: AppWorldSemanticAdapter,
 ) -> tuple[Mapping[str, JSONValue], ...]: ...
-
-def build_schema_probes(
-    source_adapter: AppWorldSemanticAdapter,
-    candidate_adapter: SemanticAdapter,
-    canonical_call_to_surface: Callable[
-        [Mapping[str, JSONValue]], Mapping[str, JSONValue]
-    ],
-) -> tuple[SchemaProbe, ...]: ...
 ```
 
-The helper must work for the base adapter, `RenameAdapter`, and
-`ParameterRestructureAdapter`. It creates exactly one generic-indexed case per declared
-source/candidate tool, never executes a requester, and produces an instance accepted by both
-declared Draft 2020-12 schemas. `expected_actions` must come only from parsing the canonical
-witness with the source adapter. The candidate surface call comes only from the trusted
-transform translator (or a frozen identity translator for clean). Never call the candidate
-adapter to manufacture its own expected actions.
+The helper creates exactly one frozen native call per declared source tool, never executes a
+requester, and independently confirms each witness with a fresh Draft 2020-12 validator, the
+sealed source binding validator, and source parsing. Cross-adapter `SchemaProbe` materialization,
+generic case IDs, and trusted transform translation belong to Task 5.
 
 The deterministic minimal-instance generator must cover the schema forms needed by pinned
 AppWorld function catalogs: `const`, `enum`, `anyOf`/`oneOf`, nullable types, object required
-properties, arrays with `minItems`, strings with `minLength`, integer/number lower bounds, and
-booleans. It must fail closed on references, recursion, unsatisfiable branches, unknown type
-sets, or unsupported combinators. Case IDs are `schema-0000`, not tool-derived. Any full
-catalog that cannot produce every witness fails closed with the private exclusion code
-`catalog_unprobeable`.
+properties, arrays with bounded `minItems`/`maxItems`, strings with bounded lengths and admitted
+formats, integer/number bounds, positive integer `multipleOf` for integer schemas, positive
+decimal `multipleOf` for number schemas, and booleans. It is a finite grammar and bounded
+neighbor generator, not a general JSON Schema SAT solver: references, recursion, unsupported
+keywords/combinators, over-budget explicit values, or any schema for which its finite candidate
+pool finds no witness fail closed. Any full catalog that cannot produce every witness fails
+closed with the private exclusion code `catalog_unprobeable`.
 
 ### Step 3: Run RED
 
@@ -193,7 +187,7 @@ catalog that cannot produce every witness fails closed with the private exclusio
 pytest tests/unit/test_appworld_adapter.py -q
 ```
 
-### Step 4: Implement the minimal pure methods and probes
+### Step 4: Implement the minimal pure methods and source witnesses
 
 All public methods use `try/finally` integrity checks. Snapshot arguments before validator
 callbacks. Convert `jsonschema` exceptions to static `ValueError` messages. The source witness
@@ -211,8 +205,10 @@ ruff check .
 ### Step 6: Commit
 
 ```bash
-git add src/toolshift/adapters/appworld.py tests/unit/test_appworld_adapter.py
-git commit -m "feat: add AppWorld semantic codec"
+git add docs/plans/2026-08-30-appworld-gate0-implementation-plan.md \
+  src/toolshift/adapters/appworld.py src/toolshift/adapters/__init__.py \
+  tests/unit/test_appworld_adapter.py
+git commit -m "feat: generate AppWorld schema witnesses"
 ```
 
 ## Task 3: Add the isolated AppWorld episode executor
@@ -379,6 +375,25 @@ git commit -m "feat: capture AppWorld oracle calls in memory"
 - Create: `tests/unit/test_appworld_gate0.py`
 
 ### Step 1: Write RED paired-bundle tests
+
+Add the cross-adapter probe builder in the benchmark layer:
+
+```python
+def build_schema_probes(
+    source_adapter: AppWorldSemanticAdapter,
+    candidate_adapter: SemanticAdapter,
+    canonical_call_to_surface: Callable[
+        [Mapping[str, JSONValue]], Mapping[str, JSONValue]
+    ],
+) -> tuple[SchemaProbe, ...]: ...
+```
+
+It consumes `build_minimal_source_calls`, works for the base adapter, `RenameAdapter`, and
+`ParameterRestructureAdapter`, and creates exactly one generic-indexed case per declared
+source/candidate tool. `expected_actions` come only from parsing the canonical witness with
+the source adapter. The candidate surface call comes only from the trusted transform
+translator (or a frozen identity translator for clean); the candidate adapter never
+manufactures its own expected actions. Case IDs are `schema-0000`, never tool-derived.
 
 Build synthetic clean, rename, and restructure adapters over a fake two-tool catalog. Inject a
 fresh-world factory and assert one variant bundle:

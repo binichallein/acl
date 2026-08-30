@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry
 
+import toolshift.adapters as adapters_module
 import toolshift.adapters.appworld as appworld_adapter_module
 from toolshift.adapters import AppWorldSemanticAdapter, build_appworld_adapter
 from toolshift.types import ExecutionTrace, SemanticAction, canonical_json_bytes
@@ -637,6 +639,1074 @@ def test_catalog_validators_use_independent_closed_registries() -> None:
     assert registries[0] is not registries[1]
 
 
+def _minimal_source_calls(
+    adapter: AppWorldSemanticAdapter,
+) -> tuple[Mapping[str, object], ...]:
+    return appworld_adapter_module.build_minimal_source_calls(adapter)
+
+
+def test_build_minimal_source_calls_is_exported_from_adapters() -> None:
+    module_builder = getattr(appworld_adapter_module, "build_minimal_source_calls", None)
+    package_builder = getattr(adapters_module, "build_minimal_source_calls", None)
+
+    assert callable(module_builder)
+    assert package_builder is module_builder
+
+
+def test_build_minimal_source_calls_covers_scalar_const_and_enum_schemas() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__primitive_values",
+                properties={
+                    "constant": {"const": "fixed"},
+                    "choice": {"type": "integer", "enum": [3, 1, 2]},
+                    "flag": {"type": "boolean"},
+                    "nothing": {"type": "null"},
+                    "optional": {
+                        "type": "string",
+                        "default": "PRIVATE_DEFAULT_CANARY",
+                    },
+                },
+                required=["constant", "choice", "flag", "nothing"],
+            )
+        ]
+    )
+
+    calls = _minimal_source_calls(adapter)
+
+    assert calls == (
+        {
+            "name": "synthetic__primitive_values",
+            "arguments": {
+                "choice": 1,
+                "constant": "fixed",
+                "flag": False,
+                "nothing": None,
+            },
+        },
+    )
+    assert "optional" not in calls[0]["arguments"]
+    with pytest.raises(TypeError):
+        calls[0]["name"] = "forbidden"
+
+
+def test_build_minimal_source_calls_covers_composition_objects_and_arrays() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__composite_values",
+                properties={
+                    "any_choice": {
+                        "anyOf": [
+                            {"type": "string", "minLength": 2},
+                            {"type": "integer", "minimum": 5},
+                        ]
+                    },
+                    "one_choice": {
+                        "oneOf": [{"type": "boolean"}, {"type": "null"}]
+                    },
+                    "nullable": {"type": ["string", "null"]},
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "required_flag": {"type": "boolean"},
+                            "optional_text": {"type": "string", "default": "unused"},
+                        },
+                        "required": ["required_flag"],
+                        "additionalProperties": False,
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 2},
+                        "minItems": 2,
+                        "maxItems": 3,
+                    },
+                },
+                required=["items", "nested", "nullable", "one_choice", "any_choice"],
+            )
+        ]
+    )
+
+    call = _minimal_source_calls(adapter)[0]
+
+    assert call == {
+        "name": "synthetic__composite_values",
+        "arguments": {
+            "any_choice": 5,
+            "items": (2, 2),
+            "nested": {"required_flag": False},
+            "nullable": None,
+            "one_choice": None,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("branches", "expected"),
+    [
+        (
+            [
+                {"type": "string", "minLength": 0},
+                {"type": "string", "maxLength": 0},
+            ],
+            "a",
+        ),
+        (
+            [
+                {"type": "array", "items": {"type": "null"}, "minItems": 0},
+                {"type": "array", "items": {"type": "null"}, "maxItems": 0},
+            ],
+            (None,),
+        ),
+    ],
+    ids=["adjacent-string", "adjacent-array"],
+)
+def test_build_minimal_source_calls_tries_bounded_adjacent_one_of_candidates(
+    branches: list[dict[str, object]],
+    expected: object,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__exclusive_choice",
+                properties={"value": {"oneOf": branches}},
+                required=["value"],
+            )
+        ]
+    )
+
+    assert _minimal_source_calls(adapter)[0]["arguments"]["value"] == expected
+
+
+@pytest.mark.parametrize(
+    ("branches", "expected"),
+    [
+        (
+            [
+                {
+                    "type": "object",
+                    "properties": {"x": {"type": "boolean"}},
+                    "required": ["x"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "boolean"},
+                        "y": {"type": "boolean"},
+                    },
+                    "required": ["x"],
+                    "additionalProperties": False,
+                },
+            ],
+            {"x": False, "y": False},
+        ),
+        (
+            [
+                {"type": "array", "items": {"type": "boolean"}, "minItems": 1},
+                {"type": "array", "items": {"const": False}, "minItems": 1},
+            ],
+            (True,),
+        ),
+    ],
+    ids=["single-optional-property", "alternate-uniform-item"],
+)
+def test_build_minimal_source_calls_tries_bounded_structural_one_of_neighbors(
+    branches: list[dict[str, object]],
+    expected: object,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__structural_choice",
+                properties={"value": {"oneOf": branches}},
+                required=["value"],
+            )
+        ]
+    )
+
+    assert _minimal_source_calls(adapter)[0]["arguments"]["value"] == expected
+
+
+@pytest.mark.parametrize(
+    ("branches", "expected"),
+    [
+        (
+            [
+                {"type": "integer", "minimum": 0},
+                {"type": "integer", "minimum": 0, "maximum": 100},
+            ],
+            101,
+        ),
+        (
+            [
+                {"type": "string", "minLength": 0},
+                {"type": "string", "minLength": 0, "maxLength": 5},
+            ],
+            "aaaaaa",
+        ),
+        (
+            [
+                {"type": "number", "minimum": 0},
+                {"type": "number", "minimum": 0, "maximum": 100},
+            ],
+            math.nextafter(100.0, math.inf),
+        ),
+    ],
+    ids=["integer-upper-neighbor", "string-upper-neighbor", "number-upper-neighbor"],
+)
+def test_build_minimal_source_calls_uses_cross_branch_boundary_neighbors(
+    branches: list[dict[str, object]],
+    expected: object,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__boundary_choice",
+                properties={"value": {"oneOf": branches}},
+                required=["value"],
+            )
+        ]
+    )
+
+    assert _minimal_source_calls(adapter)[0]["arguments"]["value"] == expected
+
+
+@pytest.mark.parametrize(
+    ("branches", "expected"),
+    [
+        (
+            [
+                {"type": "array", "items": {"type": "null"}, "minItems": 0},
+                {
+                    "type": "array",
+                    "items": {"type": "null"},
+                    "minItems": 0,
+                    "maxItems": 100,
+                },
+            ],
+            (None,) * 101,
+        ),
+        (
+            [
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0},
+                    "minItems": 1,
+                    "maxItems": 1,
+                },
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "minItems": 1,
+                    "maxItems": 1,
+                },
+            ],
+            (101,),
+        ),
+        (
+            [
+                {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer", "minimum": 0}},
+                    "required": ["x"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer", "minimum": 0, "maximum": 100}
+                    },
+                    "required": ["x"],
+                    "additionalProperties": False,
+                },
+            ],
+            {"x": 101},
+        ),
+    ],
+    ids=["array-length", "array-item", "object-property"],
+)
+def test_build_minimal_source_calls_preserves_nested_raw_boundary_neighbors(
+    branches: list[dict[str, object]],
+    expected: object,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__nested_boundary_choice",
+                properties={"value": {"oneOf": branches}},
+                required=["value"],
+            )
+        ]
+    )
+
+    assert _minimal_source_calls(adapter)[0]["arguments"]["value"] == expected
+
+
+def test_build_minimal_source_calls_covers_strings_formats_and_ignores_defaults() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__string_values",
+                properties={
+                    "fixed_length": {
+                        "type": "string",
+                        "minLength": 3,
+                        "maxLength": 3,
+                    },
+                    "email": {
+                        "type": "string",
+                        "format": "email",
+                        "minLength": 5,
+                        "maxLength": 40,
+                    },
+                    "date": {
+                        "type": "string",
+                        "format": "date",
+                        "minLength": 10,
+                        "maxLength": 10,
+                    },
+                    "required_with_default": {
+                        "type": "string",
+                        "default": "PRIVATE_REQUIRED_DEFAULT_CANARY",
+                    },
+                },
+                required=["required_with_default", "date", "email", "fixed_length"],
+            )
+        ]
+    )
+
+    arguments = _minimal_source_calls(adapter)[0]["arguments"]
+
+    assert arguments == {
+        "date": "2000-01-01",
+        "email": "a@example.com",
+        "fixed_length": "aaa",
+        "required_with_default": "",
+    }
+
+
+def test_build_minimal_source_calls_tries_a_short_supported_format_candidate() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__short_email",
+                properties={
+                    "value": {"type": "string", "format": "email", "maxLength": 3}
+                },
+                required=["value"],
+            )
+        ]
+    )
+
+    value = _minimal_source_calls(adapter)[0]["arguments"]["value"]
+
+    assert isinstance(value, str)
+    assert len(value) <= 3
+
+
+@pytest.mark.parametrize(
+    ("format_name", "expected"),
+    [
+        ("date", "2000-01-01"),
+        ("date-time", "2000-01-01T00:00:00Z"),
+        ("duration", "P0D"),
+        ("email", "@"),
+        ("hostname", "a"),
+        ("idn-email", "@"),
+        ("idn-hostname", "a"),
+        ("ipv4", "0.0.0.0"),
+        ("ipv6", "::"),
+        ("iri", "a:b"),
+        ("iri-reference", ""),
+        ("json-pointer", ""),
+        ("regex", ""),
+        ("relative-json-pointer", "0"),
+        ("time", "00:00:00Z"),
+        ("uri", "a:b"),
+        ("uri-reference", ""),
+        ("uri-template", ""),
+        ("uuid", "00000000-0000-0000-0000-000000000000"),
+    ],
+)
+def test_build_minimal_source_calls_covers_every_admitted_format(
+    format_name: str,
+    expected: str,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__formatted_value",
+                properties={"value": {"type": "string", "format": format_name}},
+                required=["value"],
+            )
+        ]
+    )
+
+    assert _minimal_source_calls(adapter)[0]["arguments"]["value"] == expected
+
+
+@pytest.mark.parametrize(
+    ("format_name", "length"),
+    [("email", 100), ("uri", 4), ("ipv4", 11), ("hostname", 64)],
+)
+def test_build_minimal_source_calls_covers_bounded_exact_format_lengths(
+    format_name: str,
+    length: int,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__exact_format_length",
+                properties={
+                    "value": {
+                        "type": "string",
+                        "format": format_name,
+                        "minLength": length,
+                        "maxLength": length,
+                    }
+                },
+                required=["value"],
+            )
+        ]
+    )
+
+    value = _minimal_source_calls(adapter)[0]["arguments"]["value"]
+
+    assert isinstance(value, str)
+    assert len(value) == length
+
+
+def test_build_minimal_source_calls_covers_numeric_bounds_and_multiples() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__numeric_values",
+                properties={
+                    "positive_integer": {
+                        "type": "integer",
+                        "exclusiveMinimum": 4,
+                        "maximum": 10,
+                        "multipleOf": 3,
+                    },
+                    "negative_integer": {
+                        "type": "integer",
+                        "exclusiveMaximum": -2,
+                        "multipleOf": 2,
+                    },
+                    "decimal": {
+                        "type": "number",
+                        "minimum": 0.3,
+                        "maximum": 1,
+                        "multipleOf": 0.2,
+                    },
+                    "exclusive_decimal": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 0.5,
+                        "multipleOf": 0.2,
+                    },
+                },
+                required=[
+                    "positive_integer",
+                    "negative_integer",
+                    "decimal",
+                    "exclusive_decimal",
+                ],
+            )
+        ]
+    )
+
+    arguments = _minimal_source_calls(adapter)[0]["arguments"]
+
+    assert arguments == {
+        "decimal": 0.4,
+        "exclusive_decimal": 0.2,
+        "negative_integer": -4,
+        "positive_integer": 6,
+    }
+
+
+def test_build_minimal_source_calls_covers_float_multiple_runtime_lattice() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__float_lattice",
+                properties={
+                    "value": {
+                        "type": "number",
+                        "exclusiveMinimum": -0.8,
+                        "maximum": -0.6,
+                        "multipleOf": 0.1,
+                    }
+                },
+                required=["value"],
+            )
+        ]
+    )
+
+    value = _minimal_source_calls(adapter)[0]["arguments"]["value"]
+
+    assert value == pytest.approx(-0.7)
+
+
+def test_build_minimal_source_calls_checks_float_neighbors_at_exclusive_bounds() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__exclusive_float_lattice",
+                properties={
+                    "value": {
+                        "type": "number",
+                        "exclusiveMinimum": 2.4,
+                        "exclusiveMaximum": 2.7,
+                        "multipleOf": 0.3,
+                    }
+                },
+                required=["value"],
+            )
+        ]
+    )
+
+    value = _minimal_source_calls(adapter)[0]["arguments"]["value"]
+
+    assert value == pytest.approx(2.7)
+    assert value < 2.7
+
+
+def test_build_minimal_source_calls_is_order_independent_and_catalog_complete() -> None:
+    first = AppWorldSemanticAdapter(
+        [
+            _tool("zeta__empty"),
+            _tool(
+                "alpha__ordered",
+                properties={
+                    "enum_value": {"type": "integer", "enum": [3, 1, 2]},
+                    "branch_value": {
+                        "anyOf": [{"type": "string"}, {"type": "boolean"}]
+                    },
+                },
+                required=["enum_value", "branch_value"],
+            ),
+        ]
+    )
+    second = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "alpha__ordered",
+                properties={
+                    "branch_value": {
+                        "anyOf": [{"type": "boolean"}, {"type": "string"}]
+                    },
+                    "enum_value": {"type": "integer", "enum": [2, 3, 1]},
+                },
+                required=["branch_value", "enum_value"],
+            ),
+            _tool("zeta__empty"),
+        ]
+    )
+
+    first_calls = _minimal_source_calls(first)
+    second_calls = _minimal_source_calls(second)
+
+    assert canonical_json_bytes(first_calls) == canonical_json_bytes(second_calls)
+    assert tuple(call["name"] for call in first_calls) == (
+        "alpha__ordered",
+        "zeta__empty",
+    )
+
+
+@pytest.mark.parametrize(
+    "property_schema",
+    [
+        {"allOf": [{"type": "string"}]},
+        {"type": "string", "pattern": "^PRIVATE_PATTERN_CANARY$"},
+        {"type": ["string", "integer"]},
+        {"type": ["null", "string", "integer"]},
+        {"anyOf": [{"type": "string"}], "oneOf": [{"type": "string"}]},
+        {"type": "object", "minProperties": 1},
+        {"type": "string", "PRIVATE_ASSERTION_CANARY": True},
+    ],
+    ids=[
+        "all-of",
+        "pattern",
+        "non-null-union",
+        "wide-null-union",
+        "mixed-composition",
+        "unsupported-object-assertion",
+        "unknown-assertion",
+    ],
+)
+def test_build_minimal_source_calls_rejects_unsupported_grammar_without_payload(
+    property_schema: dict[str, object],
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "private__unprobeable",
+                properties={"value": property_schema},
+                required=["value"],
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld catalog is unprobeable$",
+    ) as raised:
+        _minimal_source_calls(adapter)
+
+    assert "PRIVATE_" not in str(raised.value)
+    assert "private__unprobeable" not in str(raised.value)
+
+
+def test_build_minimal_source_calls_rejects_local_refs_supported_at_construction() -> None:
+    tool = _tool(
+        "private__referenced",
+        properties={"value": {"$ref": "#/$defs/value"}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["$defs"] = {"value": {"type": "string"}}
+    adapter = AppWorldSemanticAdapter([tool])
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld catalog is unprobeable$",
+    ) as raised:
+        _minimal_source_calls(adapter)
+
+    assert "private__referenced" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "property_schema",
+    [
+        {"type": "integer", "enum": [1], "minimum": 2},
+        {"oneOf": [{"type": "boolean"}, {"type": "boolean"}]},
+        {"type": "string", "minLength": 3, "maxLength": 2},
+        {"type": "array", "items": {"type": "null"}, "minItems": 2, "maxItems": 1},
+        {"type": "number", "minimum": 5, "maximum": 4},
+        {"type": "integer", "const": True},
+        {"anyOf": [False, False]},
+    ],
+    ids=[
+        "enum-conflict",
+        "overlapping-one-of",
+        "string-bounds",
+        "array-bounds",
+        "numeric-bounds",
+        "bool-is-not-integer",
+        "false-branches",
+    ],
+)
+def test_build_minimal_source_calls_rejects_unsatisfiable_schemas_without_payload(
+    property_schema: dict[str, object],
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "private__unsatisfiable",
+                properties={"value": property_schema},
+                required=["value"],
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld catalog is unprobeable$",
+    ) as raised:
+        _minimal_source_calls(adapter)
+
+    assert "private__unsatisfiable" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "property_schema",
+    [
+        {"type": "string", "minLength": 4097},
+        {"type": "array", "items": {"type": "null"}, "minItems": 257},
+    ],
+    ids=["bounded-string", "bounded-array"],
+)
+def test_build_minimal_source_calls_fails_closed_instead_of_unbounded_generation(
+    property_schema: dict[str, object],
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__bounded",
+                properties={"value": property_schema},
+                required=["value"],
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld catalog is unprobeable$"):
+        _minimal_source_calls(adapter)
+
+
+@pytest.mark.parametrize(
+    "property_schema",
+    [
+        {"const": "a" * 4097},
+        {"const": [None] * 257},
+        {"const": {f"key_{index}": None for index in range(257)}},
+        {"enum": ["a" * 4097]},
+        {"type": "integer", "minimum": 1, "maximum": 91, "multipleOf": 0.07},
+    ],
+    ids=[
+        "const-string-budget",
+        "const-array-budget",
+        "const-object-budget",
+        "enum-value-budget",
+        "fractional-integer-multiple",
+    ],
+)
+def test_build_minimal_source_calls_statically_rejects_out_of_budget_values(
+    property_schema: dict[str, object],
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__bounded_explicit_value",
+                properties={"value": property_schema},
+                required=["value"],
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld catalog is unprobeable$"):
+        _minimal_source_calls(adapter)
+
+
+def test_build_minimal_source_calls_generates_each_nested_schema_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_depth = 16
+    property_schema: dict[str, object] = {"type": "null"}
+    for _ in range(nested_depth):
+        property_schema = {
+            "type": "array",
+            "items": property_schema,
+            "minItems": 1,
+            "maxItems": 1,
+        }
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__nested_single_pass",
+                properties={"value": property_schema},
+                required=["value"],
+            )
+        ]
+    )
+    original = appworld_adapter_module._witness_candidate_set
+    calls = 0
+
+    def counted_candidate_set(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_witness_candidate_set",
+        counted_candidate_set,
+    )
+
+    result = _minimal_source_calls(adapter)
+
+    assert len(result) == 1
+    assert calls == nested_depth + 2  # root object, arrays, and null leaf
+
+
+def test_build_minimal_source_calls_rejects_projected_array_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__projected_array_budget",
+                properties={
+                    "value": {
+                        "type": "array",
+                        "items": {"type": "null"},
+                        "minItems": 3,
+                        "maxItems": 3,
+                    }
+                },
+                required=["value"],
+            )
+        ]
+    )
+    events: list[tuple[str, int]] = []
+    original_project = appworld_adapter_module._project_uniform_array_budget
+    original_materialize = appworld_adapter_module._materialize_uniform_array
+
+    def project(item: object, length: int) -> object:
+        events.append(("project", length))
+        return original_project(item, length)
+
+    def materialize(item: object, length: int) -> object:
+        events.append(("materialize", length))
+        return original_materialize(item, length)
+
+    monkeypatch.setattr(appworld_adapter_module, "_MAX_WITNESS_VALUE_NODES", 3)
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_project_uniform_array_budget",
+        project,
+    )
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_materialize_uniform_array",
+        materialize,
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld catalog is unprobeable$"):
+        _minimal_source_calls(adapter)
+
+    assert events == [("project", 3)]
+
+
+def test_build_minimal_source_calls_rejects_projected_object_before_member_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__projected_object_budget",
+                properties={
+                    "value": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "null"},
+                            "b": {"type": "null"},
+                        },
+                        "required": ["a", "b"],
+                        "additionalProperties": False,
+                    }
+                },
+                required=["value"],
+            )
+        ]
+    )
+    events: list[tuple[str, str]] = []
+    original_project = appworld_adapter_module._project_object_candidate_budget
+    original_materialize = appworld_adapter_module._materialize_object_candidate
+
+    def project(
+        values: Mapping[str, object],
+        name: str,
+        value: object,
+    ) -> object:
+        events.append(("project", name))
+        return original_project(values, name, value)
+
+    def materialize(
+        values: Mapping[str, object],
+        name: str,
+        value: object,
+    ) -> object:
+        events.append(("materialize", name))
+        return original_materialize(values, name, value)
+
+    monkeypatch.setattr(appworld_adapter_module, "_MAX_WITNESS_VALUE_NODES", 2)
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_project_object_candidate_budget",
+        project,
+    )
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_materialize_object_candidate",
+        materialize,
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld catalog is unprobeable$"):
+        _minimal_source_calls(adapter)
+
+    assert events == [
+        ("project", "a"),
+        ("materialize", "a"),
+        ("project", "b"),
+    ]
+
+
+def test_build_minimal_source_calls_bounds_composition_pool_while_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__bounded_composition_pool",
+                properties={
+                    "value": {
+                        "oneOf": [{"const": str(index)} for index in range(8)]
+                    }
+                },
+                required=["value"],
+            )
+        ]
+    )
+    original = appworld_adapter_module._witness_candidate_set
+    calls = 0
+
+    def counted_candidate_set(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(appworld_adapter_module, "_MAX_WITNESS_CANDIDATE_POOL_BYTES", 7)
+    monkeypatch.setattr(
+        appworld_adapter_module,
+        "_witness_candidate_set",
+        counted_candidate_set,
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld catalog is unprobeable$"):
+        _minimal_source_calls(adapter)
+
+    assert calls == 5  # root, oneOf, then only three of eight branches
+
+
+def test_build_minimal_source_calls_uses_a_fresh_format_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__email",
+                properties={"value": {"type": "string", "format": "email"}},
+                required=["value"],
+            )
+        ]
+    )
+    monkeypatch.setitem(
+        Draft202012Validator.FORMAT_CHECKER.checkers,
+        "email",
+        (lambda _value: False, ()),
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld catalog is unprobeable$"):
+        _minimal_source_calls(adapter)
+
+
+def test_build_minimal_source_calls_confirms_each_call_through_the_source_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter([_tool("synthetic__empty")])
+    original = AppWorldSemanticAdapter.surface_to_semantic
+    confirmed: list[object] = []
+
+    def confirm(
+        self: AppWorldSemanticAdapter,
+        surface_call: Mapping[str, object],
+    ) -> tuple[SemanticAction, ...]:
+        confirmed.append(surface_call)
+        return original(self, surface_call)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(AppWorldSemanticAdapter, "surface_to_semantic", confirm)
+
+    calls = _minimal_source_calls(adapter)
+
+    assert confirmed == list(calls)
+
+
+def test_build_minimal_source_calls_preserves_integrity_error_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__email",
+                properties={"value": {"type": "string", "format": "email"}},
+                required=["value"],
+            )
+        ]
+    )
+    binding = object.__getattribute__(adapter, "_bindings")["synthetic__email"]
+
+    def mutate(_value: object) -> bool:
+        object.__setattr__(binding, "api_name", "PRIVATE_MUTATION_CANARY")
+        return True
+
+    monkeypatch.setitem(
+        Draft202012Validator.FORMAT_CHECKER.checkers,
+        "email",
+        (mutate, ()),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ) as raised:
+        _minimal_source_calls(adapter)
+
+    assert "PRIVATE_MUTATION_CANARY" not in str(raised.value)
+
+
+def test_build_minimal_source_calls_rechecks_all_tools_after_confirmation_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [_tool("alpha__empty"), _tool("zeta__empty")]
+    )
+    original = AppWorldSemanticAdapter.surface_to_semantic
+    alpha_binding = object.__getattribute__(adapter, "_bindings")["alpha__empty"]
+
+    def mutate_prior_binding(
+        self: AppWorldSemanticAdapter,
+        surface_call: Mapping[str, object],
+    ) -> tuple[SemanticAction, ...]:
+        actions = original(self, surface_call)  # type: ignore[arg-type]
+        if surface_call["name"] == "zeta__empty":
+            object.__setattr__(alpha_binding, "api_name", "PRIVATE_PRIOR_CANARY")
+        return actions
+
+    monkeypatch.setattr(
+        AppWorldSemanticAdapter,
+        "surface_to_semantic",
+        mutate_prior_binding,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ) as raised:
+        _minimal_source_calls(adapter)
+
+    assert "PRIVATE_PRIOR_CANARY" not in str(raised.value)
+
+
+def test_build_minimal_source_calls_rejects_the_whole_catalog_on_one_failure() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool("alpha__valid"),
+            _tool(
+                "private__invalid",
+                properties={"value": {"type": "string", "pattern": "PRIVATE_CANARY"}},
+                required=["value"],
+            ),
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld catalog is unprobeable$",
+    ) as raised:
+        _minimal_source_calls(adapter)
+
+    assert "alpha__valid" not in str(raised.value)
+    assert "private__invalid" not in str(raised.value)
+
+
 def test_importing_appworld_adapter_does_not_import_external_appworld() -> None:
     repository_root = Path(__file__).resolve().parents[2]
     environment = os.environ.copy()
@@ -1179,6 +2249,54 @@ def test_mapping_callback_errors_are_sanitized() -> None:
         adapter.surface_to_semantic(ExplodingMapping())  # type: ignore[arg-type]
 
     assert "PRIVATE_CALLBACK_CANARY" not in str(raised.value)
+
+
+@pytest.mark.parametrize("method", ["parse", "compile", "wrap", "trace", "witness"])
+def test_public_appworld_operations_sanitize_forged_integrity_callback_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    private_message = "PRIVATE_FORGED_INTEGRITY_CANARY"
+
+    def forge_integrity(_value: object) -> bool:
+        raise appworld_adapter_module._AdapterIntegrityError(private_message)
+
+    monkeypatch.setitem(
+        Draft202012Validator.FORMAT_CHECKER.checkers,
+        "email",
+        (forge_integrity, ()),
+    )
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__email",
+                properties={"value": {"type": "string", "format": "email"}},
+                required=["value"],
+            )
+        ]
+    )
+    call = {"name": "synthetic__email", "arguments": {"value": "a@example.com"}}
+    action = SemanticAction("synthetic__email", {"value": "a@example.com"})
+    trace = ExecutionTrace((call,), (action,), (call,))  # type: ignore[arg-type]
+    operations = {
+        "parse": lambda: adapter.surface_to_semantic(call),
+        "compile": lambda: adapter.semantic_to_base_calls(action),
+        "wrap": lambda: adapter.base_observation_to_surface(
+            call,
+            (action,),
+            ((None,),),
+        ),
+        "trace": lambda: adapter.canonicalize_trace(trace),
+        "witness": lambda: _minimal_source_calls(adapter),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ) as raised:
+        operations[method]()
+
+    assert private_message not in str(raised.value)
 
 
 def test_runtime_seal_container_replacement_is_rejected() -> None:
