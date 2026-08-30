@@ -188,6 +188,161 @@ def test_catalog_construction_installs_one_format_checker_per_schema() -> None:
     assert first.is_valid({"email": "synthetic@example.com"}) is True
 
 
+@pytest.mark.parametrize(
+    ("format_name", "valid_value", "invalid_value"),
+    [
+        (
+            "date-time",
+            "2000-01-01T00:00:00Z",
+            "PRIVATE_INVALID_DATETIME_CANARY",
+        ),
+        ("uri", "https://example.com/synthetic", "PRIVATE INVALID URI CANARY"),
+    ],
+)
+def test_catalog_construction_enforces_draft202012_formats(
+    format_name: str,
+    valid_value: str,
+    invalid_value: str,
+) -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__validate_value",
+                properties={"value": {"type": "string", "format": format_name}},
+                required=["value"],
+            )
+        ]
+    )
+
+    assert adapter.surface_to_semantic(
+        {
+            "name": "synthetic__validate_value",
+            "arguments": {"value": valid_value},
+        }
+    ) == (SemanticAction("synthetic__validate_value", {"value": valid_value}),)
+    with pytest.raises(ValueError, match=r"^AppWorld surface call is invalid$") as raised:
+        adapter.surface_to_semantic(
+            {
+                "name": "synthetic__validate_value",
+                "arguments": {"value": invalid_value},
+            }
+        )
+
+    assert invalid_value not in str(raised.value)
+
+
+def test_catalog_construction_rejects_unknown_format_without_payload() -> None:
+    private_format = "PRIVATE_UNKNOWN_FORMAT_CANARY"
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter(
+            [
+                _tool(
+                    "synthetic__validate_value",
+                    properties={
+                        "value": {"type": "string", "format": private_format}
+                    },
+                )
+            ]
+        )
+
+    assert private_format not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "property_schema",
+    [
+        {
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "string",
+                    "format": "PRIVATE_NESTED_FORMAT_CANARY",
+                }
+            },
+        },
+        {
+            "anyOf": [
+                {"type": "string"},
+                {
+                    "type": "string",
+                    "format": "PRIVATE_UNSELECTED_FORMAT_CANARY",
+                },
+            ]
+        },
+        {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "format": "PRIVATE_ITEM_FORMAT_CANARY",
+            },
+        },
+    ],
+    ids=["optional-nested-property", "unselected-anyof-branch", "array-items"],
+)
+def test_catalog_construction_audits_formats_in_all_nested_schema_nodes(
+    property_schema: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter(
+            [
+                _tool(
+                    "synthetic__validate_value",
+                    properties={"optional": property_schema},
+                )
+            ]
+        )
+
+    assert "PRIVATE_" not in str(raised.value)
+
+
+def test_catalog_construction_rejects_declared_format_without_registered_checker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(Draft202012Validator.FORMAT_CHECKER.checkers, "email")
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$"):
+        AppWorldSemanticAdapter(
+            [
+                _tool(
+                    "synthetic__validate_value",
+                    properties={"value": {"type": "string", "format": "email"}},
+                )
+            ]
+        )
+
+
+def test_catalog_construction_copies_only_declared_draft202012_format_checkers() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "contacts__validate_email",
+                properties={"value": {"type": "string", "format": "email"}},
+            ),
+            _tool(
+                "text__validate_regex",
+                properties={"value": {"type": "string", "format": "regex"}},
+            ),
+        ]
+    )
+
+    validators = object.__getattribute__(adapter, "_validators")
+    email_checker = validators["contacts__validate_email"].format_checker
+    regex_checker = validators["text__validate_regex"].format_checker
+    draft_checkers = Draft202012Validator.FORMAT_CHECKER.checkers
+
+    assert email_checker is not None
+    assert regex_checker is not None
+    assert email_checker is not regex_checker
+    assert email_checker.checkers is not regex_checker.checkers
+    assert email_checker.checkers is not draft_checkers
+    assert regex_checker.checkers is not draft_checkers
+    assert tuple(email_checker.checkers) == ("email",)
+    assert tuple(regex_checker.checkers) == ("regex",)
+    assert email_checker.checkers["email"] is draft_checkers["email"]
+    assert regex_checker.checkers["regex"] is draft_checkers["regex"]
+
+
 def test_importing_appworld_adapter_does_not_import_external_appworld() -> None:
     repository_root = Path(__file__).resolve().parents[2]
     environment = os.environ.copy()

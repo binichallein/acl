@@ -49,8 +49,58 @@ _VARIANT_MANIFEST: Mapping[str, JSONValue] = {
     "kind": "appworld_source_interface",
     "schema_policy": "closed-root-v1",
 }
+_SUPPORTED_DRAFT202012_FORMATS = frozenset(
+    {
+        "date",
+        "date-time",
+        "duration",
+        "email",
+        "hostname",
+        "idn-email",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "iri",
+        "iri-reference",
+        "json-pointer",
+        "regex",
+        "relative-json-pointer",
+        "time",
+        "uri",
+        "uri-reference",
+        "uri-template",
+        "uuid",
+    }
+)
+_SINGLE_SUBSCHEMA_KEYS = frozenset(
+    {
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SEQUENCE_SUBSCHEMA_KEYS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_MAPPING_SUBSCHEMA_KEYS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
 _APPWORLD_ADAPTER_INTEGRITY_TOKEN = object()
 _ResultT = TypeVar("_ResultT")
+_FormatRaises = type[Exception] | tuple[type[Exception], ...]
+_FormatCheckerEntry = tuple[Callable[[object], bool], _FormatRaises]
 
 
 class _CatalogSnapshotError(ValueError):
@@ -194,7 +244,97 @@ def _split_native_name(value: object) -> tuple[str, str]:
     return app_name, api_name
 
 
-def _closed_schema(value: object) -> dict[str, object]:
+def _declared_format_entries(
+    schema: dict[str, object],
+) -> tuple[tuple[str, _FormatCheckerEntry], ...]:
+    declared: set[str] = set()
+
+    def visit(node: object, active: set[int]) -> None:
+        if type(node) is bool:
+            return
+        if type(node) is not dict:
+            raise _SchemaSnapshotError
+        identity = id(node)
+        if identity in active:
+            raise _SchemaSnapshotError
+        active.add(identity)
+        try:
+            if "format" in node:
+                format_name = node["format"]
+                if (
+                    type(format_name) is not str
+                    or format_name not in _SUPPORTED_DRAFT202012_FORMATS
+                ):
+                    raise _SchemaSnapshotError
+                declared.add(format_name)
+
+            for keyword in _SINGLE_SUBSCHEMA_KEYS:
+                if keyword in node:
+                    visit(node[keyword], active)
+
+            for keyword in _SEQUENCE_SUBSCHEMA_KEYS:
+                if keyword not in node:
+                    continue
+                children = node[keyword]
+                if type(children) is not list:
+                    raise _SchemaSnapshotError
+                for child in children:
+                    visit(child, active)
+
+            for keyword in _MAPPING_SUBSCHEMA_KEYS:
+                if keyword not in node:
+                    continue
+                children = node[keyword]
+                if type(children) is not dict:
+                    raise _SchemaSnapshotError
+                for child in children.values():
+                    visit(child, active)
+
+            if "dependencies" in node:
+                dependencies = node["dependencies"]
+                if type(dependencies) is not dict:
+                    raise _SchemaSnapshotError
+                for dependency in dependencies.values():
+                    if type(dependency) in (bool, dict):
+                        visit(dependency, active)
+                    elif type(dependency) is not list:
+                        raise _SchemaSnapshotError
+        finally:
+            active.remove(identity)
+
+    visit(schema, set())
+    try:
+        registry = Draft202012Validator.FORMAT_CHECKER.checkers
+        if type(registry) is not dict:
+            raise _SchemaSnapshotError
+        entries: list[tuple[str, _FormatCheckerEntry]] = []
+        for format_name in sorted(declared):
+            entry = registry.get(format_name)
+            if (
+                type(entry) is not tuple
+                or len(entry) != 2
+                or not callable(entry[0])
+            ):
+                raise _SchemaSnapshotError
+            entries.append((format_name, cast(_FormatCheckerEntry, entry)))
+        return tuple(entries)
+    except _SchemaSnapshotError:
+        raise
+    except Exception:
+        raise _SchemaSnapshotError from None
+
+
+def _new_format_checker(
+    entries: tuple[tuple[str, _FormatCheckerEntry], ...],
+) -> FormatChecker:
+    checker = FormatChecker(formats=())
+    checker.checkers.update(dict(entries))
+    return checker
+
+
+def _closed_schema(
+    value: object,
+) -> tuple[dict[str, object], tuple[tuple[str, _FormatCheckerEntry], ...]]:
     try:
         if type(value) is not dict:
             raise _SchemaSnapshotError
@@ -223,7 +363,7 @@ def _closed_schema(value: object) -> dict[str, object]:
         else:
             schema["additionalProperties"] = False
         Draft202012Validator.check_schema(schema)
-        return schema
+        return schema, _declared_format_entries(schema)
     except _SchemaSnapshotError:
         raise ValueError(_SCHEMA_ERROR) from None
     except Exception:
@@ -232,8 +372,27 @@ def _closed_schema(value: object) -> dict[str, object]:
 
 def _catalog_records(
     entries: tuple[dict[str, object], ...],
-) -> tuple[tuple[str, str, str, str, dict[str, object]], ...]:
-    records: list[tuple[str, str, str, str, dict[str, object]]] = []
+) -> tuple[
+    tuple[
+        str,
+        str,
+        str,
+        str,
+        dict[str, object],
+        tuple[tuple[str, _FormatCheckerEntry], ...],
+    ],
+    ...,
+]:
+    records: list[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            dict[str, object],
+            tuple[tuple[str, _FormatCheckerEntry], ...],
+        ]
+    ] = []
     names: set[str] = set()
     try:
         for entry in entries:
@@ -251,8 +410,17 @@ def _catalog_records(
             if type(description) is not str:
                 raise _CatalogSnapshotError
             description.encode("utf-8")
-            schema = _closed_schema(function.get("parameters"))
-            records.append((cast(str, name), app_name, api_name, description, schema))
+            schema, format_entries = _closed_schema(function.get("parameters"))
+            records.append(
+                (
+                    cast(str, name),
+                    app_name,
+                    api_name,
+                    description,
+                    schema,
+                    format_entries,
+                )
+            )
         return tuple(sorted(records, key=lambda record: record[0]))
     except _CatalogSnapshotError:
         raise ValueError(_CATALOG_ERROR) from None
@@ -455,11 +623,11 @@ class AppWorldSemanticAdapter(SemanticAdapter):
         bindings: dict[str, _ToolBinding] = {}
         validators: dict[str, Draft202012Validator] = {}
         try:
-            for name, app_name, api_name, description, schema in records:
+            for name, app_name, api_name, description, schema, format_entries in records:
                 tool = SurfaceToolSpec(name, description, schema)
                 validator = Draft202012Validator(
                     tool.input_schema,
-                    format_checker=FormatChecker(),
+                    format_checker=_new_format_checker(format_entries),
                 )
                 tools.append(tool)
                 validators[name] = validator
