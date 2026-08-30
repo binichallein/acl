@@ -160,13 +160,18 @@ def _freeze_json(
     context: str,
     active: set[int],
     container_depth: int,
+    *,
+    allow_wide_integers: bool,
 ) -> JSONValue:
     if value is None or type(value) is bool:
         return value
     if type(value) is str:
         return _require_utf8_text(value, context)
     if type(value) is int:
-        if not -_MAX_SAFE_INTEGER <= value <= _MAX_SAFE_INTEGER:
+        if (
+            not allow_wide_integers
+            and not -_MAX_SAFE_INTEGER <= value <= _MAX_SAFE_INTEGER
+        ):
             raise ValueError(
                 f"{context} must be an integer in the I-JSON safe range "
                 f"[-{_MAX_SAFE_INTEGER}, {_MAX_SAFE_INTEGER}]"
@@ -202,6 +207,7 @@ def _freeze_json(
                             f"{context}.{key}",
                             active,
                             container_depth + 1,
+                            allow_wide_integers=allow_wide_integers,
                         ),
                     )
                     for key, item in entries
@@ -233,6 +239,7 @@ def _freeze_json(
                     f"{context}.{key}",
                     active,
                     container_depth + 1,
+                    allow_wide_integers=allow_wide_integers,
                 )
             return _FrozenJSONMapping(tuple(frozen.items()))
         finally:
@@ -250,6 +257,7 @@ def _freeze_json(
                     f"{context}[{index}]",
                     active,
                     container_depth + 1,
+                    allow_wide_integers=allow_wide_integers,
                 )
                 for index, item in enumerate(value)
             )
@@ -261,7 +269,30 @@ def _freeze_json(
 
 def _freeze_json_root(value: object, context: str) -> JSONValue:
     try:
-        return _freeze_json(value, context, set(), 0)
+        return _freeze_json(
+            value,
+            context,
+            set(),
+            0,
+            allow_wide_integers=False,
+        )
+    except RecursionError as error:
+        raise ValueError(
+            f"{context} exceeds maximum JSON container depth {_MAX_JSON_CONTAINER_DEPTH}"
+        ) from error
+
+
+def _freeze_schema_json_root(value: object, context: str) -> JSONValue:
+    """Freeze schema-document JSON while preserving exact Python integers."""
+
+    try:
+        return _freeze_json(
+            value,
+            context,
+            set(),
+            0,
+            allow_wide_integers=True,
+        )
     except RecursionError as error:
         raise ValueError(
             f"{context} exceeds maximum JSON container depth {_MAX_JSON_CONTAINER_DEPTH}"
@@ -274,7 +305,13 @@ def _freeze_mapping(value: object, context: str) -> Mapping[str, JSONValue]:
     return cast(Mapping[str, JSONValue], _freeze_json_root(value, context))
 
 
-def _is_frozen_json(value: object) -> bool:
+def _freeze_schema_mapping(value: object, context: str) -> Mapping[str, JSONValue]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} must be a mapping")
+    return cast(Mapping[str, JSONValue], _freeze_schema_json_root(value, context))
+
+
+def _is_frozen_json_domain(value: object, *, allow_wide_integers: bool) -> bool:
     def visit(item: object, active: set[int], container_depth: int) -> bool:
         if item is None or type(item) is bool:
             return True
@@ -285,7 +322,7 @@ def _is_frozen_json(value: object) -> bool:
                 return False
             return True
         if type(item) is int:
-            return -_MAX_SAFE_INTEGER <= item <= _MAX_SAFE_INTEGER
+            return allow_wide_integers or -_MAX_SAFE_INTEGER <= item <= _MAX_SAFE_INTEGER
         if type(item) is float:
             return math.isfinite(item)
         if type(item) not in (tuple, _FrozenJSONMapping):
@@ -328,8 +365,20 @@ def _is_frozen_json(value: object) -> bool:
     return visit(value, set(), 0)
 
 
+def _is_frozen_json(value: object) -> bool:
+    return _is_frozen_json_domain(value, allow_wide_integers=False)
+
+
+def _is_frozen_schema_json(value: object) -> bool:
+    return _is_frozen_json_domain(value, allow_wide_integers=True)
+
+
 def _is_frozen_mapping(value: object) -> bool:
     return type(value) is _FrozenJSONMapping and _is_frozen_json(value)
+
+
+def _is_frozen_schema_mapping(value: object) -> bool:
+    return type(value) is _FrozenJSONMapping and _is_frozen_schema_json(value)
 
 
 def _freeze_call_sequence(
@@ -373,6 +422,79 @@ def _canonical_json_bytes_from_frozen(value: JSONValue, context: str) -> bytes:
         return text.encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as error:
         raise ValueError(f"{context} cannot be serialized as canonical JSON: {error}") from error
+
+
+def _schema_canonical_json_bytes_from_frozen(
+    value: JSONValue,
+    context: str,
+) -> bytes:
+    if not _is_frozen_schema_json(value):
+        raise ValueError(f"{context} contains invalid frozen schema JSON")
+    try:
+        return _schema_json_text_from_frozen(value).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as error:
+        raise ValueError(
+            f"{context} cannot be serialized as canonical schema JSON: {error}"
+        ) from error
+
+
+def _schema_integer_text(value: int) -> str:
+    if value == 0:
+        return "0"
+    negative = value < 0
+    magnitude = -value if negative else value
+    chunks: list[int] = []
+    while magnitude:
+        magnitude, chunk = divmod(magnitude, 1_000_000_000)
+        chunks.append(chunk)
+    most_significant = chunks.pop()
+    text = f"{most_significant:d}" + "".join(
+        f"{chunk:09d}" for chunk in reversed(chunks)
+    )
+    return f"-{text}" if negative else text
+
+
+def _schema_json_text_from_frozen(value: JSONValue) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "true" if value else "false"
+    if type(value) is str:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+    if type(value) is int:
+        return _schema_integer_text(value)
+    if type(value) is float:
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+    if type(value) is tuple:
+        return "[" + ",".join(_schema_json_text_from_frozen(item) for item in value) + "]"
+    if type(value) is _FrozenJSONMapping:
+        entries = cast(
+            tuple[tuple[str, JSONValue], ...],
+            object.__getattribute__(value, "_items"),
+        )
+        return "{" + ",".join(
+            json.dumps(key, ensure_ascii=False, allow_nan=False)
+            + ":"
+            + _schema_json_text_from_frozen(item)
+            for key, item in sorted(entries, key=lambda entry: entry[0])
+        ) + "}"
+    raise ValueError("schema JSON contains an unsupported frozen value")
+
+
+def _schema_canonical_json_bytes(value: JSONValue) -> bytes:
+    """Serialize schema-document JSON without narrowing exact Python integers."""
+
+    frozen = _freeze_schema_json_root(value, "schema")
+    return _schema_canonical_json_bytes_from_frozen(frozen, "schema")
+
+
+def _schema_json_container(
+    value: JSONValue,
+) -> JSONScalar | dict[str, object] | list[object]:
+    """Return detached built-in containers for validated schema-document JSON."""
+
+    frozen = _freeze_schema_json_root(value, "schema")
+    return _to_json_container(frozen)
 
 
 def canonical_json_bytes(value: JSONValue) -> bytes:
@@ -428,12 +550,12 @@ class SurfaceToolSpec:
         if type(self.description) is not str:
             raise ValueError("description must be a string")
         _require_utf8_text(self.description, "description")
-        input_schema = _freeze_mapping(self.input_schema, "input_schema")
+        input_schema = _freeze_schema_mapping(self.input_schema, "input_schema")
         object.__setattr__(self, "input_schema", input_schema)
         object.__setattr__(
             self,
             "_input_schema_canonical",
-            _canonical_json_bytes_from_frozen(input_schema, "input_schema"),
+            _schema_canonical_json_bytes_from_frozen(input_schema, "input_schema"),
         )
 
     def __eq__(self, other: object) -> bool:
@@ -552,7 +674,7 @@ def _surface_tool_spec_has_canonical_shape(value: object) -> bool:
     return (
         type(object.__getattribute__(tool, "name")) is str
         and type(object.__getattribute__(tool, "description")) is str
-        and _is_frozen_mapping(object.__getattribute__(tool, "input_schema"))
+        and _is_frozen_schema_mapping(object.__getattribute__(tool, "input_schema"))
         and type(object.__getattribute__(tool, "_input_schema_canonical")) is bytes
     )
 

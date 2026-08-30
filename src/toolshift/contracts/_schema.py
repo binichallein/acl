@@ -27,6 +27,7 @@ from toolshift.types import (
     SemanticAction,
     SurfaceToolSpec,
     _is_frozen_mapping,
+    _schema_canonical_json_bytes,
     _schema_variant_has_canonical_shape,
     _semantic_action_has_canonical_shape,
     canonical_json_bytes,
@@ -155,7 +156,7 @@ def schema_fingerprint(variant: SchemaVariant) -> str:
     for tool in variant.tools:
         _update_framed(digest, canonical_json_bytes(tool.name))
         _update_framed(digest, canonical_json_bytes(tool.description))
-        _update_framed(digest, canonical_json_bytes(tool.input_schema))
+        _update_framed(digest, _schema_canonical_json_bytes(tool.input_schema))
     _update_framed(digest, canonical_json_bytes(variant.manifest))
     return digest.hexdigest()
 

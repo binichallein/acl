@@ -139,6 +139,78 @@ def test_build_appworld_adapter_snapshots_sorts_and_closes_catalog() -> None:
     assert catalog == original
 
 
+def test_appworld_catalog_preserves_wide_schema_integers_and_builds_witness() -> None:
+    wide = 2**80 + 123
+    catalog = [
+        _tool(
+            "synthetic__bounded_count",
+            properties={
+                "count": {
+                    "type": "integer",
+                    "maximum": wide,
+                    "default": wide,
+                    "examples": [wide],
+                }
+            },
+            required=["count"],
+        )
+    ]
+    adapter = AppWorldSemanticAdapter(catalog)
+
+    function = catalog[0]["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    properties = parameters["properties"]
+    assert isinstance(properties, dict)
+    count = properties["count"]
+    assert isinstance(count, dict)
+    count["maximum"] = 0
+    count["default"] = 0
+    count["examples"] = [0]
+
+    frozen_count = adapter.variant.tools[0].input_schema["properties"]["count"]
+    assert frozen_count["maximum"] == wide
+    assert frozen_count["default"] == wide
+    assert frozen_count["examples"] == (wide,)
+    calls = appworld_adapter_module.build_minimal_source_calls(adapter)
+    assert calls == (
+        {"name": "synthetic__bounded_count", "arguments": {"count": 0}},
+    )
+    assert adapter.surface_to_semantic(calls[0])[0].arguments["count"] == 0
+
+
+def test_appworld_selected_schema_detects_nested_wide_integer_tampering() -> None:
+    wide = 2**80 + 123
+    adapter = AppWorldSemanticAdapter(
+        [
+            _tool(
+                "synthetic__bounded_count",
+                properties={
+                    "count": {"type": "integer", "maximum": wide},
+                },
+                required=["count"],
+            )
+        ]
+    )
+    schema = adapter.variant.tools[0].input_schema
+    count_schema = schema["properties"]["count"]
+    items = object.__getattribute__(count_schema, "_items")
+    tampered_items = tuple(
+        (key, wide + 1 if key == "maximum" else value) for key, value in items
+    )
+
+    object.__setattr__(count_schema, "_items", tampered_items)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^AppWorld adapter integrity validation failed$",
+    ):
+        adapter.surface_to_semantic(
+            {"name": "synthetic__bounded_count", "arguments": {"count": 0}}
+        )
+
+
 def test_appworld_adapter_can_be_constructed_directly() -> None:
     direct = AppWorldSemanticAdapter(_catalog())
     built = build_appworld_adapter(_catalog())

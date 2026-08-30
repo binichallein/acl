@@ -22,6 +22,9 @@ from toolshift.types import (
     SurfaceToolSpec,
     _execution_trace_has_canonical_shape,
     _freeze_json_root,
+    _freeze_schema_json_root,
+    _schema_canonical_json_bytes,
+    _schema_json_container,
     _semantic_action_has_canonical_shape,
     canonical_json_bytes,
 )
@@ -286,8 +289,8 @@ def _snapshot_catalog(
         if any(type(entry) is not dict for entry in snapshots):
             raise _CatalogSnapshotError
         plain = cast(tuple[dict[str, object], ...], snapshots)
-        frozen = _freeze_json_root(plain, "AppWorld catalog")
-        canonical = canonical_json_bytes(frozen)
+        frozen = _freeze_schema_json_root(plain, "AppWorld catalog")
+        canonical = _schema_canonical_json_bytes(frozen)
         return plain, frozen, canonical
     except _CatalogSnapshotError:
         raise ValueError(_CATALOG_ERROR) from None
@@ -675,6 +678,13 @@ def _snapshot_runtime_mapping(
 def _plain_json(value: JSONValue, error_message: str) -> object:
     try:
         return json.loads(canonical_json_bytes(value).decode("utf-8"))
+    except Exception:
+        raise ValueError(error_message) from None
+
+
+def _plain_schema_json(value: JSONValue, error_message: str) -> object:
+    try:
+        return _schema_json_container(value)
     except Exception:
         raise ValueError(error_message) from None
 
@@ -1691,7 +1701,7 @@ class AppWorldSemanticAdapter(SemanticAdapter):
                     app_name,
                     api_name,
                     tool.input_schema,
-                    canonical_json_bytes(tool.input_schema),
+                    _schema_canonical_json_bytes(tool.input_schema),
                     validator,
                 )
             variant = SchemaVariant(_VARIANT_ID, tuple(tools), _VARIANT_MANIFEST)
@@ -1862,7 +1872,7 @@ class AppWorldSemanticAdapter(SemanticAdapter):
                 != seal.schema_canonical
                 or object.__getattribute__(seal.binding, "validator") is not validator
                 or object.__getattribute__(validator, "schema") is not seal.schema
-                or canonical_json_bytes(seal.schema) != seal.schema_canonical
+                or _schema_canonical_json_bytes(seal.schema) != seal.schema_canonical
                 or not _validator_seal_matches(seal.validator_seal)
             ):
                 raise _AdapterIntegrityError(_INTEGRITY_ERROR)
@@ -2084,7 +2094,10 @@ def build_minimal_source_calls(
             for seal in runtime_seals:
                 source_adapter._require_selected_schema_integrity(seal)
                 try:
-                    schema = _plain_json(cast(JSONValue, seal.schema), _WITNESS_ERROR)
+                    schema = _plain_schema_json(
+                        cast(JSONValue, seal.schema),
+                        _WITNESS_ERROR,
+                    )
                     if type(schema) is not dict:
                         raise _WitnessGenerationError
                     _audit_witness_schema(schema)
