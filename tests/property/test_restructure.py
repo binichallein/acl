@@ -9,6 +9,8 @@ from typing import cast
 
 import pytest
 
+import toolshift.transforms.restructure as restructure_module
+from toolshift.adapters.semantic import SemanticAdapter
 from toolshift.contracts.schema import schema_fingerprint
 from toolshift.transforms.base import (
     OperatorManifestEntry,
@@ -22,7 +24,15 @@ from toolshift.transforms.restructure import (
     ParameterRestructureTransform,
     build_parameter_restructure_transform,
 )
-from toolshift.types import JSONValue, SchemaVariant, SurfaceToolSpec, manifest_sha256
+from toolshift.types import (
+    ExecutionTrace,
+    JSONValue,
+    SchemaVariant,
+    SemanticAction,
+    SurfaceToolSpec,
+    canonical_json_bytes,
+    manifest_sha256,
+)
 
 
 def _search_schema() -> dict[str, JSONValue]:
@@ -92,11 +102,95 @@ def _search_rule(
     return ParameterGroupRule("search", container_name, moved_parameters)
 
 
+class _RecordingRestructureSource(SemanticAdapter):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        self._tool_names = frozenset(tool.name for tool in variant.tools)
+        self.parse_inputs: list[Mapping[str, JSONValue]] = []
+        self.parse_results: list[tuple[SemanticAction, ...]] = []
+        self.compile_inputs: list[SemanticAction] = []
+        self.compile_results: list[tuple[Mapping[str, JSONValue], ...]] = []
+        self.wrap_inputs: list[
+            tuple[
+                Mapping[str, JSONValue],
+                tuple[SemanticAction, ...],
+                tuple[tuple[JSONValue, ...], ...],
+            ]
+        ] = []
+        self.trace_inputs: list[ExecutionTrace] = []
+
+    def surface_to_semantic(
+        self,
+        surface_call: Mapping[str, JSONValue],
+    ) -> tuple[SemanticAction, ...]:
+        self.parse_inputs.append(surface_call)
+        name = surface_call.get("name")
+        arguments = surface_call.get("arguments")
+        if type(name) is not str or name not in self._tool_names:
+            raise ValueError("PRIVATE_PARSE_PAYLOAD")
+        if not isinstance(arguments, Mapping):
+            raise ValueError("PRIVATE_PARSE_PAYLOAD")
+        result = (SemanticAction(name, arguments),)
+        self.parse_results.append(result)
+        return result
+
+    def semantic_to_base_calls(
+        self,
+        action: SemanticAction,
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self.compile_inputs.append(action)
+        result = ({"name": action.name, "arguments": action.arguments},)
+        self.compile_results.append(result)
+        return result
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self.wrap_inputs.append((surface_call, actions, base_observation_groups))
+        return base_observation_groups[0][0]
+
+    def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
+        self.trace_inputs.append(trace)
+        return trace.semantic_actions
+
+
+class _ExplodingCallMapping(dict[str, JSONValue]):
+    def items(self):
+        raise RuntimeError("PRIVATE_CALLBACK_PAYLOAD")
+
+
+def _apply_restructure(
+    source: SemanticAdapter | None = None,
+    *,
+    rules: tuple[ParameterGroupRule, ...] | None = None,
+):
+    source_adapter = source or _RecordingRestructureSource(_base_variant())
+    return restructure_module.apply_parameter_restructure(
+        source_adapter,
+        rules=rules or (_search_rule(),),
+        seed=7,
+    )
+
+
 def test_parameter_restructure_abi_hash_has_fixed_vector() -> None:
     assert (
         PARAMETER_RESTRUCTURE_VERSION_HASH
         == "6a170c4eb544cda3798a4106d30625e9cf25b46878fbea7e27589895348d45ac"
     )
+
+
+def test_restructure_module_exports_adapter_and_apply_helper() -> None:
+    assert restructure_module.__all__ == [
+        "PARAMETER_RESTRUCTURE_VERSION_HASH",
+        "ParameterGroupRule",
+        "ParameterRestructureAdapter",
+        "ParameterRestructureTransform",
+        "apply_parameter_restructure",
+        "build_parameter_restructure_transform",
+    ]
 
 
 def test_parameter_group_rule_is_normalized_frozen_unhashable_value() -> None:
@@ -1171,3 +1265,852 @@ def test_variant_id_is_the_full_manifest_digest() -> None:
         "operators",
     }
     assert transform.variant.manifest["composition_order"] == ("restructure-000",)
+
+
+@pytest.mark.parametrize(
+    "explicit_value",
+    [
+        None,
+        False,
+        0,
+        "",
+        [],
+        {},
+        ["值", {"nested": [0, False, None]}],
+    ],
+)
+def test_call_translation_round_trip_preserves_falsey_values_and_metadata(
+    explicit_value: JSONValue,
+) -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    canonical_call: dict[str, JSONValue] = {
+        "name": "search",
+        "arguments": {
+            "query": "雪",
+            "limit": explicit_value,
+            "locale": "zh-CN",
+        },
+        "request_id": "请求-1",
+        "metadata": {"attempt": 0, "flags": [False, None]},
+    }
+    original = copy.deepcopy(canonical_call)
+
+    surface = transform.canonical_call_to_surface(canonical_call)
+    surface_arguments = surface["arguments"]
+    assert isinstance(surface_arguments, Mapping)
+    request = surface_arguments["request"]
+    assert isinstance(request, Mapping)
+    assert request["query"] == "雪"
+    assert "limit" in request
+    assert canonical_json_bytes(request["limit"]) == canonical_json_bytes(explicit_value)
+    assert surface_arguments["locale"] == "zh-CN"
+    assert surface["request_id"] == "请求-1"
+    assert canonical_json_bytes(surface["metadata"]) == canonical_json_bytes(
+        canonical_call["metadata"]
+    )
+
+    round_trip = transform.surface_call_to_canonical(surface)
+    assert canonical_json_bytes(round_trip) == canonical_json_bytes(canonical_call)
+    assert canonical_call == original
+    with pytest.raises(TypeError):
+        surface_arguments["changed"] = True  # type: ignore[index]
+    with pytest.raises(TypeError):
+        request["changed"] = True  # type: ignore[index]
+
+
+def test_call_translation_preserves_optional_absence_and_creates_empty_container() -> None:
+    base = _base_variant()
+    selective = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    without_limit = {
+        "name": "search",
+        "arguments": {"query": "alpha", "locale": None},
+    }
+
+    surface = selective.canonical_call_to_surface(without_limit)
+    surface_arguments = surface["arguments"]
+    assert isinstance(surface_arguments, Mapping)
+    request = surface_arguments["request"]
+    assert isinstance(request, Mapping)
+    assert set(request) == {"query"}
+    assert "limit" not in request
+    assert canonical_json_bytes(selective.surface_call_to_canonical(surface)) == (
+        canonical_json_bytes(without_limit)
+    )
+
+    optional_only = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(("limit",)),),
+        seed=7,
+    )
+    optional_surface = optional_only.canonical_call_to_surface(without_limit)
+    optional_arguments = optional_surface["arguments"]
+    assert isinstance(optional_arguments, Mapping)
+    assert optional_arguments["request"] == {}
+    assert canonical_json_bytes(optional_only.surface_call_to_canonical(optional_surface)) == (
+        canonical_json_bytes(without_limit)
+    )
+
+
+def test_whole_wrap_call_translation_moves_every_present_parameter() -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(("query", "limit", "locale")),),
+        seed=7,
+    )
+    canonical = {
+        "name": "search",
+        "arguments": {"query": "alpha", "locale": None},
+    }
+
+    surface = transform.canonical_call_to_surface(canonical)
+    assert surface["arguments"] == {
+        "request": {"query": "alpha", "locale": None},
+    }
+    assert canonical_json_bytes(transform.surface_call_to_canonical(surface)) == (
+        canonical_json_bytes(canonical)
+    )
+
+
+def test_identity_tool_calls_are_frozen_without_parameter_mode_classification() -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    identity_call = {
+        "name": "status",
+        "arguments": {
+            "request": {"query": "literal"},
+            "query": "also-literal",
+            "nested": [1, {"ok": False}],
+        },
+        "metadata": {"empty": {}},
+    }
+
+    canonical = transform.surface_call_to_canonical(identity_call)
+    surface = transform.canonical_call_to_surface(identity_call)
+
+    assert canonical_json_bytes(canonical) == canonical_json_bytes(identity_call)
+    assert canonical_json_bytes(surface) == canonical_json_bytes(identity_call)
+    assert canonical is not identity_call
+    assert surface is not identity_call
+    arguments = canonical["arguments"]
+    assert isinstance(arguments, Mapping)
+    with pytest.raises(TypeError):
+        arguments["changed"] = True  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"name": "unknown", "arguments": {}},
+        {"arguments": {"locale": "en", "request": {"query": "alpha"}}},
+        {"name": 7, "arguments": {}},
+        {"name": "search"},
+        {"name": "search", "arguments": "PRIVATE_ARGUMENTS"},
+        {"name": "status", "arguments": "PRIVATE_IDENTITY_ARGUMENTS"},
+        {"name": "search", "arguments": {"query": "alpha", "locale": "en"}},
+        {
+            "name": "search",
+            "arguments": {"locale": "en", "request": "PRIVATE_CONTAINER"},
+        },
+        {
+            "name": "search",
+            "arguments": {
+                "query": "hybrid",
+                "locale": "en",
+                "request": {"query": "alpha"},
+            },
+        },
+        {
+            "name": "search",
+            "arguments": {
+                "locale": "en",
+                "PRIVATE_ROOT": True,
+                "request": {"query": "alpha"},
+            },
+        },
+        {
+            "name": "search",
+            "arguments": {
+                "locale": "en",
+                "request": {"query": "alpha", "PRIVATE_INNER": True},
+            },
+        },
+        {"name": "search", "arguments": {"request": {"query": "alpha"}}},
+        {"name": "search", "arguments": {"locale": "en", "request": {}}},
+    ],
+)
+def test_surface_call_translation_rejects_invalid_closed_shapes_without_payload(
+    call: object,
+) -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+
+    with pytest.raises(TransformValidationError) as caught:
+        transform.surface_call_to_canonical(call)  # type: ignore[arg-type]
+
+    assert "PRIVATE" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"name": "unknown", "arguments": {}},
+        {"arguments": {"query": "alpha", "locale": "en"}},
+        {"name": False, "arguments": {}},
+        {"name": "search"},
+        {"name": "search", "arguments": "PRIVATE_ARGUMENTS"},
+        {"name": "status", "arguments": "PRIVATE_IDENTITY_ARGUMENTS"},
+        {
+            "name": "search",
+            "arguments": {"query": "alpha", "locale": "en", "request": {}},
+        },
+        {
+            "name": "search",
+            "arguments": {"query": "alpha", "locale": "en", "PRIVATE_ROOT": True},
+        },
+        {"name": "search", "arguments": {"locale": "en"}},
+        {"name": "search", "arguments": {"query": "alpha"}},
+        {"name": "search", "arguments": {"query": "alpha", "locale": float("nan")}},
+        _ExplodingCallMapping(name="search", arguments={}),
+    ],
+)
+def test_canonical_call_translation_rejects_invalid_calls_without_payload(
+    call: object,
+) -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+
+    with pytest.raises(TransformValidationError) as caught:
+        transform.canonical_call_to_surface(call)  # type: ignore[arg-type]
+
+    assert "PRIVATE" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
+def test_trace_modes_preserve_canonical_and_neutral_identity_and_translate_surface() -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(
+            _search_rule(),
+            ParameterGroupRule("summarize", "payload", ("text",)),
+        ),
+        seed=7,
+    )
+    search_action = SemanticAction("search", {"query": "alpha", "locale": "en"})
+    canonical_search = {
+        "name": "search",
+        "arguments": {"query": "alpha", "locale": "en"},
+    }
+    surface_search = {
+        "name": "search",
+        "arguments": {"locale": "en", "request": {"query": "alpha"}},
+    }
+    identity_call = {
+        "name": "status",
+        "arguments": {"request": {"query": "literal"}, "query": "literal"},
+    }
+    base_call = {"name": "search", "arguments": {"query": "alpha", "locale": "en"}}
+    canonical_trace = ExecutionTrace(
+        (canonical_search, identity_call),
+        (search_action,),
+        (base_call,),
+    )
+    neutral_trace = ExecutionTrace((identity_call,), (), ())
+    surface_trace = ExecutionTrace(
+        (surface_search, identity_call),
+        (search_action,),
+        (base_call,),
+    )
+
+    assert transform._trace_for_source(canonical_trace) is canonical_trace
+    assert transform._trace_for_source(neutral_trace) is neutral_trace
+    translated = transform._trace_for_source(surface_trace)
+    assert translated is not surface_trace
+    assert canonical_json_bytes(translated.surface_calls[0]) == canonical_json_bytes(
+        canonical_search
+    )
+    assert canonical_json_bytes(translated.surface_calls[1]) == canonical_json_bytes(identity_call)
+    assert translated.semantic_actions is surface_trace.semantic_actions
+    assert translated.semantic_actions[0] is search_action
+    assert canonical_json_bytes(translated.base_calls) == canonical_json_bytes(
+        surface_trace.base_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "surface_calls",
+    [
+        (
+            {
+                "name": "search",
+                "arguments": {"locale": "en", "request": {"query": "alpha"}},
+            },
+            {"name": "summarize", "arguments": {"text": "alpha"}},
+        ),
+        (
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "hybrid",
+                    "locale": "en",
+                    "request": {"query": "alpha"},
+                },
+            },
+        ),
+        ({"name": "unknown", "arguments": {}},),
+        ({"name": "search", "arguments": {"query": "alpha"}},),
+        (
+            {
+                "name": "search",
+                "arguments": {
+                    "locale": "en",
+                    "request": {"query": "alpha", "PRIVATE_INNER": True},
+                },
+            },
+        ),
+    ],
+)
+def test_trace_rejects_mixed_hybrid_unknown_and_malformed_calls_before_source(
+    surface_calls: tuple[Mapping[str, JSONValue], ...],
+) -> None:
+    source = _RecordingRestructureSource(_base_variant())
+    adapter = _apply_restructure(
+        source,
+        rules=(
+            _search_rule(),
+            ParameterGroupRule("summarize", "payload", ("text",)),
+        ),
+    )
+    trace = ExecutionTrace(surface_calls, (), ())
+
+    with pytest.raises(TransformValidationError) as caught:
+        adapter.canonicalize_trace(trace)
+
+    assert "PRIVATE" not in str(caught.value)
+    assert source.trace_inputs == []
+
+
+class _StageErrorRestructureSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant, stage: str, error_type: type[Exception]) -> None:
+        super().__init__(variant)
+        self._stage = stage
+        self.error = error_type("PRIVATE_STAGE_PAYLOAD")
+
+    def _maybe_raise(self, stage: str) -> None:
+        if self._stage == stage:
+            raise self.error
+
+    def surface_to_semantic(
+        self,
+        surface_call: Mapping[str, JSONValue],
+    ) -> tuple[SemanticAction, ...]:
+        self._maybe_raise("parse")
+        return super().surface_to_semantic(surface_call)
+
+    def semantic_to_base_calls(
+        self,
+        action: SemanticAction,
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self._maybe_raise("compile")
+        return super().semantic_to_base_calls(action)
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self._maybe_raise("wrap")
+        return super().base_observation_to_surface(
+            surface_call,
+            actions,
+            base_observation_groups,
+        )
+
+    def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
+        self._maybe_raise("canonicalize")
+        return super().canonicalize_trace(trace)
+
+
+class _RebindingRestructureSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant, stage: str) -> None:
+        super().__init__(variant)
+        self._stage = stage
+        self._replacement = SchemaVariant(
+            "replacement-v1",
+            variant.tools,
+            {"operator": "replacement", "seed": 9},
+        )
+
+    def _rebind(self, stage: str) -> None:
+        if self._stage == stage:
+            self._variant = self._replacement
+
+    def surface_to_semantic(
+        self,
+        surface_call: Mapping[str, JSONValue],
+    ) -> tuple[SemanticAction, ...]:
+        result = super().surface_to_semantic(surface_call)
+        self._rebind("parse")
+        return result
+
+    def semantic_to_base_calls(
+        self,
+        action: SemanticAction,
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        result = super().semantic_to_base_calls(action)
+        self._rebind("compile")
+        return result
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        result = super().base_observation_to_surface(
+            surface_call,
+            actions,
+            base_observation_groups,
+        )
+        self._rebind("wrap")
+        return result
+
+    def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
+        result = super().canonicalize_trace(trace)
+        self._rebind("canonicalize")
+        return result
+
+
+class _RebindThenRaiseRestructureSource(_RebindingRestructureSource):
+    def __init__(self, variant: SchemaVariant, stage: str, error_type: type[Exception]) -> None:
+        super().__init__(variant, stage)
+        self.error = error_type("PRIVATE_REBIND_PAYLOAD")
+
+    def _raise_after_rebind(self, stage: str) -> None:
+        self._rebind(stage)
+        raise self.error
+
+    def surface_to_semantic(
+        self,
+        surface_call: Mapping[str, JSONValue],
+    ) -> tuple[SemanticAction, ...]:
+        self._raise_after_rebind("parse")
+
+    def semantic_to_base_calls(
+        self,
+        action: SemanticAction,
+    ) -> tuple[Mapping[str, JSONValue], ...]:
+        self._raise_after_rebind("compile")
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self._raise_after_rebind("wrap")
+
+    def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
+        self._raise_after_rebind("canonicalize")
+
+
+class _PublicLieRestructureSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        self._public_variant = _base_variant()
+
+    @property
+    def variant(self) -> SchemaVariant:
+        return self._public_variant
+
+
+class _PayloadPublicRestructureSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant) -> None:
+        self.raise_public = False
+        super().__init__(variant)
+
+    @property
+    def variant(self) -> SchemaVariant:
+        if self.raise_public:
+            raise RuntimeError("PRIVATE_PUBLIC_VARIANT_PAYLOAD")
+        return super().variant
+
+
+def _invoke_restructure_stage(adapter: object, stage: str) -> object:
+    surface_call = {
+        "name": "search",
+        "arguments": {"locale": "en", "request": {"query": "alpha"}},
+    }
+    canonical_call = {
+        "name": "search",
+        "arguments": {"query": "alpha", "locale": "en"},
+    }
+    action = SemanticAction("search", {"query": "alpha", "locale": "en"})
+    if stage == "parse":
+        return adapter.surface_to_semantic(surface_call)  # type: ignore[attr-defined]
+    if stage == "compile":
+        return adapter.semantic_to_base_calls(action)  # type: ignore[attr-defined]
+    if stage == "wrap":
+        return adapter.base_observation_to_surface(  # type: ignore[attr-defined]
+            surface_call,
+            (action,),
+            (({"ok": True},),),
+        )
+    return adapter.canonicalize_trace(  # type: ignore[attr-defined]
+        ExecutionTrace((surface_call,), (action,), (canonical_call,))
+    )
+
+
+def test_parameter_restructure_adapter_delegates_pipeline_objects_exactly_once() -> None:
+    source = _RecordingRestructureSource(_base_variant())
+    adapter = _apply_restructure(source)
+    surface_call = {
+        "name": "search",
+        "arguments": {
+            "locale": "zh-CN",
+            "request": {"query": "雪", "limit": 0},
+        },
+        "metadata": {"retry": False},
+    }
+
+    actions = adapter.surface_to_semantic(surface_call)
+    assert actions is source.parse_results[0]
+    delegated_parse = source.parse_inputs[0]
+    assert delegated_parse == {
+        "name": "search",
+        "arguments": {"locale": "zh-CN", "query": "雪", "limit": 0},
+        "metadata": {"retry": False},
+    }
+
+    base_calls = adapter.semantic_to_base_calls(actions[0])
+    assert source.compile_inputs == [actions[0]]
+    assert base_calls is source.compile_results[0]
+
+    observation: JSONValue = {"items": ["雪", False, None]}
+    groups = ((observation,),)
+    wrapped = adapter.base_observation_to_surface(surface_call, actions, groups)
+    delegated_call, delegated_actions, delegated_groups = source.wrap_inputs[0]
+    assert delegated_call == delegated_parse
+    assert delegated_actions is actions
+    assert delegated_groups is groups
+    assert wrapped is observation
+    assert len(source.parse_inputs) == len(source.compile_inputs) == len(source.wrap_inputs) == 1
+
+
+def test_adapter_canonicalize_trace_preserves_source_trace_and_action_identity() -> None:
+    source = _RecordingRestructureSource(_base_variant())
+    adapter = _apply_restructure(source)
+    action = SemanticAction("search", {"query": "alpha", "locale": "en"})
+    canonical_call = {
+        "name": "search",
+        "arguments": {"query": "alpha", "locale": "en"},
+    }
+    surface_call = {
+        "name": "search",
+        "arguments": {"locale": "en", "request": {"query": "alpha"}},
+    }
+    canonical_trace = ExecutionTrace((canonical_call,), (action,), (canonical_call,))
+    neutral_trace = ExecutionTrace(
+        ({"name": "status", "arguments": {"request": {}, "query": "literal"}},),
+        (),
+        (),
+    )
+    surface_trace = ExecutionTrace((surface_call,), (action,), (canonical_call,))
+
+    canonical_result = adapter.canonicalize_trace(canonical_trace)
+    neutral_result = adapter.canonicalize_trace(neutral_trace)
+    surface_result = adapter.canonicalize_trace(surface_trace)
+
+    assert canonical_result is canonical_trace.semantic_actions
+    assert neutral_result is neutral_trace.semantic_actions
+    assert surface_result is surface_trace.semantic_actions
+    assert source.trace_inputs[0] is canonical_trace
+    assert source.trace_inputs[1] is neutral_trace
+    delegated_surface = source.trace_inputs[2]
+    assert delegated_surface is not surface_trace
+    assert delegated_surface.semantic_actions is surface_trace.semantic_actions
+    assert delegated_surface.semantic_actions[0] is action
+    assert canonical_json_bytes(delegated_surface.surface_calls[0]) == canonical_json_bytes(
+        canonical_call
+    )
+    assert canonical_json_bytes(delegated_surface.base_calls) == canonical_json_bytes(
+        surface_trace.base_calls
+    )
+
+
+@pytest.mark.parametrize("stage", ["parse", "compile", "wrap", "canonicalize"])
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_source_errors_follow_stage_specific_static_delegation_policy(
+    stage: str,
+    error_type: type[Exception],
+) -> None:
+    source = _StageErrorRestructureSource(_base_variant(), stage, error_type)
+    adapter = _apply_restructure(source)
+    expected_errors = {
+        "parse": "source adapter rejected the translated surface call",
+        "compile": "source adapter rejected the semantic action",
+        "wrap": "source adapter rejected observation wrapping",
+        "canonicalize": "source adapter rejected trace canonicalization",
+    }
+
+    if error_type is ValueError:
+        with pytest.raises(TransformValidationError) as caught:
+            _invoke_restructure_stage(adapter, stage)
+        assert str(caught.value) == expected_errors[stage]
+        assert caught.value.__cause__ is None
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            _invoke_restructure_stage(adapter, stage)
+        assert caught.value is source.error
+
+
+@pytest.mark.parametrize("stage", ["parse", "compile", "wrap", "canonicalize"])
+@pytest.mark.parametrize("outcome", ["return", "value_error", "runtime_error"])
+def test_final_binding_failure_overrides_every_stage_callback_outcome(
+    stage: str,
+    outcome: str,
+) -> None:
+    if outcome == "return":
+        source: _RecordingRestructureSource = _RebindingRestructureSource(
+            _base_variant(),
+            stage,
+        )
+    else:
+        error_type = ValueError if outcome == "value_error" else RuntimeError
+        source = _RebindThenRaiseRestructureSource(_base_variant(), stage, error_type)
+    adapter = _apply_restructure(source)
+
+    with pytest.raises(TransformValidationError, match="binding") as caught:
+        _invoke_restructure_stage(adapter, stage)
+
+    assert "PRIVATE" not in str(caught.value)
+
+
+def test_preexisting_binding_failure_prevents_source_callback() -> None:
+    base = _base_variant()
+    source = _RecordingRestructureSource(base)
+    adapter = _apply_restructure(source)
+    object.__setattr__(source, "_variant", _base_variant())
+
+    with pytest.raises(TransformValidationError, match="binding"):
+        adapter.surface_to_semantic(
+            {
+                "name": "search",
+                "arguments": {"locale": "en", "request": {"query": "alpha"}},
+            }
+        )
+
+    assert source.parse_inputs == []
+
+
+def test_adapter_construction_requires_exact_raw_and_public_source_binding() -> None:
+    base = _base_variant()
+    transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    equal_but_distinct = _base_variant()
+
+    with pytest.raises(TransformValidationError, match="binding"):
+        restructure_module.ParameterRestructureAdapter(
+            _RecordingRestructureSource(equal_but_distinct),
+            transform,
+        )
+    with pytest.raises(TransformValidationError, match="binding"):
+        restructure_module.ParameterRestructureAdapter(
+            _PublicLieRestructureSource(base),
+            transform,
+        )
+
+
+def test_public_variant_callback_payload_is_sanitized_at_init_and_runtime() -> None:
+    base = _base_variant()
+    initial_source = _PayloadPublicRestructureSource(base)
+    initial_source.raise_public = True
+    transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    with pytest.raises(TransformValidationError) as initial_error:
+        restructure_module.ParameterRestructureAdapter(initial_source, transform)
+    assert "PRIVATE_PUBLIC_VARIANT_PAYLOAD" not in str(initial_error.value)
+
+    runtime_source = _PayloadPublicRestructureSource(base)
+    adapter = restructure_module.ParameterRestructureAdapter(runtime_source, transform)
+    runtime_source.raise_public = True
+    with pytest.raises(TransformValidationError) as runtime_error:
+        adapter.surface_to_semantic(
+            {
+                "name": "search",
+                "arguments": {"locale": "en", "request": {"query": "alpha"}},
+            }
+        )
+    assert "PRIVATE_PUBLIC_VARIANT_PAYLOAD" not in str(runtime_error.value)
+
+
+def test_runtime_binding_rejects_adapter_transform_and_final_variant_replacement() -> None:
+    base = _base_variant()
+    source = _RecordingRestructureSource(base)
+    adapter = _apply_restructure(source)
+    valid_call = {
+        "name": "search",
+        "arguments": {"locale": "en", "request": {"query": "alpha"}},
+    }
+
+    object.__setattr__(adapter, "_source_adapter", _RecordingRestructureSource(base))
+    with pytest.raises(TransformValidationError, match="binding"):
+        adapter.surface_to_semantic(valid_call)
+
+    source = _RecordingRestructureSource(base)
+    adapter = _apply_restructure(source)
+    replacement_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    object.__setattr__(adapter, "_transform", replacement_transform)
+    with pytest.raises(TransformValidationError, match="binding"):
+        adapter.surface_to_semantic(valid_call)
+
+    source = _RecordingRestructureSource(base)
+    adapter = _apply_restructure(source)
+    object.__setattr__(adapter, "_variant", base)
+    with pytest.raises(TransformValidationError, match="binding"):
+        adapter.surface_to_semantic(valid_call)
+
+
+def test_transform_runtime_seals_reject_root_replacement() -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    object.__setattr__(transform, "source_variant", _base_variant())
+
+    with pytest.raises(TransformValidationError, match="integrity"):
+        transform.canonical_call_to_surface(
+            {
+                "name": "search",
+                "arguments": {"query": "alpha", "locale": "en"},
+            }
+        )
+
+
+def test_transform_runtime_lookup_index_tamper_fails_closed_for_changed_tool() -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    lookup = object.__getattribute__(transform, "_plans_by_tool")
+    index = object.__getattribute__(lookup, "_index")
+    index.clear()
+
+    with pytest.raises(TransformValidationError, match="integrity"):
+        transform.canonical_call_to_surface(
+            {
+                "name": "search",
+                "arguments": {"query": "alpha", "locale": "en"},
+            }
+        )
+
+
+def test_helper_and_direct_adapter_reject_implicit_composition() -> None:
+    first = _apply_restructure()
+
+    with pytest.raises(
+        TransformValidationError,
+        match=r"^parameter restructure composition requires the explicit compose transform$",
+    ):
+        restructure_module.apply_parameter_restructure(
+            first,
+            rules=(_search_rule(),),
+            seed=8,
+        )
+
+    clean_base = _base_variant()
+    clean_transform = build_parameter_restructure_transform(
+        clean_base,
+        rules=(_search_rule(),),
+        seed=8,
+    )
+    with pytest.raises(
+        TransformValidationError,
+        match=r"^parameter restructure composition requires the explicit compose transform$",
+    ):
+        restructure_module.ParameterRestructureAdapter(first, clean_transform)
+
+
+def test_online_translation_uses_only_precomputed_plans_and_runtime_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+
+    def unexpected_construction_read(*args: object, **kwargs: object) -> object:
+        pytest.fail("online translation performed construction-time schema work")
+
+    monkeypatch.setattr(restructure_module, "schema_fingerprint", unexpected_construction_read)
+    monkeypatch.setattr(restructure_module, "canonical_json_bytes", unexpected_construction_read)
+    monkeypatch.setattr(restructure_module, "_admit_changed_schema", unexpected_construction_read)
+    monkeypatch.setattr(
+        restructure_module,
+        "_build_restructured_tools",
+        unexpected_construction_read,
+    )
+    monkeypatch.setattr(
+        restructure_module,
+        "_build_translation_plans",
+        unexpected_construction_read,
+    )
+    monkeypatch.setattr(
+        restructure_module,
+        "_make_schema_runtime_seal",
+        unexpected_construction_read,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        restructure_module,
+        "_make_operator_runtime_seal",
+        unexpected_construction_read,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        restructure_module,
+        "_make_mapping_root_seal",
+        unexpected_construction_read,
+        raising=False,
+    )
+
+    canonical = {
+        "name": "search",
+        "arguments": {"query": "alpha", "locale": "en"},
+    }
+    for _ in range(5):
+        surface = transform.canonical_call_to_surface(canonical)
+        assert canonical_json_bytes(transform.surface_call_to_canonical(surface)) == (
+            canonical_json_bytes(canonical)
+        )
