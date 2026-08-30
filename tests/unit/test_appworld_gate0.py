@@ -1867,6 +1867,10 @@ def test_editable_checkout_pin_uses_direct_url_and_exact_revision(
     monkeypatch.setattr(gate0_module.subprocess, "run", git_run)
     monkeypatch.setattr(gate0_module, "_require_head_worktree_match", require_raw_match)
 
+    checkout.chmod(0o755)
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        gate0_module._require_editable_appworld_checkout()
+    checkout.chmod(0o700)
     assert gate0_module._require_editable_appworld_checkout() == checkout
 
     attached = True
@@ -1896,6 +1900,7 @@ def test_editable_checkout_pin_ignores_local_core_worktree_redirect(
     checkout = tmp_path / "checkout"
     shadow = tmp_path / "shadow"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -1973,6 +1978,7 @@ def test_editable_checkout_pin_rejects_tracked_changes_hidden_by_index_flags(
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -2033,6 +2039,7 @@ def test_editable_checkout_pin_accepts_real_clean_detached_checkout(
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -2078,6 +2085,7 @@ def test_editable_checkout_pin_rejects_staged_only_change(
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -2137,6 +2145,7 @@ def test_editable_checkout_pin_rejects_local_attribute_filter_override(
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -2209,6 +2218,7 @@ def test_editable_checkout_pin_verifies_expanded_lfs_payload_bytes(
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -2262,6 +2272,93 @@ def test_editable_checkout_pin_verifies_expanded_lfs_payload_bytes(
     assert raised.value.__cause__ is None
 
 
+def test_bundle_member_binding_accepts_only_exact_tracked_regular_collisions() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    tracked_path = b"src/appworld/apps/synthetic/LICENSE"
+    tracked_payload = b"synthetic tracked payload\n"
+    seen_targets: set[bytes] = set()
+    expected_untracked: dict[bytes, bytes] = {}
+
+    gate0_module._bind_appworld_bundle_member(
+        seen_targets,
+        expected_untracked,
+        {tracked_path: tracked_payload},
+        {tracked_path: b"100644"},
+        tracked_path,
+        tracked_payload,
+    )
+    assert expected_untracked == {}
+
+    with pytest.raises(ValueError):
+        gate0_module._bind_appworld_bundle_member(
+            set(),
+            expected_untracked,
+            {tracked_path: tracked_payload},
+            {tracked_path: b"100644"},
+            tracked_path,
+            b"tampered",
+        )
+    with pytest.raises(ValueError):
+        gate0_module._bind_appworld_bundle_member(
+            set(),
+            expected_untracked,
+            {tracked_path: tracked_payload},
+            {tracked_path: b"120000"},
+            tracked_path,
+            tracked_payload,
+        )
+
+    expanded_payload = b"synthetic expanded payload\n"
+    pointer = (
+        b"version https://git-lfs.github.com/spec/v1\n"
+        + b"oid sha256:"
+        + hashlib.sha256(expanded_payload).hexdigest().encode("ascii")
+        + b"\nsize "
+        + str(len(expanded_payload)).encode("ascii")
+        + b"\n"
+    )
+    gate0_module._bind_appworld_bundle_member(
+        set(),
+        expected_untracked,
+        {tracked_path: pointer},
+        {tracked_path: b"100644"},
+        tracked_path,
+        expanded_payload,
+    )
+    assert expected_untracked == {}
+
+    untracked_path = b"src/appworld/apps/synthetic/runtime.py"
+    gate0_module._bind_appworld_bundle_member(
+        seen_targets,
+        expected_untracked,
+        {tracked_path: tracked_payload},
+        {tracked_path: b"100644"},
+        untracked_path,
+        b"runtime payload",
+    )
+    assert expected_untracked == {untracked_path: b"runtime payload"}
+    with pytest.raises(ValueError):
+        gate0_module._bind_appworld_bundle_member(
+            seen_targets,
+            expected_untracked,
+            {tracked_path: tracked_payload},
+            {tracked_path: b"100644"},
+            untracked_path,
+            b"runtime payload",
+        )
+
+    with pytest.raises(ValueError):
+        gate0_module._bind_appworld_bundle_member(
+            seen_targets,
+            expected_untracked,
+            {tracked_path: tracked_payload},
+            {tracked_path: b"100644"},
+            tracked_path,
+            tracked_payload,
+        )
+
+
 @pytest.mark.parametrize(
     "relative",
     [
@@ -2279,6 +2376,7 @@ def test_editable_checkout_pin_rejects_untracked_runtime_input(
 
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    checkout.chmod(0o700)
     subprocess.run(
         ["git", "-C", str(checkout), "config", "user.email", "synthetic@example.invalid"],
         check=True,
@@ -2327,6 +2425,54 @@ def test_editable_checkout_pin_rejects_untracked_runtime_input(
     assert raised.value.__cause__ is None
 
 
+def test_dotenv_runtime_binds_import_to_pinned_distribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    package_file = tmp_path / "site-packages" / "dotenv" / "__init__.py"
+    package_file.parent.mkdir(parents=True)
+    package_file.write_text("", encoding="utf-8")
+    shadow_file = tmp_path / "shadow" / "dotenv" / "__init__.py"
+    shadow_file.parent.mkdir(parents=True)
+    shadow_file.write_text("", encoding="utf-8")
+
+    class Distribution:
+        version = "1.2.2"
+
+        @staticmethod
+        def locate_file(relative: str) -> Path:
+            assert relative == "dotenv/__init__.py"
+            return package_file
+
+    dotenv_module = ModuleType("dotenv")
+    dotenv_module.__file__ = str(package_file)
+    dotenv_module.load_dotenv = lambda *, stream, override: False  # type: ignore[attr-defined]
+    monkeypatch.delenv("TOOLSHIFT_DOTENV_DISABLED_PROBE", raising=False)
+    monkeypatch.setattr(
+        gate0_module.importlib.metadata,
+        "distribution",
+        lambda name: Distribution(),
+    )
+    monkeypatch.setattr(
+        gate0_module.importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(origin=str(package_file)),
+    )
+    monkeypatch.setattr(
+        gate0_module.importlib,
+        "import_module",
+        lambda name: dotenv_module,
+    )
+
+    gate0_module._require_pinned_dotenv_runtime()
+
+    dotenv_module.__file__ = str(shadow_file)
+    with pytest.raises(ValueError):
+        gate0_module._require_pinned_dotenv_runtime()
+
+
 def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2347,11 +2493,6 @@ def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
     monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     monkeypatch.setattr(gate0_module.sys, "version_info", (3, 11, 15, "final", 0))
     monkeypatch.setattr(gate0_module.sys, "dont_write_bytecode", True)
-    monkeypatch.setattr(
-        gate0_module.importlib.metadata,
-        "version",
-        lambda name: "1.2.2" if name == "python-dotenv" else "unexpected",
-    )
     monkeypatch.setattr(
         gate0_module,
         "_require_private_appworld_root",
@@ -2379,7 +2520,30 @@ def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
     monkeypatch.setitem(sys.modules, "appworld.common", common_module)
     monkeypatch.setitem(sys.modules, "appworld.common.constants", constants_module)
 
+    dotenv_file = tmp_path / "site-packages" / "dotenv" / "__init__.py"
+    dotenv_file.parent.mkdir(parents=True)
+    dotenv_file.write_text("", encoding="utf-8")
+
+    class DotenvDistribution:
+        version = "1.2.2"
+
+        @staticmethod
+        def locate_file(relative: str) -> Path:
+            assert relative == "dotenv/__init__.py"
+            return dotenv_file
+
+    monkeypatch.setattr(
+        gate0_module.importlib.metadata,
+        "distribution",
+        lambda name: DotenvDistribution(),
+    )
+    monkeypatch.setattr(
+        gate0_module.importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(origin=str(dotenv_file)),
+    )
     dotenv_module = ModuleType("dotenv")
+    dotenv_module.__file__ = str(dotenv_file)
     dotenv_module.load_dotenv = lambda *, stream, override: False  # type: ignore[attr-defined]
     original_import = gate0_module.importlib.import_module
 
@@ -2392,18 +2556,10 @@ def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
 
     gate0_module.require_pinned_appworld_runtime()
 
-    monkeypatch.setattr(
-        gate0_module.importlib.metadata,
-        "version",
-        lambda name: "1.1.1" if name == "python-dotenv" else "unexpected",
-    )
+    DotenvDistribution.version = "1.1.1"
     with pytest.raises(RuntimeError, match="preflight failed"):
         gate0_module.require_pinned_appworld_runtime()
-    monkeypatch.setattr(
-        gate0_module.importlib.metadata,
-        "version",
-        lambda name: "1.2.2" if name == "python-dotenv" else "unexpected",
-    )
+    DotenvDistribution.version = "1.2.2"
 
     def mutate_from_dotenv(*, stream: object, override: bool) -> bool:
         del stream, override

@@ -889,11 +889,16 @@ def test_appworld_runbook_explicitly_binds_tracked_clean_checkout_check() -> Non
         '"ls-tree", "-r", "-z", "--full-tree", "HEAD"',
         '"cat-file", "--batch"',
         "git_blob_sha1(payload)",
+        "head_modes = {relative: mode",
         "lfs_pointer(expected)",
         "hashlib.sha256()",
         "ast.parse(",
         "PBKDF2HMAC(",
         "zipfile.ZipFile(",
+        "if target in seen_bundle_targets:",
+        "member_payload = archive.read(info)",
+        "if target in head_payloads:",
+        "tracked_pointer = lfs_pointer(tracked_payload)",
         "untracked_paths != set(expected_untracked)",
         "path.read_bytes() != expected",
     ]
@@ -903,6 +908,8 @@ def test_appworld_runbook_explicitly_binds_tracked_clean_checkout_check() -> Non
     assert "core.fsmonitor=false" in before_verify
     assert "core.hooksPath=/dev/null" in before_verify
     assert "--no-replace-objects" in before_verify
+    assert "checkout_metadata.st_uid != os.geteuid()" in before_verify
+    assert "stat.S_IMODE(checkout_metadata.st_mode) != 0o700" in before_verify
     assert "Pinned AppWorld checkout binding validation failed" in before_verify
     assert "Pinned AppWorld tracked checkout is dirty" in before_verify
 

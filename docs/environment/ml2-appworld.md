@@ -213,6 +213,13 @@ import zipfile
 
 try:
     checkout = pathlib.Path(sys.argv[1]).resolve(strict=True)
+    checkout_metadata = checkout.lstat()
+    if (
+        not stat.S_ISDIR(checkout_metadata.st_mode)
+        or checkout_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(checkout_metadata.st_mode) != 0o700
+    ):
+        raise SystemExit(3)
     git_directory = checkout / ".git"
     git_stat = git_directory.lstat()
     if not stat.S_ISDIR(git_stat.st_mode) or stat.S_ISLNK(git_stat.st_mode):
@@ -390,6 +397,7 @@ try:
         raise SystemExit(4)
 
     head_payloads = {relative: payloads[oid] for _, oid, relative in entries}
+    head_modes = {relative: mode for mode, _, relative in entries}
     for mode, oid, relative in entries:
         path = checkout / os.fsdecode(relative)
         metadata = path.lstat()
@@ -456,6 +464,7 @@ try:
         (b"generate/.source/data.bundle", b"generate"),
     )
     expected_untracked = {}
+    seen_bundle_targets = set()
     for bundle_path, base_directory in bundle_layout:
         pointer = lfs_pointer(head_payloads[bundle_path])
         if pointer is None:
@@ -494,9 +503,27 @@ try:
                 ):
                     raise SystemExit(4)
                 target = base_directory + b"/" + raw_member
-                if target in expected_untracked or target in head_payloads:
+                if target in seen_bundle_targets:
                     raise SystemExit(4)
-                expected_untracked[target] = archive.read(info)
+                seen_bundle_targets.add(target)
+                member_payload = archive.read(info)
+                if target in head_payloads:
+                    if head_modes.get(target) not in (b"100644", b"100755"):
+                        raise SystemExit(4)
+                    tracked_payload = head_payloads[target]
+                    tracked_pointer = lfs_pointer(tracked_payload)
+                    if tracked_pointer is None:
+                        if member_payload != tracked_payload:
+                            raise SystemExit(4)
+                    else:
+                        tracked_digest, tracked_size = tracked_pointer
+                        if (
+                            len(member_payload) != tracked_size
+                            or hashlib.sha256(member_payload).hexdigest() != tracked_digest
+                        ):
+                            raise SystemExit(4)
+                    continue
+                expected_untracked[target] = member_payload
     if untracked_paths != set(expected_untracked):
         raise SystemExit(3)
     for raw_path, expected in expected_untracked.items():
@@ -539,11 +566,13 @@ The two data version files below the dedicated private `APPWORLD_ROOT` must both
 `0.2.0`. The path/size inventory and encrypted bundle hashes are recorded in the manifest;
 the path/size inventory is a structural reproducibility summary, not a content-integrity
 checksum. The audit decrypts the four already-verified LFS bundles in memory and requires the
-ignored unpacked files to match their exact path set and bytes; any additional untracked file,
-including caches or dotenv configuration, fails closed. It persists no protected content or
-derived fingerprint. At this revision, `verify tests --root` expects the unpacked repository
-tests below the selected root, so the commands copy that tree into the mode-`0700` private root
-before verification. The protected test copy never enters ToolShift Git.
+ignored unpacked files to match their exact path set and bytes. A bundle member that also
+exists in the tracked tree must be a regular file and must match the verified HEAD blob (or its
+expanded LFS payload) exactly. Any additional untracked file, including caches or dotenv
+configuration, fails closed. The audit persists no protected content or derived fingerprint.
+At this revision, `verify tests --root` expects the unpacked repository tests below the selected
+root, so the commands copy that tree into the mode-`0700` private root before verification. The
+protected test copy never enters ToolShift Git.
 
 ## Official verification
 

@@ -10,6 +10,7 @@ import ast
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.util
 import io
 import json
 import os
@@ -1560,9 +1561,37 @@ def _read_checkout_regular(root_fd: int, raw_path: bytes) -> bytes:
         os.close(parent_fd)
 
 
+def _bind_appworld_bundle_member(
+    seen_targets: set[bytes],
+    expected_files: dict[bytes, bytes],
+    head_payloads: Mapping[bytes, bytes],
+    head_modes: Mapping[bytes, bytes],
+    target: bytes,
+    payload: bytes,
+) -> None:
+    if target in seen_targets:
+        raise ValueError
+    seen_targets.add(target)
+    if target not in head_payloads:
+        expected_files[target] = payload
+        return
+    if head_modes.get(target) not in (b"100644", b"100755"):
+        raise ValueError
+    tracked_payload = head_payloads[target]
+    pointer = _parse_lfs_pointer(tracked_payload)
+    if pointer is None:
+        if payload != tracked_payload:
+            raise ValueError
+        return
+    expected_digest, expected_size = pointer
+    if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_digest:
+        raise ValueError
+
+
 def _decrypt_pinned_appworld_bundles(
     root_fd: int,
     head_payloads: Mapping[bytes, bytes],
+    head_modes: Mapping[bytes, bytes],
 ) -> dict[bytes, bytes]:
     try:
         from cryptography.hazmat.backends import default_backend
@@ -1574,6 +1603,7 @@ def _decrypt_pinned_appworld_bundles(
             head_payloads[b"src/appworld/common/constants.py"]
         )
         expected_files: dict[bytes, bytes] = {}
+        seen_targets: set[bytes] = set()
         for bundle_path, base_directory in _PINNED_APPWORLD_BUNDLE_LAYOUT:
             pointer = _parse_lfs_pointer(head_payloads[bundle_path])
             if pointer is None:
@@ -1612,9 +1642,14 @@ def _decrypt_pinned_appworld_bundles(
                     ):
                         raise ValueError
                     target = base_directory + b"/" + raw_member
-                    if target in expected_files or target in head_payloads:
-                        raise ValueError
-                    expected_files[target] = archive.read(info)
+                    _bind_appworld_bundle_member(
+                        seen_targets,
+                        expected_files,
+                        head_payloads,
+                        head_modes,
+                        target,
+                        archive.read(info),
+                    )
         return expected_files
     except BaseException:
         raise ValueError from None
@@ -1627,6 +1662,7 @@ def _require_untracked_source_layout(
     entries: tuple[tuple[bytes, bytes, str, bytes], ...],
 ) -> None:
     head_payloads = {os.fsencode(path): payload for _, _, path, payload in entries}
+    head_modes = {os.fsencode(path): mode for mode, _, path, _ in entries}
     untracked = subprocess.run(
         [*git_prefix, "ls-files", "--others", "-z", "--"],
         check=True,
@@ -1653,7 +1689,7 @@ def _require_untracked_source_layout(
         if actual_paths:
             raise ValueError
         return
-    expected_files = _decrypt_pinned_appworld_bundles(root_fd, head_payloads)
+    expected_files = _decrypt_pinned_appworld_bundles(root_fd, head_payloads, head_modes)
     if actual_paths != set(expected_files):
         raise ValueError
     for raw_path, expected in expected_files.items():
@@ -1764,10 +1800,14 @@ def _require_editable_appworld_checkout() -> Path:
         if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
             raise ValueError
         checkout = Path(unquote(parsed.path)).resolve(strict=True)
+        checkout_stat = checkout.lstat()
         git_directory = checkout / ".git"
         git_directory_stat = git_directory.lstat()
         if (
             not checkout.is_absolute()
+            or not stat.S_ISDIR(checkout_stat.st_mode)
+            or checkout_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(checkout_stat.st_mode) != 0o700
             or stat.S_ISLNK(git_directory_stat.st_mode)
             or not stat.S_ISDIR(git_directory_stat.st_mode)
         ):
@@ -1874,14 +1914,29 @@ def _require_editable_appworld_checkout() -> Path:
 def _require_pinned_dotenv_runtime() -> None:
     probe_key = "TOOLSHIFT_DOTENV_DISABLED_PROBE"
     try:
+        distribution = importlib.metadata.distribution("python-dotenv")
+        if distribution.version != _PINNED_PYTHON_DOTENV_VERSION or probe_key in os.environ:
+            raise ValueError
+        expected_module_file = Path(distribution.locate_file("dotenv/__init__.py")).resolve(
+            strict=True
+        )
+        expected_stat = expected_module_file.lstat()
+        module_spec = importlib.util.find_spec("dotenv")
+        module_origin = getattr(module_spec, "origin", None)
         if (
-            importlib.metadata.version("python-dotenv") != _PINNED_PYTHON_DOTENV_VERSION
-            or probe_key in os.environ
+            not stat.S_ISREG(expected_stat.st_mode)
+            or type(module_origin) is not str
+            or not os.path.samefile(module_origin, expected_module_file)
         ):
             raise ValueError
         dotenv_module = importlib.import_module("dotenv")
+        module_file = getattr(dotenv_module, "__file__", None)
         load_dotenv = getattr(dotenv_module, "load_dotenv", None)
-        if not callable(load_dotenv):
+        if (
+            type(module_file) is not str
+            or not os.path.samefile(module_file, expected_module_file)
+            or not callable(load_dotenv)
+        ):
             raise ValueError
         try:
             disabled = load_dotenv(
