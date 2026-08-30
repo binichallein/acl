@@ -80,6 +80,34 @@ official_verification:
     elapsed_seconds: 246
     passed: 147
     total: 147
+gate_0_m3a:
+  kind: private_nonformal_integration_smoke_protocol
+  upstream_sources:
+    repository: >-
+      https://github.com/StonyBrookNLP/appworld/tree/a072b7a86e7c1d5b1d7175659d750ebb9b79f10a
+    cli: >-
+      https://github.com/StonyBrookNLP/appworld/blob/a072b7a86e7c1d5b1d7175659d750ebb9b79f10a/src/appworld/cli.py
+    path_store: >-
+      https://github.com/StonyBrookNLP/appworld/blob/a072b7a86e7c1d5b1d7175659d750ebb9b79f10a/src/appworld/common/path_store.py
+    verifier: >-
+      https://github.com/StonyBrookNLP/appworld/blob/a072b7a86e7c1d5b1d7175659d750ebb9b79f10a/src/appworld/verify.py
+  protocol:
+    split: train
+    seed: 100
+    workers: 1
+    transform_families:
+      - clean
+      - l1
+      - l2
+    fresh_world_per_role: true
+    full_non_admin_catalog: true
+    formal_gate_evaluable: false
+    formal_gate_claim: false
+  evidence_policy:
+    plaintext_location: external_private_appworld_root
+    runtime_record_committed: false
+    public_result_claim: false
+    publication_requires: appworld_maintainer_approved_encrypted_workflow
 gate_0a:
   observed_at: "2026-08-30"
   run_label: formal-os-exit-c84049ad-20260829T212809Z

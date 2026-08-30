@@ -16,6 +16,13 @@ The local W1 scaffold and system-configuration layer are complete. On `ml2`, the
 - [Research design](docs/plans/2026-08-29-tool-interface-tail-rl-design.md)
 - [Implementation plan](docs/plans/2026-08-29-tool-interface-tail-rl-implementation-plan.md)
 
+The AppWorld M3A adapter-contract runner is a separate train-only integration smoke for clean,
+L1 rename, and L2 parameter-restructure variants. It is deliberately non-formal: its actual
+screening counts, diagnostics, and aggregate result stay in a private external AppWorld root
+and are not committed or quoted publicly. See the [M3A design](docs/plans/2026-08-30-appworld-gate0-design.md),
+[implementation plan](docs/plans/2026-08-30-appworld-gate0-implementation-plan.md), and
+[`ml2` runbook](docs/environment/ml2-appworld.md).
+
 ## Local development
 
 ToolShift requires Python 3.10 or newer. Create an isolated environment and install the package with its development tools:
