@@ -2772,6 +2772,51 @@ def test_transform_runtime_lookup_index_tamper_fails_closed_for_changed_tool() -
         )
 
 
+@pytest.mark.parametrize(
+    ("method_name", "call"),
+    [
+        (
+            "canonical_call_to_surface",
+            {"name": "search", "arguments": {"query": "alpha", "locale": "en"}},
+        ),
+        (
+            "surface_call_to_canonical",
+            {
+                "name": "search",
+                "arguments": {"locale": "en", "request": {"query": "alpha"}},
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("explode", [False, True], ids=["return", "raise"])
+def test_direct_translation_rechecks_integrity_after_call_mapping_callback(
+    method_name: str,
+    call: Mapping[str, JSONValue],
+    explode: bool,
+) -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+
+    def replace_changed_tool_names() -> None:
+        object.__setattr__(transform, "_changed_tool_names", frozenset())
+
+    callback_call = _CallbackPayloadMapping(
+        call,
+        callback=replace_changed_tool_names,
+        explode=explode,
+    )
+
+    with pytest.raises(TransformValidationError) as caught:
+        getattr(transform, method_name)(callback_call)
+
+    assert str(caught.value) == "parameter restructure transform integrity validation failed"
+    assert caught.value.__cause__ is None
+    assert callback_call.calls == 1
+
+
 def test_helper_and_direct_adapter_reject_implicit_composition() -> None:
     first = _apply_restructure()
 
@@ -3343,16 +3388,16 @@ def _exercise_hot_path(
     adapter = fixture.adapter
     before = tools_reads[fixture.label]
     surface_call = transform.canonical_call_to_surface(fixture.canonical_call)
-    assert tools_reads[fixture.label] - before == 2
+    assert tools_reads[fixture.label] - before == 4
     before = tools_reads[fixture.label]
     canonical_call = transform.surface_call_to_canonical(fixture.surface_call)
-    assert tools_reads[fixture.label] - before == 2
+    assert tools_reads[fixture.label] - before == 4
     assert canonical_json_bytes(surface_call) == canonical_json_bytes(fixture.surface_call)
     assert canonical_json_bytes(canonical_call) == canonical_json_bytes(fixture.canonical_call)
 
     before = tools_reads[fixture.label]
     actions = adapter.surface_to_semantic(fixture.surface_call)
-    assert tools_reads[fixture.label] - before == 6
+    assert tools_reads[fixture.label] - before == 8
     before = tools_reads[fixture.label]
     base_calls = adapter.semantic_to_base_calls(actions[0])
     assert tools_reads[fixture.label] - before == 4
@@ -3360,7 +3405,7 @@ def _exercise_hot_path(
     groups = ((observation,),)
     before = tools_reads[fixture.label]
     assert adapter.base_observation_to_surface(fixture.surface_call, actions, groups) is observation
-    assert tools_reads[fixture.label] - before == 6
+    assert tools_reads[fixture.label] - before == 8
     trace = ExecutionTrace((fixture.surface_call,), actions, base_calls)
     before = tools_reads[fixture.label]
     result = adapter.canonicalize_trace(trace)
@@ -3423,4 +3468,4 @@ def test_large_schema_tiny_call_online_path_never_revisits_schema_inventory(
     _exercise_hot_path(small, tools_reads)
     _exercise_hot_path(large, tools_reads)
 
-    assert tools_reads == {"small": 26, "large": 26}
+    assert tools_reads == {"small": 34, "large": 34}

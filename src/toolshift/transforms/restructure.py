@@ -1018,18 +1018,21 @@ class ParameterRestructureTransform:
         """Translate one nested surface call into the flat source interface."""
 
         self._require_integrity()
-        snapshot, name = _freeze_call_snapshot(
-            call,
-            "parameter restructure surface call",
-        )
-        plan = self._plan_for_name(name)
-        if plan is None:
-            return snapshot
-        arguments = _changed_call_arguments(
-            snapshot,
-            "parameter restructure surface call",
-        )
-        return _surface_snapshot_to_canonical(snapshot, arguments, plan)
+        try:
+            snapshot, name = _freeze_call_snapshot(
+                call,
+                "parameter restructure surface call",
+            )
+            plan = self._plan_for_name(name)
+            if plan is None:
+                return snapshot
+            arguments = _changed_call_arguments(
+                snapshot,
+                "parameter restructure surface call",
+            )
+            return _surface_snapshot_to_canonical(snapshot, arguments, plan)
+        finally:
+            self._require_integrity()
 
     def canonical_call_to_surface(
         self,
@@ -1038,18 +1041,21 @@ class ParameterRestructureTransform:
         """Translate one flat source call into the nested final interface."""
 
         self._require_integrity()
-        snapshot, name = _freeze_call_snapshot(
-            call,
-            "parameter restructure canonical call",
-        )
-        plan = self._plan_for_name(name)
-        if plan is None:
-            return snapshot
-        arguments = _changed_call_arguments(
-            snapshot,
-            "parameter restructure canonical call",
-        )
-        return _canonical_snapshot_to_surface(snapshot, arguments, plan)
+        try:
+            snapshot, name = _freeze_call_snapshot(
+                call,
+                "parameter restructure canonical call",
+            )
+            plan = self._plan_for_name(name)
+            if plan is None:
+                return snapshot
+            arguments = _changed_call_arguments(
+                snapshot,
+                "parameter restructure canonical call",
+            )
+            return _canonical_snapshot_to_surface(snapshot, arguments, plan)
+        finally:
+            self._require_integrity()
 
     def _trace_for_source(self, trace: ExecutionTrace) -> ExecutionTrace:
         self._require_integrity()
