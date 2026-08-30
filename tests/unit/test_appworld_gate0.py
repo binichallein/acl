@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator, Mapping
+import os
+import sys
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import fields, replace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -198,6 +202,126 @@ class _WorldFactory:
             self.close_roles.append(role)
             if role == self.cleanup_failure_role:
                 raise RuntimeError("PRIVATE_CLEANUP_CANARY")
+
+
+class _SmokeApiDocs:
+    def __init__(self, catalog: list[dict[str, object]], events: list[object]) -> None:
+        self._catalog = catalog
+        self._events = events
+
+    def function_calling(self) -> list[dict[str, object]]:
+        self._events.append("catalog")
+        return self._catalog
+
+
+class _SmokeRequester:
+    def __init__(self, models: _Models, events: list[object]) -> None:
+        self._models = models
+        self._events = events
+        self.requests: list[object] = []
+
+    def request(
+        self,
+        _app_name: str,
+        _api_name: str,
+        client: object = None,
+        raise_on_failure: object = None,
+        show: object = False,
+        track: object = True,
+        **data: object,
+    ) -> dict[str, object]:
+        del client, raise_on_failure, show
+        call = {"name": f"{_app_name}__{_api_name}", "arguments": data}
+        self.post("/synthetic", track=track)
+        self._models.apply(call)
+        self.requests.append({"method": "POST"})
+        return {"ok": True, "call_index": len(self._models._state) - 1}
+
+    def get(self, *args: object, **kwargs: object) -> dict[str, bool]:
+        del args, kwargs
+        return {"ok": True}
+
+    def post(self, *args: object, **kwargs: object) -> dict[str, bool]:
+        del args, kwargs
+        return {"ok": True}
+
+    def put(self, *args: object, **kwargs: object) -> dict[str, bool]:
+        del args, kwargs
+        return {"ok": True}
+
+    def patch(self, *args: object, **kwargs: object) -> dict[str, bool]:
+        del args, kwargs
+        return {"ok": True}
+
+    def delete(self, *args: object, **kwargs: object) -> dict[str, bool]:
+        del args, kwargs
+        return {"ok": True}
+
+
+class _SmokeWorld:
+    def __init__(
+        self,
+        catalog: list[dict[str, object]],
+        oracle_calls: tuple[Mapping[str, object], ...],
+        events: list[object],
+    ) -> None:
+        self.models = _Models()
+        self.requester = _SmokeRequester(self.models, events)
+        self.task = type("Task", (), {})()
+        self.task.api_docs = _SmokeApiDocs(catalog, events)
+        self.task.ground_truth = type("GroundTruth", (), {})()
+        self.task.ground_truth.compiled_solution_code = "def solution(apis, requester): return None"
+        self._oracle_calls = oracle_calls
+        self.save_calls = 0
+
+    def execute(self, code: str) -> str:
+        assert code.endswith("\nsolution(apis, requester)")
+        for call in self._oracle_calls:
+            name = call["name"]
+            arguments = call["arguments"]
+            assert isinstance(name, str)
+            assert isinstance(arguments, Mapping)
+            app_name, api_name = name.split("__", 1)
+            self.requester.request(app_name, api_name, **arguments)
+        return "ok"
+
+    def save(self) -> None:
+        self.save_calls += 1
+
+    def evaluate(self, *, suppress_errors: bool) -> _Tracker:
+        assert suppress_errors is False
+        return _Tracker()
+
+
+class _SmokeContextFactory:
+    def __init__(
+        self,
+        task_specs: Mapping[
+            str,
+            tuple[list[dict[str, object]], tuple[Mapping[str, object], ...]],
+        ],
+    ) -> None:
+        self.task_specs = task_specs
+        self.calls: list[dict[str, object]] = []
+        self.events: list[object] = []
+        self.worlds: list[_SmokeWorld] = []
+        self.live_count = 0
+        self.max_live_count = 0
+
+    @contextmanager
+    def __call__(self, **kwargs: object) -> Iterator[_SmokeWorld]:
+        self.calls.append(dict(kwargs))
+        task_id = kwargs["task_id"]
+        assert isinstance(task_id, str)
+        catalog, oracle_calls = self.task_specs[task_id]
+        world = _SmokeWorld(catalog, oracle_calls, self.events)
+        self.worlds.append(world)
+        self.live_count += 1
+        self.max_live_count = max(self.max_live_count, self.live_count)
+        try:
+            yield world
+        finally:
+            self.live_count -= 1
 
 
 def _source_and_calls():
@@ -902,3 +1026,512 @@ def test_transformed_candidate_must_be_bound_to_exact_reference_source(kind: str
 
     assert raised.value.__cause__ is None
     assert factory.open_roles == []
+
+
+def test_smoke_screens_in_loader_order_selects_l1_l2_and_freezes_world_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    ineligible_catalog = [
+        _tool(
+            "notes__search_notes",
+            {"query": {"type": "string", "minLength": 1}},
+            ["query"],
+        )
+    ]
+    task_specs = {
+        "PRIVATE_TASK_Z": (
+            ineligible_catalog,
+            ({"name": "notes__search_notes", "arguments": {"query": "first"}},),
+        ),
+        "PRIVATE_TASK_A": (
+            _catalog(),
+            (
+                {
+                    "name": "notes__create_note",
+                    "arguments": {"title": "second", "priority": 1},
+                },
+            ),
+        ),
+    }
+    factory = _SmokeContextFactory(task_specs)
+    loader_calls: list[str] = []
+    pin_calls = 0
+    admitted: list[tuple[object, Callable[..., object]]] = []
+
+    def task_loader(split: str) -> tuple[str, ...]:
+        loader_calls.append(split)
+        return ("PRIVATE_TASK_Z", "PRIVATE_TASK_A")
+
+    def pin_checker() -> None:
+        nonlocal pin_calls
+        pin_calls += 1
+
+    def admit_spy(**kwargs: object) -> object:
+        candidate = kwargs["candidate_adapter"]
+        pair_factory = kwargs["world_context_factory"]
+        assert callable(pair_factory)
+        admitted.append((candidate, pair_factory))
+        for role in ("reference", "candidate", "reference-reset", "candidate-reset"):
+            with pair_factory(role=role):
+                pass
+        return gate0_module._VariantAdmissionRecord(1, (("schema", 1),), ())
+
+    monkeypatch.setattr(gate0_module, "_admit_variant_pair", admit_spy)
+
+    summary = gate0_module.run_appworld_gate0_smoke(
+        seed=100,
+        workers=1,
+        task_loader=task_loader,
+        world_context_factory=factory,
+        pin_checker=pin_checker,
+    )
+
+    assert loader_calls == ["train"]
+    assert pin_calls == 1
+    assert len(admitted) == 3
+    assert admitted[0][0].variant.variant_id == "appworld-source-v1"
+    assert admitted[1][0].transform.canonical_to_surface == {
+        "notes__create_note": "toolshift_l1_0000",
+        "notes__search_notes": "notes__search_notes",
+    }
+    assert admitted[2][0].transform.rules[0].tool_name == "notes__create_note"
+    assert admitted[2][0].transform.rules[0].moved_parameters == ("priority",)
+    assert len(admitted[2][0].transform.rules[0].moved_parameters) < 2
+    assert summary.screened_task_count == 2
+    assert summary.excluded_task_count == 1
+    assert summary.admitted_task_count == 1
+    assert summary.clean.admitted_count == 1
+    assert summary.l1.admitted_count == 1
+    assert summary.l2.admitted_count == 1
+    assert summary.smoke_passed is True
+    assert "PRIVATE_TASK" not in repr(summary)
+    assert factory.max_live_count == 1
+    assert [call["task_id"] for call in factory.calls[:2]] == [
+        "PRIVATE_TASK_Z",
+        "PRIVATE_TASK_A",
+    ]
+    assert len(factory.calls) == 14
+    assert all(call["task_id"] == "PRIVATE_TASK_A" for call in factory.calls[2:])
+    common_flags = {
+        "random_seed": 100,
+        "raise_on_failure": False,
+        "raise_on_extra_parameters": True,
+        "remote_apis_url": None,
+        "remote_environment_url": None,
+        "remote_mcp_url": None,
+        "remote_docker": False,
+        "parse_datetimes": False,
+        "wrap_response": False,
+        "unwrap_response": False,
+        "munchify_response": False,
+    }
+    experiment_names: list[str] = []
+    for index, call in enumerate(factory.calls):
+        assert {key: call[key] for key in common_flags} == common_flags
+        assert call.get("ground_truth_mode") == ("full" if index in {0, 1, 2, 6, 10} else None)
+        experiment_name = call["experiment_name"]
+        assert isinstance(experiment_name, str)
+        experiment_names.append(experiment_name)
+    assert len(experiment_names) == len(set(experiment_names))
+
+
+def test_smoke_preflight_failure_is_static_and_precedes_task_loading() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    loader_calls: list[str] = []
+
+    def failing_pin() -> None:
+        raise RuntimeError("PRIVATE_PIN_PATH_CANARY")
+
+    with pytest.raises(RuntimeError, match="AppWorld Gate 0 preflight failed") as raised:
+        gate0_module.run_appworld_gate0_smoke(
+            task_loader=lambda split: loader_calls.append(split) or (),
+            world_context_factory=lambda **kwargs: pytest.fail("world construction must not occur"),
+            pin_checker=failing_pin,
+        )
+
+    assert loader_calls == []
+    assert raised.value.__cause__ is None
+    assert "PRIVATE_PIN_PATH_CANARY" not in str(raised.value)
+
+
+def test_smoke_without_selective_l2_is_a_failed_nonformal_summary() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    task_specs = {
+        "PRIVATE_ONLY_TASK": (
+            [
+                _tool(
+                    "notes__search_notes",
+                    {"query": {"type": "string", "minLength": 1}},
+                    ["query"],
+                )
+            ],
+            ({"name": "notes__search_notes", "arguments": {"query": "one"}},),
+        )
+    }
+    summary = gate0_module.run_appworld_gate0_smoke(
+        task_loader=lambda split: ("PRIVATE_ONLY_TASK",),
+        world_context_factory=_SmokeContextFactory(task_specs),
+        pin_checker=lambda: None,
+    )
+
+    assert summary.smoke_passed is False
+    assert summary.gate_evaluable is False
+    assert summary.formal_gate_passed is False
+    assert summary.screened_task_count == 1
+    assert summary.l2.eligible_count == 0
+    assert summary.l2.attempted_count == 0
+    assert summary.diagnostic_counts == (("smoke.no_l2_eligible_task", 1),)
+
+
+def test_first_eligible_task_admission_failure_does_not_select_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    task_specs = {
+        task_id: (
+            _catalog(),
+            (
+                {
+                    "name": "notes__create_note",
+                    "arguments": {"title": "one", "priority": 1},
+                },
+            ),
+        )
+        for task_id in ("PRIVATE_FIRST", "PRIVATE_SECOND")
+    }
+    factory = _SmokeContextFactory(task_specs)
+
+    def reject_first_pair(**kwargs: object) -> object:
+        del kwargs
+        raise gate0_module._VariantAdmissionError(
+            "paired AppWorld evidence failed",
+            ("pair.synthetic_failure",),
+        )
+
+    monkeypatch.setattr(gate0_module, "_admit_variant_pair", reject_first_pair)
+    summary = gate0_module.run_appworld_gate0_smoke(
+        task_loader=lambda split: ("PRIVATE_FIRST", "PRIVATE_SECOND"),
+        world_context_factory=factory,
+        pin_checker=lambda: None,
+    )
+
+    assert summary.smoke_passed is False
+    assert summary.screened_task_count == 1
+    assert summary.clean.attempted_count == 1
+    assert summary.l1.attempted_count == 0
+    assert summary.diagnostic_counts == (("pair.synthetic_failure", 1),)
+    assert [call["task_id"] for call in factory.calls] == ["PRIVATE_FIRST"]
+
+
+class _ReusingSmokeContextFactory(_SmokeContextFactory):
+    def __init__(
+        self,
+        task_specs: Mapping[
+            str,
+            tuple[list[dict[str, object]], tuple[Mapping[str, object], ...]],
+        ],
+    ) -> None:
+        super().__init__(task_specs)
+        self._shared_world: _SmokeWorld | None = None
+
+    @contextmanager
+    def __call__(self, **kwargs: object) -> Iterator[_SmokeWorld]:
+        self.calls.append(dict(kwargs))
+        task_id = kwargs["task_id"]
+        assert isinstance(task_id, str)
+        catalog, oracle_calls = self.task_specs[task_id]
+        if self._shared_world is None:
+            self._shared_world = _SmokeWorld(catalog, oracle_calls, self.events)
+        self.live_count += 1
+        self.max_live_count = max(self.max_live_count, self.live_count)
+        try:
+            yield self._shared_world
+        finally:
+            self.live_count -= 1
+
+
+def test_smoke_rejects_world_identity_reuse_across_variant_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    task_specs = {
+        "PRIVATE_REUSED": (
+            _catalog(),
+            (
+                {
+                    "name": "notes__create_note",
+                    "arguments": {"title": "one", "priority": 1},
+                },
+            ),
+        )
+    }
+    factory = _ReusingSmokeContextFactory(task_specs)
+
+    def open_reference(**kwargs: object) -> object:
+        pair_factory = kwargs["world_context_factory"]
+        assert callable(pair_factory)
+        with pair_factory(role="reference"):
+            pass
+        return gate0_module._VariantAdmissionRecord(1, (("schema", 1),), ())
+
+    monkeypatch.setattr(gate0_module, "_admit_variant_pair", open_reference)
+    summary = gate0_module.run_appworld_gate0_smoke(
+        task_loader=lambda split: ("PRIVATE_REUSED",),
+        world_context_factory=factory,
+        pin_checker=lambda: None,
+    )
+
+    assert summary.smoke_passed is False
+    assert summary.execution_exception_count == 1
+    assert summary.diagnostic_counts == (("smoke.admission_exception", 1),)
+    assert len(factory.calls) == 2
+
+
+class _CleanupFailingSmokeContextFactory(_SmokeContextFactory):
+    @contextmanager
+    def __call__(self, **kwargs: object) -> Iterator[_SmokeWorld]:
+        with super().__call__(**kwargs) as world:
+            yield world
+        raise RuntimeError("PRIVATE_CLEANUP_PATH_CANARY")
+
+
+def test_smoke_cleanup_failure_is_counted_and_payload_free() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    task_specs = {
+        "PRIVATE_CLEANUP": (
+            _catalog(),
+            (
+                {
+                    "name": "notes__create_note",
+                    "arguments": {"title": "one", "priority": 1},
+                },
+            ),
+        )
+    }
+    summary = gate0_module.run_appworld_gate0_smoke(
+        task_loader=lambda split: ("PRIVATE_CLEANUP",),
+        world_context_factory=_CleanupFailingSmokeContextFactory(task_specs),
+        pin_checker=lambda: None,
+    )
+
+    assert summary.smoke_passed is False
+    assert summary.cleanup_exception_count == 1
+    assert summary.execution_exception_count == 0
+    assert summary.diagnostic_counts == (("smoke.world_lifecycle_failure", 1),)
+    assert "PRIVATE" not in repr(summary)
+
+
+def test_private_appworld_root_requires_absolute_owned_0700_non_git_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    private_root = tmp_path / "private-root"
+    private_root.mkdir(mode=0o700)
+    monkeypatch.setenv("APPWORLD_ROOT", str(private_root))
+
+    assert gate0_module._require_private_appworld_root() == private_root
+
+    private_root.chmod(0o755)
+    with pytest.raises(RuntimeError, match="preflight failed") as raised:
+        gate0_module._require_private_appworld_root()
+    assert str(private_root) not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_editable_checkout_pin_uses_direct_url_and_exact_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+
+    class Distribution:
+        version = "0.2.0.dev0"
+
+        @staticmethod
+        def read_text(filename: str) -> str:
+            assert filename == "direct_url.json"
+            return f'{{"dir_info":{{"editable":true}},"url":"{checkout.as_uri()}"}}'
+
+    monkeypatch.setattr(
+        gate0_module.importlib.metadata,
+        "distribution",
+        lambda name: Distribution(),
+    )
+    attached = False
+
+    def git_run(arguments: list[str], **kwargs: object) -> object:
+        del kwargs
+        if "rev-parse" in arguments:
+            return SimpleNamespace(
+                stdout=gate0_module.PINNED_APPWORLD_COMMIT + "\n",
+                returncode=0,
+            )
+        assert "symbolic-ref" in arguments
+        return SimpleNamespace(stdout="", returncode=0 if attached else 1)
+
+    monkeypatch.setattr(gate0_module.subprocess, "run", git_run)
+
+    assert gate0_module._require_editable_appworld_checkout() == checkout
+
+    attached = True
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        gate0_module._require_editable_appworld_checkout()
+    attached = False
+
+    Distribution.version = "PRIVATE_WRONG_VERSION"
+    with pytest.raises(RuntimeError, match="preflight failed") as raised:
+        gate0_module._require_editable_appworld_checkout()
+    assert "PRIVATE_WRONG_VERSION" not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_pinned_runtime_checks_proxy_python_constants_and_version_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    private_root = tmp_path / "private-root"
+    (private_root / "data" / "base_dbs").mkdir(parents=True)
+    (private_root / "data" / "version.txt").write_text("0.2.0\n", encoding="utf-8")
+    (private_root / "data" / "base_dbs" / "version.txt").write_text(
+        "0.2.0\n",
+        encoding="utf-8",
+    )
+    for key in tuple(os.environ):
+        if key.lower().endswith("_proxy"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(gate0_module.sys, "version_info", (3, 11, 15, "final", 0))
+    monkeypatch.setattr(
+        gate0_module,
+        "_require_private_appworld_root",
+        lambda: private_root,
+    )
+    checkout = tmp_path / "checkout"
+    package_file = checkout / "src" / "appworld" / "__init__.py"
+    constants_file = checkout / "src" / "appworld" / "common" / "constants.py"
+    constants_file.parent.mkdir(parents=True)
+    package_file.write_text("", encoding="utf-8")
+    constants_file.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        gate0_module,
+        "_require_editable_appworld_checkout",
+        lambda: checkout,
+    )
+    appworld_module = ModuleType("appworld")
+    common_module = ModuleType("appworld.common")
+    constants_module = ModuleType("appworld.common.constants")
+    appworld_module.__file__ = str(package_file)
+    constants_module.__file__ = str(constants_file)
+    constants_module.DATA_VERSION = "0.2.0"  # type: ignore[attr-defined]
+    constants_module.DB_VERSION = "0.2.0"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "appworld", appworld_module)
+    monkeypatch.setitem(sys.modules, "appworld.common", common_module)
+    monkeypatch.setitem(sys.modules, "appworld.common.constants", constants_module)
+
+    gate0_module.require_pinned_appworld_runtime()
+
+    shadow_file = tmp_path / "shadow" / "appworld" / "__init__.py"
+    shadow_file.parent.mkdir(parents=True)
+    shadow_file.write_text("", encoding="utf-8")
+    appworld_module.__file__ = str(shadow_file)
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        gate0_module.require_pinned_appworld_runtime()
+    appworld_module.__file__ = str(package_file)
+
+    monkeypatch.setenv("CUSTOM_PROXY", "PRIVATE_PROXY_CANARY")
+    with pytest.raises(RuntimeError, match="preflight failed") as raised:
+        gate0_module.require_pinned_appworld_runtime()
+    assert "PRIVATE_PROXY_CANARY" not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_empty_oracle_fails_the_smoke_without_trying_a_later_task() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    task_specs = {
+        "PRIVATE_EMPTY": (_catalog(), ()),
+        "PRIVATE_LATER": (
+            _catalog(),
+            (
+                {
+                    "name": "notes__create_note",
+                    "arguments": {"title": "later", "priority": 1},
+                },
+            ),
+        ),
+    }
+    factory = _SmokeContextFactory(task_specs)
+    summary = gate0_module.run_appworld_gate0_smoke(
+        task_loader=lambda split: ("PRIVATE_EMPTY", "PRIVATE_LATER"),
+        world_context_factory=factory,
+        pin_checker=lambda: None,
+    )
+
+    assert summary.smoke_passed is False
+    assert summary.screened_task_count == 1
+    assert summary.diagnostic_counts == (("screen.oracle_capture_failed", 1),)
+    assert [call["task_id"] for call in factory.calls] == ["PRIVATE_EMPTY"]
+
+
+def test_l1_l2_selection_is_deterministic_selective_and_nonmutating() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    source = build_appworld_adapter(_catalog())
+    source_schema = next(
+        tool.input_schema for tool in source.variant.tools if tool.name == "notes__create_note"
+    )
+    before = canonical_json_bytes(source_schema)
+    oracle_tools = ("notes__create_note",)
+
+    l1 = gate0_module._build_l1_candidate(source, oracle_tools, seed=100)
+    l2 = gate0_module._build_l2_candidate(source, oracle_tools, seed=100)
+
+    assert l1.transform.canonical_to_surface["notes__create_note"] == ("toolshift_l1_0000")
+    assert l2 is not None
+    assert l2.transform.rules[0].container_name == "toolshift_group_0000"
+    assert l2.transform.rules[0].moved_parameters == ("priority",)
+    assert len(l2.transform.rules[0].moved_parameters) < len(source_schema["properties"])
+    assert canonical_json_bytes(source_schema) == before
+
+
+def test_l2_does_not_delete_defaults_to_manufacture_eligibility() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    source = build_appworld_adapter(
+        [
+            _tool(
+                "notes__create_note",
+                {
+                    "priority": {"type": "integer", "default": 1},
+                    "title": {"type": "string", "minLength": 1},
+                },
+                ["title"],
+            )
+        ]
+    )
+    source_schema = source.variant.tools[0].input_schema
+    before = canonical_json_bytes(source_schema)
+
+    candidate = gate0_module._build_l2_candidate(
+        source,
+        ("notes__create_note",),
+        seed=100,
+    )
+
+    assert candidate is None
+    assert source_schema["properties"]["priority"]["default"] == 1
+    assert canonical_json_bytes(source_schema) == before
