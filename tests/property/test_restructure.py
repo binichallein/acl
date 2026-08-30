@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError
 from typing import cast
 
@@ -179,8 +179,11 @@ class _IdentityArgumentShapeSource(_RecordingRestructureSource):
 
 
 class _ExplodingManifestMapping(Mapping[str, JSONValue]):
+    def __init__(self, error_type: type[Exception] = RuntimeError) -> None:
+        self.error = error_type("PRIVATE_MANIFEST_PAYLOAD")
+
     def __getitem__(self, key: str) -> JSONValue:
-        raise RuntimeError("PRIVATE_MANIFEST_PAYLOAD")
+        raise self.error
 
     def __iter__(self):
         return iter(("kind",))
@@ -211,10 +214,18 @@ class _EqualityBombManifest(Mapping[str, object]):
 
 
 class _ManifestPayloadPublicSource(_RecordingRestructureSource):
-    def __init__(self, variant: SchemaVariant) -> None:
+    def __init__(
+        self,
+        variant: SchemaVariant,
+        error_type: type[Exception] = RuntimeError,
+    ) -> None:
         super().__init__(variant)
         public_variant = _base_variant()
-        object.__setattr__(public_variant, "manifest", _ExplodingManifestMapping())
+        object.__setattr__(
+            public_variant,
+            "manifest",
+            _ExplodingManifestMapping(error_type),
+        )
         self._public_variant = public_variant
 
     @property
@@ -234,7 +245,7 @@ class _ManifestTruthPublicSource(_RecordingRestructureSource):
         return self._public_variant
 
 
-class _ManifestTruthRawSource(_RecordingRestructureSource):
+class _RawVariantLieSource(_RecordingRestructureSource):
     def __init__(
         self,
         raw_variant: SchemaVariant,
@@ -2317,9 +2328,12 @@ def test_restructure_to_rename_composition_is_classified_at_every_entry() -> Non
         rename_module.RenameAdapter(restructure_adapter, clean_transform)
 
 
-def test_cross_composition_manifest_probes_sanitize_public_callback_payloads() -> None:
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_cross_composition_manifest_probes_sanitize_public_callback_payloads(
+    error_type: type[Exception],
+) -> None:
     base = _base_variant()
-    source = _ManifestPayloadPublicSource(base)
+    source = _ManifestPayloadPublicSource(base, error_type)
     restructure_transform = build_parameter_restructure_transform(
         base,
         rules=(_search_rule(),),
@@ -2337,14 +2351,43 @@ def test_cross_composition_manifest_probes_sanitize_public_callback_payloads() -
     ):
         with pytest.raises(TransformValidationError) as caught:
             constructor(source, transform)
+        assert str(caught.value) == "source adapter binding validation failed"
         assert "PRIVATE_MANIFEST_PAYLOAD" not in str(caught.value)
         assert caught.value.__cause__ is None
 
 
-def test_cross_composition_manifest_probes_sanitize_raw_callback_payloads() -> None:
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_cross_composition_manifest_probes_sanitize_raw_callback_payloads(
+    error_type: type[Exception],
+) -> None:
+    base = _base_variant()
     raw_variant = _base_variant()
-    object.__setattr__(raw_variant, "manifest", _ExplodingManifestMapping())
-    source = _RecordingRestructureSource(raw_variant)
+    object.__setattr__(
+        raw_variant,
+        "manifest",
+        _ExplodingManifestMapping(error_type),
+    )
+    source = _RawVariantLieSource(raw_variant, base)
+    restructure_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    rename_transform = rename_module.build_rename_transform(
+        base,
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+
+    for constructor, transform in (
+        (restructure_module.ParameterRestructureAdapter, restructure_transform),
+        (rename_module.RenameAdapter, rename_transform),
+    ):
+        with pytest.raises(TransformValidationError) as caught:
+            constructor(source, transform)
+        assert str(caught.value) == "source adapter binding validation failed"
+        assert "PRIVATE_MANIFEST_PAYLOAD" not in str(caught.value)
+        assert caught.value.__cause__ is None
 
     for apply in (
         restructure_module.apply_parameter_restructure,
@@ -2357,8 +2400,66 @@ def test_cross_composition_manifest_probes_sanitize_raw_callback_payloads() -> N
             kwargs = {"tool_name_mapping": {"search": "lookup"}, "seed": 13}
         with pytest.raises(TransformValidationError) as caught:
             apply(source, **kwargs)
+        assert str(caught.value) == "source adapter binding validation failed"
         assert "PRIVATE_MANIFEST_PAYLOAD" not in str(caught.value)
         assert caught.value.__cause__ is None
+
+
+def test_cross_composition_direct_adapters_probe_transformed_raw_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _base_variant()
+    transformed_raw = _apply_restructure(_RecordingRestructureSource(base)).variant
+    source = _RawVariantLieSource(transformed_raw, base)
+    restructure_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    rename_transform = rename_module.build_rename_transform(
+        base,
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+
+    def make_recording_probe(
+        calls: list[object],
+        probe: Callable[[object, str], bool],
+    ) -> Callable[[object, str], bool]:
+        def recording_probe(value: object, error_message: str) -> bool:
+            calls.append(value)
+            return probe(value, error_message)
+
+        return recording_probe
+
+    for module, constructor, transform, expected in (
+        (
+            restructure_module,
+            restructure_module.ParameterRestructureAdapter,
+            restructure_transform,
+            "parameter restructure composition requires the explicit compose transform",
+        ),
+        (
+            rename_module,
+            rename_module.RenameAdapter,
+            rename_transform,
+            "rename composition requires the explicit compose transform",
+        ),
+    ):
+        calls: list[object] = []
+        original_probe = module._variant_has_interface_manifest
+        recording_probe = make_recording_probe(calls, original_probe)
+
+        with monkeypatch.context() as context:
+            context.setattr(module, "_variant_has_interface_manifest", recording_probe)
+            with pytest.raises(TransformValidationError) as caught:
+                constructor(source, transform)
+
+        assert str(caught.value) == expected
+        assert caught.value.__cause__ is None
+        assert len(calls) == 2
+        assert calls[0] is base
+        assert calls[1] is transformed_raw
 
 
 def test_cross_composition_manifest_probes_do_not_leak_public_truthiness() -> None:
@@ -2389,7 +2490,7 @@ def test_cross_composition_manifest_probes_do_not_leak_raw_truthiness() -> None:
     base = _base_variant()
     raw_variant = _base_variant()
     object.__setattr__(raw_variant, "manifest", _EqualityBombManifest())
-    source = _ManifestTruthRawSource(raw_variant, base)
+    source = _RawVariantLieSource(raw_variant, base)
     restructure_transform = build_parameter_restructure_transform(
         base,
         rules=(_search_rule(),),
