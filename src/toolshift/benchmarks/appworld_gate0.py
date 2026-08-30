@@ -6,6 +6,7 @@ contract suite, episode record, task identity, call, observation, or digest.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.metadata
 import json
@@ -13,6 +14,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -29,6 +31,7 @@ from toolshift.adapters import (
     build_minimal_source_calls,
 )
 from toolshift.adapters.semantic import SemanticAdapter
+from toolshift.benchmarks._evidence import write_private_json_beneath
 from toolshift.benchmarks.appworld_replay import (
     PINNED_APPWORLD_COMMIT,
     _AppWorldCleanupMarker,
@@ -76,7 +79,193 @@ _PINNED_APPWORLD_PACKAGE_VERSION = "0.2.0.dev0"
 _PINNED_APPWORLD_DATA_VERSION = "0.2.0"
 _PINNED_APPWORLD_DB_VERSION = "0.2.0"
 _PINNED_PYTHON_VERSION = (3, 11, 15)
+_ALLOWED_APPWORLD_UNTRACKED_SOURCE_PREFIXES = tuple(
+    f"src/appworld/apps/{name}/".encode("ascii")
+    for name in (
+        "admin",
+        "amazon",
+        "api_docs",
+        "file_system",
+        "gmail",
+        "phone",
+        "simple_note",
+        "splitwise",
+        "spotify",
+        "supervisor",
+        "todoist",
+        "venmo",
+    )
+)
+APPWORLD_ADAPTER_ABI_SHA256 = hashlib.sha256(b"toolshift.appworld.adapter.v1").hexdigest()
+APPWORLD_GATE0_RUNNER_ABI_SHA256 = hashlib.sha256(b"toolshift.appworld.gate0.runner.v1").hexdigest()
 _SMOKE_ROLES = frozenset({"screen", "reference", "candidate", "reference-reset", "candidate-reset"})
+_KNOWN_GATE0_DIAGNOSTIC_CODES = frozenset(
+    {
+        "denotation.base_group_count",
+        "denotation.compile_exception",
+        "denotation.compile_mismatch",
+        "denotation.duplicate_case",
+        "denotation.empty_cases",
+        "denotation.invalid_adapter",
+        "denotation.invalid_case",
+        "denotation.invalid_cases",
+        "denotation.nondeterministic_compile",
+        "denotation.nondeterministic_observation",
+        "denotation.nondeterministic_parse",
+        "denotation.observation_cardinality",
+        "denotation.observation_exception",
+        "denotation.observation_group_count",
+        "denotation.observation_mismatch",
+        "denotation.parse_exception",
+        "denotation.parse_mismatch",
+        "denotation.variant_rebound",
+        "gate0.unsafe_diagnostic",
+        "pair.action_mismatch",
+        "pair.admission_failed",
+        "pair.admission_identity_mismatch",
+        "pair.base_call_mismatch",
+        "pair.base_observation_mismatch",
+        "pair.candidate_oracle_unsuccessful",
+        "pair.execution_exception",
+        "pair.invalid_oracle_plan",
+        "pair.reference_oracle_unsuccessful",
+        "pair.reset_hash_exception",
+        "pair.step_count_mismatch",
+        "pair.surface_observation_mismatch",
+        "pair.translation_nondeterministic",
+        "pair.unsafe_diagnostic",
+        "pair.world_not_fresh",
+        "schema.call_name_mismatch",
+        "schema.duplicate_call",
+        "schema.duplicate_case",
+        "schema.empty_probes",
+        "schema.invalid_probe",
+        "schema.invalid_probes",
+        "schema.invalid_variant",
+        "schema.mapping_exception",
+        "schema.mapping_mismatch",
+        "schema.missing_tool",
+        "schema.nondeterministic_mapping",
+        "schema.undeclared_tool",
+        "schema.variant_exception",
+        "schema.variant_mismatch",
+        "schema.variant_rebound",
+        "screen.catalog_invalid",
+        "screen.catalog_unprobeable",
+        "screen.oracle_capture_failed",
+        "screen.variant_construction_failed",
+        "smoke.admission_exception",
+        "smoke.invalid_admission_record",
+        "smoke.no_l2_eligible_task",
+        "smoke.preflight_failure",
+        "smoke.task_loader_failure",
+        "smoke.world_lifecycle_failure",
+        "state.candidate_reset_mismatch",
+        "state.collateral_mismatch",
+        "state.duplicate_case",
+        "state.duplicate_episode",
+        "state.empty_cases",
+        "state.final_mismatch",
+        "state.initial_mismatch",
+        "state.invalid_case",
+        "state.invalid_cases",
+        "state.provider_exception",
+        "state.reference_reset_mismatch",
+        "suite.case_snapshot_mismatch",
+        "suite.denotation_exception",
+        "suite.episode_set_mismatch",
+        "suite.schema_exception",
+        "suite.state_exception",
+        "suite.trace_exception",
+        "suite.variant_binding_mismatch",
+        "trace.base_call_mismatch",
+        "trace.base_reconstruction_mismatch",
+        "trace.canonical_semantic_channel_mismatch",
+        "trace.canonicalization_exception",
+        "trace.duplicate_case",
+        "trace.duplicate_episode",
+        "trace.duplicate_verified_step",
+        "trace.effect_mismatch",
+        "trace.empty_cases",
+        "trace.empty_steps",
+        "trace.candidate_effect_alignment",
+        "trace.candidate_effect_count",
+        "trace.invalid_adapter",
+        "trace.invalid_case",
+        "trace.invalid_cases",
+        "trace.invalid_step_structure",
+        "trace.invalid_verified_step",
+        "trace.invalid_verified_steps",
+        "trace.provider_exception",
+        "trace.reference_effect_alignment",
+        "trace.reference_effect_count",
+        "trace.score_mismatch",
+        "trace.semantic_mismatch",
+        "trace.semantic_reconstruction_mismatch",
+        "trace.surface_reconstruction_mismatch",
+        "trace.unverified_step",
+        "trace.variant_rebound",
+        "trace.verified_step_mutated",
+    }
+)
+_ZERO_SCREEN_DIAGNOSTIC_CODES = frozenset({"smoke.preflight_failure", "smoke.task_loader_failure"})
+_SCREEN_EXCLUSION_DIAGNOSTIC_CODES = frozenset(
+    {"screen.catalog_invalid", "screen.catalog_unprobeable"}
+)
+_SCREEN_TERMINAL_DIAGNOSTIC_CODES = frozenset(
+    {
+        "screen.oracle_capture_failed",
+        "screen.variant_construction_failed",
+        "smoke.world_lifecycle_failure",
+    }
+)
+_NO_L2_DIAGNOSTIC_CODE = "smoke.no_l2_eligible_task"
+_ADMISSION_DIAGNOSTIC_CODES = _KNOWN_GATE0_DIAGNOSTIC_CODES.difference(
+    _ZERO_SCREEN_DIAGNOSTIC_CODES,
+    _SCREEN_EXCLUSION_DIAGNOSTIC_CODES,
+    _SCREEN_TERMINAL_DIAGNOSTIC_CODES,
+    {_NO_L2_DIAGNOSTIC_CODE},
+)
+_SINGLETON_DIAGNOSTIC_CODES = frozenset(
+    {
+        *_ZERO_SCREEN_DIAGNOSTIC_CODES,
+        *_SCREEN_TERMINAL_DIAGNOSTIC_CODES,
+        _NO_L2_DIAGNOSTIC_CODE,
+        "gate0.unsafe_diagnostic",
+        "smoke.admission_exception",
+        "smoke.invalid_admission_record",
+        "schema.duplicate_call",
+        "schema.duplicate_case",
+        "schema.empty_probes",
+        "schema.invalid_probes",
+        "schema.invalid_variant",
+        "schema.missing_tool",
+        "schema.undeclared_tool",
+        "schema.variant_exception",
+        "schema.variant_mismatch",
+        "denotation.duplicate_case",
+        "denotation.empty_cases",
+        "denotation.invalid_adapter",
+        "denotation.invalid_cases",
+        "trace.duplicate_case",
+        "trace.duplicate_episode",
+        "trace.empty_cases",
+        "trace.invalid_adapter",
+        "trace.invalid_cases",
+        "trace.candidate_effect_count",
+        "trace.reference_effect_count",
+        "suite.denotation_exception",
+        "suite.episode_set_mismatch",
+        "suite.schema_exception",
+        "suite.state_exception",
+        "suite.trace_exception",
+        *(
+            code
+            for code in _KNOWN_GATE0_DIAGNOSTIC_CODES
+            if code.startswith("pair.") or code.startswith("state.")
+        ),
+    }
+)
 _WORLD_FLAGS = MappingProxyType(
     {
         "raise_on_failure": False,
@@ -91,6 +280,7 @@ _WORLD_FLAGS = MappingProxyType(
         "munchify_response": False,
     }
 )
+_SMOKE_WORLD_SLOT = threading.Lock()
 _STATIC_ADMISSION_FAILURES = frozenset(
     {
         _PAIR_EVIDENCE_FAILURE,
@@ -123,17 +313,16 @@ class _VariantAdmissionError(ValueError):
         )
         super().__init__(safe_message)
         try:
-            self.diagnostic_codes = tuple(
-                code
-                if type(code) is str
-                and 0 < len(code) <= 96
-                and all(
-                    character.isascii() and (character.isalnum() or character in "._-")
-                    for character in code
-                )
-                else "pair.unsafe_diagnostic"
-                for code in diagnostic_codes
-            )
+            sanitized: list[str] = []
+            singleton_seen: set[str] = set()
+            for code in diagnostic_codes:
+                safe_code = code if _is_safe_diagnostic_code(code) else "pair.unsafe_diagnostic"
+                if safe_code in _SINGLETON_DIAGNOSTIC_CODES:
+                    if safe_code in singleton_seen:
+                        continue
+                    singleton_seen.add(safe_code)
+                sanitized.append(safe_code)
+            self.diagnostic_codes = tuple(sanitized)
         except BaseException:
             self.diagnostic_codes = ("pair.unsafe_diagnostic",)
 
@@ -148,14 +337,7 @@ def _require_exact_nonnegative_int(value: object) -> int:
 
 
 def _is_safe_diagnostic_code(value: object) -> bool:
-    return (
-        type(value) is str
-        and 0 < len(value) <= 96
-        and all(
-            character.isascii() and (character.isalnum() or character in "._-")
-            for character in value
-        )
-    )
+    return type(value) is str and value in _KNOWN_GATE0_DIAGNOSTIC_CODES
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
@@ -169,6 +351,9 @@ class AppWorldTransformSummary:
     excluded_count: int
 
     def __post_init__(self) -> None:
+        self._validate_integrity()
+
+    def _validate_integrity(self) -> None:
         values = tuple(
             _require_exact_nonnegative_int(getattr(self, name))
             for name in (
@@ -180,7 +365,12 @@ class AppWorldTransformSummary:
             )
         )
         requested, eligible, attempted, admitted, _ = values
-        if admitted > attempted or attempted > eligible or eligible > requested:
+        if (
+            admitted > attempted
+            or attempted > eligible
+            or eligible > requested
+            or self.excluded_count != requested - eligible
+        ):
             raise ValueError("AppWorld Gate 0 summary is invalid")
 
 
@@ -204,12 +394,26 @@ class AppWorldGate0Summary:
     gate_evaluable: bool
     formal_gate_passed: bool
     smoke_passed: bool
+    schema_version: int = 1
+    pinned_appworld_commit: str = PINNED_APPWORLD_COMMIT
+    pinned_appworld_package_version: str = _PINNED_APPWORLD_PACKAGE_VERSION
+    pinned_appworld_data_version: str = _PINNED_APPWORLD_DATA_VERSION
+    pinned_appworld_base_db_version: str = _PINNED_APPWORLD_DB_VERSION
+    pinned_python_version: str = "3.11.15"
+    adapter_abi_sha256: str = APPWORLD_ADAPTER_ABI_SHA256
+    runner_abi_sha256: str = APPWORLD_GATE0_RUNNER_ABI_SHA256
 
     def __post_init__(self) -> None:
+        self._validate_integrity()
+
+    def _validate_integrity(self) -> None:
         if (
-            self.mode != "smoke"
+            type(self.mode) is not str
+            or self.mode != "smoke"
+            or type(self.split) is not str
             or self.split != "train"
             or type(self.seed) is not int
+            or self.seed < 0
             or type(self.workers) is not int
             or self.workers != 1
             or type(self.clean) is not AppWorldTransformSummary
@@ -220,8 +424,27 @@ class AppWorldGate0Summary:
             or type(self.formal_gate_passed) is not bool
             or self.formal_gate_passed
             or type(self.smoke_passed) is not bool
+            or type(self.schema_version) is not int
+            or self.schema_version != 1
+            or type(self.pinned_appworld_commit) is not str
+            or self.pinned_appworld_commit != PINNED_APPWORLD_COMMIT
+            or type(self.pinned_appworld_package_version) is not str
+            or self.pinned_appworld_package_version != _PINNED_APPWORLD_PACKAGE_VERSION
+            or type(self.pinned_appworld_data_version) is not str
+            or self.pinned_appworld_data_version != _PINNED_APPWORLD_DATA_VERSION
+            or type(self.pinned_appworld_base_db_version) is not str
+            or self.pinned_appworld_base_db_version != _PINNED_APPWORLD_DB_VERSION
+            or type(self.pinned_python_version) is not str
+            or self.pinned_python_version != "3.11.15"
+            or type(self.adapter_abi_sha256) is not str
+            or self.adapter_abi_sha256 != APPWORLD_ADAPTER_ABI_SHA256
+            or type(self.runner_abi_sha256) is not str
+            or self.runner_abi_sha256 != APPWORLD_GATE0_RUNNER_ABI_SHA256
         ):
             raise ValueError("AppWorld Gate 0 summary is invalid")
+        self.clean._validate_integrity()
+        self.l1._validate_integrity()
+        self.l2._validate_integrity()
         for value in (
             self.screened_task_count,
             self.excluded_task_count,
@@ -230,9 +453,26 @@ class AppWorldGate0Summary:
             self.cleanup_exception_count,
         ):
             _require_exact_nonnegative_int(value)
+        if (
+            self.admitted_task_count > 1
+            or self.admitted_task_count > self.screened_task_count
+            or self.excluded_task_count != self.screened_task_count - self.admitted_task_count
+            or any(
+                summary.requested_count != self.screened_task_count
+                for summary in (self.clean, self.l1, self.l2)
+            )
+            or self.clean.eligible_count != self.l1.eligible_count
+            or self.l2.eligible_count > 1
+            or self.clean.attempted_count != self.l2.eligible_count
+            or self.l1.attempted_count != self.clean.admitted_count
+            or self.l2.attempted_count != self.l1.admitted_count
+            or self.admitted_task_count != self.l2.admitted_count
+        ):
+            raise ValueError("AppWorld Gate 0 summary is invalid")
         if type(self.diagnostic_counts) is not tuple:
             raise ValueError("AppWorld Gate 0 summary is invalid")
         previous = ""
+        diagnostic_map: dict[str, int] = {}
         for entry in self.diagnostic_counts:
             if type(entry) is not tuple or len(entry) != 2:
                 raise ValueError("AppWorld Gate 0 summary is invalid")
@@ -242,6 +482,104 @@ class AppWorldGate0Summary:
             if type(count) is not int or count <= 0:
                 raise ValueError("AppWorld Gate 0 summary is invalid")
             previous = code
+            diagnostic_map[code] = count
+        if any(
+            count != 1
+            for code, count in diagnostic_map.items()
+            if code in _SINGLETON_DIAGNOSTIC_CODES
+        ):
+            raise ValueError("AppWorld Gate 0 summary is invalid")
+        if any(
+            diagnostic_map.get(code, 0) > 4
+            for code in ("suite.case_snapshot_mismatch", "suite.variant_binding_mismatch")
+        ):
+            raise ValueError("AppWorld Gate 0 summary is invalid")
+        exception_total = self.execution_exception_count + self.cleanup_exception_count
+        if (
+            self.execution_exception_count > 1
+            or self.cleanup_exception_count > 1
+            or (exception_total > 0 and self.admitted_task_count != 0)
+        ):
+            raise ValueError("AppWorld Gate 0 summary is invalid")
+        zero_screen_codes = set(diagnostic_map).intersection(_ZERO_SCREEN_DIAGNOSTIC_CODES)
+        exclusion_count = sum(
+            diagnostic_map.get(code, 0) for code in _SCREEN_EXCLUSION_DIAGNOSTIC_CODES
+        )
+        terminal_codes = set(diagnostic_map).intersection(_SCREEN_TERMINAL_DIAGNOSTIC_CODES)
+        admission_codes = set(diagnostic_map).intersection(_ADMISSION_DIAGNOSTIC_CODES)
+        no_l2 = _NO_L2_DIAGNOSTIC_CODE in diagnostic_map
+        if zero_screen_codes:
+            if (
+                len(zero_screen_codes) != 1
+                or len(diagnostic_map) != 1
+                or self.screened_task_count != 0
+                or self.admitted_task_count != 0
+                or exception_total != 0
+                or exclusion_count != 0
+            ):
+                raise ValueError("AppWorld Gate 0 summary is invalid")
+        elif no_l2:
+            if (
+                terminal_codes
+                or admission_codes
+                or self.clean.attempted_count != 0
+                or self.admitted_task_count != 0
+                or exception_total != 0
+                or exclusion_count != self.screened_task_count - self.clean.eligible_count
+            ):
+                raise ValueError("AppWorld Gate 0 summary is invalid")
+        elif terminal_codes:
+            if (
+                len(terminal_codes) != 1
+                or admission_codes
+                or self.clean.attempted_count != 0
+                or self.admitted_task_count != 0
+                or exclusion_count != self.screened_task_count - self.clean.eligible_count - 1
+            ):
+                raise ValueError("AppWorld Gate 0 summary is invalid")
+            lifecycle_failure = "smoke.world_lifecycle_failure" in terminal_codes
+            if (lifecycle_failure and exception_total == 0) or (
+                not lifecycle_failure and exception_total != 0
+            ):
+                raise ValueError("AppWorld Gate 0 summary is invalid")
+        elif admission_codes:
+            if (
+                self.clean.attempted_count != 1
+                or self.admitted_task_count != 0
+                or exclusion_count != self.screened_task_count - self.clean.eligible_count
+            ):
+                raise ValueError("AppWorld Gate 0 summary is invalid")
+            if exception_total:
+                valid_lifecycle_provenance = (
+                    admission_codes == {"pair.execution_exception"}
+                    or (
+                        admission_codes
+                        in (
+                            {"pair.reset_hash_exception"},
+                            {"pair.world_not_fresh"},
+                        )
+                        and self.execution_exception_count == 1
+                    )
+                    or (
+                        admission_codes == {"smoke.admission_exception"}
+                        and self.execution_exception_count == 1
+                        and self.cleanup_exception_count == 0
+                    )
+                )
+                if not valid_lifecycle_provenance:
+                    raise ValueError("AppWorld Gate 0 summary is invalid")
+            elif admission_codes.intersection(
+                {"pair.reset_hash_exception", "pair.world_not_fresh"}
+            ):
+                raise ValueError("AppWorld Gate 0 summary is invalid")
+        elif (
+            self.admitted_task_count != 1
+            or exception_total != 0
+            or exclusion_count != self.screened_task_count - self.clean.eligible_count
+        ):
+            raise ValueError("AppWorld Gate 0 summary is invalid")
+        if self.admitted_task_count == 0 and not self.diagnostic_counts:
+            raise ValueError("AppWorld Gate 0 summary is invalid")
         expected_pass = (
             self.admitted_task_count == 1
             and self.clean.admitted_count == 1
@@ -253,6 +591,48 @@ class AppWorldGate0Summary:
         )
         if self.smoke_passed is not expected_pass:
             raise ValueError("AppWorld Gate 0 summary is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the exact private aggregate allowlist without protected evidence."""
+
+        self._validate_integrity()
+
+        def transform_counts(summary: AppWorldTransformSummary) -> dict[str, int]:
+            return {
+                "requested": summary.requested_count,
+                "eligible": summary.eligible_count,
+                "attempted": summary.attempted_count,
+                "admitted": summary.admitted_count,
+                "excluded": summary.excluded_count,
+            }
+
+        return {
+            "schema_version": self.schema_version,
+            "mode": self.mode,
+            "pinned_appworld_commit": self.pinned_appworld_commit,
+            "pinned_appworld_package_version": self.pinned_appworld_package_version,
+            "pinned_appworld_data_version": self.pinned_appworld_data_version,
+            "pinned_appworld_base_db_version": self.pinned_appworld_base_db_version,
+            "pinned_python_version": self.pinned_python_version,
+            "adapter_abi_sha256": self.adapter_abi_sha256,
+            "runner_abi_sha256": self.runner_abi_sha256,
+            "split": self.split,
+            "seed": self.seed,
+            "workers": self.workers,
+            "screened_task_count": self.screened_task_count,
+            "admitted_task_count": self.admitted_task_count,
+            "transform_counts": {
+                "clean": transform_counts(self.clean),
+                "l1": transform_counts(self.l1),
+                "l2": transform_counts(self.l2),
+            },
+            "diagnostic_counts": dict(self.diagnostic_counts),
+            "execution_exception_count": self.execution_exception_count,
+            "cleanup_exception_count": self.cleanup_exception_count,
+            "gate_evaluable": self.gate_evaluable,
+            "formal_gate_passed": self.formal_gate_passed,
+            "smoke_passed": self.smoke_passed,
+        }
 
 
 def _identity_canonical_call_to_surface(
@@ -671,7 +1051,10 @@ class _SmokeAccounting:
 
     def add_diagnostic(self, code: object) -> None:
         safe_code = code if _is_safe_diagnostic_code(code) else _SAFE_DIAGNOSTIC
-        self.diagnostics[safe_code] += 1
+        if safe_code == _SAFE_DIAGNOSTIC:
+            self.diagnostics[safe_code] = 1
+        else:
+            self.diagnostics[safe_code] += 1
 
     def summary(self, *, seed: int, workers: int) -> AppWorldGate0Summary:
         family_summaries: dict[str, AppWorldTransformSummary] = {}
@@ -716,6 +1099,12 @@ class _SmokeAccounting:
         )
 
 
+def _appworld_gate0_preflight_failure_summary() -> AppWorldGate0Summary:
+    accounting = _SmokeAccounting()
+    accounting.add_diagnostic("smoke.preflight_failure")
+    return accounting.summary(seed=100, workers=1)
+
+
 def _has_cleanup_marker(error: BaseException) -> bool:
     marker: BaseException | None = error
     for _ in range(3):
@@ -732,7 +1121,6 @@ class _SmokeWorldContexts:
         "_accounting",
         "_context_count",
         "_factory",
-        "_live",
         "_seed",
         "_seen_worlds",
     )
@@ -748,52 +1136,59 @@ class _SmokeWorldContexts:
         self._seed = seed
         self._accounting = accounting
         self._context_count = 0
-        self._live = False
         self._seen_worlds: list[object] = []
 
     @contextmanager
     def open(self, *, task_id: str, role: str) -> Iterator[object]:
         if type(task_id) is not str or not task_id or role not in _SMOKE_ROLES:
             raise ValueError(_WORLD_FAILURE)
-        sequence = self._context_count
-        self._context_count += 1
-        kwargs: dict[str, object] = {
-            "task_id": task_id,
-            "experiment_name": f"toolshift-m3a-{sequence:06d}-{uuid.uuid4().hex}",
-            "random_seed": self._seed,
-            **_WORLD_FLAGS,
-        }
-        if role in {"screen", "reference"}:
-            kwargs["ground_truth_mode"] = "full"
-
+        if not _SMOKE_WORLD_SLOT.acquire(blocking=False):
+            self._accounting.execution_exception_count += 1
+            raise ValueError(_WORLD_FAILURE) from None
         entered = False
         body_failed = False
         body_completed = False
+        pre_yield_failed = False
+        yield_started = False
         try:
-            with self._factory(**kwargs) as world:
-                entered = True
-                if self._live or any(world is previous for previous in self._seen_worlds):
-                    raise ValueError(_WORLD_FAILURE)
-                self._seen_worlds.append(world)
-                self._live = True
-                try:
-                    yield world
-                except BaseException:
-                    body_failed = True
-                    raise
-                else:
-                    body_completed = True
-                finally:
-                    self._live = False
-        except BaseException as error:
-            cleanup_failed = _has_cleanup_marker(error) or (
-                entered and body_completed and not body_failed
-            )
-            if cleanup_failed:
-                self._accounting.cleanup_exception_count += 1
-            if body_failed or not cleanup_failed or not entered:
-                self._accounting.execution_exception_count += 1
-            raise
+            try:
+                sequence = self._context_count
+                self._context_count += 1
+                kwargs: dict[str, object] = {
+                    "task_id": task_id,
+                    "experiment_name": f"toolshift-m3a-{sequence:06d}-{uuid.uuid4().hex}",
+                    "random_seed": self._seed,
+                    **_WORLD_FLAGS,
+                }
+                if role == "screen":
+                    kwargs["ground_truth_mode"] = "full"
+                with self._factory(**kwargs) as world:
+                    entered = True
+                    if any(world is previous for previous in self._seen_worlds):
+                        pre_yield_failed = True
+                        raise ValueError(_WORLD_FAILURE)
+                    self._seen_worlds.append(world)
+                    try:
+                        yield_started = True
+                        yield world
+                    except BaseException:
+                        body_failed = True
+                        raise
+                    else:
+                        body_completed = True
+                if pre_yield_failed or body_failed:
+                    raise ValueError(_WORLD_FAILURE) from None
+            except BaseException as error:
+                cleanup_failed = _has_cleanup_marker(error) or (
+                    entered and body_completed and not body_failed
+                )
+                if cleanup_failed:
+                    self._accounting.cleanup_exception_count += 1
+                if body_failed or not yield_started or not cleanup_failed or not entered:
+                    self._accounting.execution_exception_count += 1
+                raise
+        finally:
+            _SMOKE_WORLD_SLOT.release()
 
 
 class _BoundPairWorldFactory:
@@ -841,6 +1236,395 @@ def _require_private_appworld_root() -> Path:
         raise RuntimeError(_PREFLIGHT_FAILURE) from None
 
 
+def _open_private_appworld_directory(
+    name: str,
+    *,
+    parent_fd: int,
+    create: bool,
+) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    created = False
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+                created = True
+            except FileExistsError:
+                pass
+            if created:
+                os.chmod(name, 0o700, dir_fd=parent_fd, follow_symlinks=False)
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
+        if created:
+            os.fchmod(descriptor, 0o700)
+            os.fsync(parent_fd)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ValueError
+        return descriptor
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _read_private_appworld_version(directory_fd: int) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open("version.txt", flags, dir_fd=directory_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise ValueError
+        value = os.read(descriptor, 64)
+        if os.read(descriptor, 1):
+            raise ValueError
+        return value.decode("utf-8", errors="strict").strip()
+    finally:
+        os.close(descriptor)
+
+
+def _require_private_appworld_tree(root: Path) -> None:
+    """Bind protected AppWorld paths without following mutable child symlinks."""
+
+    root_fd: int | None = None
+    data_fd: int | None = None
+    base_dbs_fd: int | None = None
+    runtime_fds: list[int] = []
+    try:
+        if getattr(os, "O_NOFOLLOW", 0) == 0 or getattr(os, "O_DIRECTORY", 0) == 0:
+            raise ValueError
+        root_metadata = root.lstat()
+        if (
+            not root.is_absolute()
+            or root.resolve(strict=True) != root
+            or stat.S_ISLNK(root_metadata.st_mode)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise ValueError
+        root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        root_fd = os.open(root, root_flags)
+        opened_root = os.fstat(root_fd)
+        if (opened_root.st_dev, opened_root.st_ino) != (
+            root_metadata.st_dev,
+            root_metadata.st_ino,
+        ):
+            raise ValueError
+        data_fd = _open_private_appworld_directory("data", parent_fd=root_fd, create=False)
+        base_dbs_fd = _open_private_appworld_directory(
+            "base_dbs",
+            parent_fd=data_fd,
+            create=False,
+        )
+        if (
+            _read_private_appworld_version(data_fd) != _PINNED_APPWORLD_DATA_VERSION
+            or _read_private_appworld_version(base_dbs_fd) != _PINNED_APPWORLD_DB_VERSION
+        ):
+            raise ValueError
+        experiments_fd = _open_private_appworld_directory(
+            "experiments",
+            parent_fd=root_fd,
+            create=True,
+        )
+        runtime_fds.append(experiments_fd)
+        runtime_fds.append(
+            _open_private_appworld_directory(
+                "outputs",
+                parent_fd=experiments_fd,
+                create=True,
+            )
+        )
+        for name in (".tmp", ".profiling", "plots", ".release"):
+            runtime_fds.append(
+                _open_private_appworld_directory(name, parent_fd=root_fd, create=True)
+            )
+        current_root = root.lstat()
+        if (current_root.st_dev, current_root.st_ino) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ):
+            raise ValueError
+    except BaseException:
+        raise RuntimeError(_PREFLIGHT_FAILURE) from None
+    finally:
+        for descriptor in reversed(runtime_fds):
+            os.close(descriptor)
+        if base_dbs_fd is not None:
+            os.close(base_dbs_fd)
+        if data_fd is not None:
+            os.close(data_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _git_blob_sha1(payload: bytes) -> str:
+    digest = hashlib.sha1(usedforsecurity=False)
+    digest.update(f"blob {len(payload)}\0".encode())
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _parse_lfs_pointer(payload: bytes) -> tuple[str, int] | None:
+    lines = payload.splitlines(keepends=True)
+    if (
+        len(lines) != 3
+        or lines[0] != b"version https://git-lfs.github.com/spec/v1\n"
+        or not lines[1].startswith(b"oid sha256:")
+        or not lines[1].endswith(b"\n")
+        or not lines[2].startswith(b"size ")
+        or not lines[2].endswith(b"\n")
+    ):
+        return None
+    raw_digest = lines[1][len(b"oid sha256:") : -1]
+    raw_size = lines[2][len(b"size ") : -1]
+    if (
+        len(raw_digest) != 64
+        or any(byte not in b"0123456789abcdef" for byte in raw_digest)
+        or not raw_size
+        or any(byte not in b"0123456789" for byte in raw_size)
+        or (len(raw_size) > 1 and raw_size.startswith(b"0"))
+    ):
+        return None
+    return raw_digest.decode("ascii"), int(raw_size)
+
+
+def _read_head_blobs(
+    git_prefix: list[str],
+    git_environment: dict[str, str],
+) -> tuple[tuple[bytes, bytes, str, bytes], ...]:
+    tree = subprocess.run(
+        [*git_prefix, "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+        check=True,
+        capture_output=True,
+        env=git_environment,
+        text=False,
+        timeout=30,
+    )
+    entries: list[tuple[bytes, bytes, str]] = []
+    seen_paths: set[bytes] = set()
+    for record in tree.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        path_parts = raw_path.split(b"/")
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or fields[0] not in (b"100644", b"100755", b"120000")
+            or fields[1] != b"blob"
+            or len(fields[2]) != 40
+            or any(byte not in b"0123456789abcdef" for byte in fields[2])
+            or not raw_path
+            or raw_path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in path_parts)
+            or raw_path in seen_paths
+        ):
+            raise ValueError
+        seen_paths.add(raw_path)
+        entries.append((fields[0], fields[2], os.fsdecode(raw_path)))
+    if not entries:
+        raise ValueError
+
+    ordered_oids = tuple(dict.fromkeys(oid for _, oid, _ in entries))
+    objects = subprocess.run(
+        [*git_prefix, "cat-file", "--batch"],
+        input=b"".join(oid + b"\n" for oid in ordered_oids),
+        check=True,
+        capture_output=True,
+        env=git_environment,
+        text=False,
+        timeout=30,
+    ).stdout
+    payloads: dict[bytes, bytes] = {}
+    offset = 0
+    for expected_oid in ordered_oids:
+        header_end = objects.find(b"\n", offset)
+        if header_end < 0:
+            raise ValueError
+        header = objects[offset:header_end].split(b" ")
+        if (
+            len(header) != 3
+            or header[0] != expected_oid
+            or header[1] != b"blob"
+            or not header[2]
+            or any(byte not in b"0123456789" for byte in header[2])
+        ):
+            raise ValueError
+        size = int(header[2])
+        payload_start = header_end + 1
+        payload_end = payload_start + size
+        if payload_end >= len(objects) or objects[payload_end : payload_end + 1] != b"\n":
+            raise ValueError
+        payload = objects[payload_start:payload_end]
+        if _git_blob_sha1(payload).encode("ascii") != expected_oid:
+            raise ValueError
+        payloads[expected_oid] = payload
+        offset = payload_end + 1
+    if offset != len(objects):
+        raise ValueError
+    return tuple((mode, oid, path, payloads[oid]) for mode, oid, path in entries)
+
+
+def _open_checkout_parent(root_fd: int, parts: tuple[bytes, ...]) -> int:
+    descriptor = os.dup(root_fd)
+    try:
+        for part in parts:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_untracked_source_layout(
+    checkout: Path,
+    git_prefix: list[str],
+    git_environment: dict[str, str],
+) -> None:
+    untracked = subprocess.run(
+        [*git_prefix, "ls-files", "--others", "-z", "--"],
+        check=True,
+        capture_output=True,
+        env=git_environment,
+        text=False,
+        timeout=30,
+    ).stdout
+    for raw_path in untracked.split(b"\0"):
+        if not raw_path or not raw_path.startswith(b"src/"):
+            continue
+        parts = raw_path.split(b"/")
+        allowed = (
+            any(
+                raw_path.startswith(prefix)
+                for prefix in _ALLOWED_APPWORLD_UNTRACKED_SOURCE_PREFIXES
+            )
+            or raw_path.startswith(b"src/appworld.egg-info/")
+            or (b"/__pycache__/" in raw_path and raw_path.endswith(b".pyc"))
+        )
+        if (
+            not allowed
+            or raw_path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in parts)
+        ):
+            raise ValueError
+        current = checkout
+        for index, part in enumerate(parts):
+            current /= os.fsdecode(part)
+            metadata = current.lstat()
+            if metadata.st_uid != os.geteuid() or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError
+            if index < len(parts) - 1:
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ValueError
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise ValueError
+
+
+def _require_head_worktree_match(
+    checkout: Path,
+    git_prefix: list[str],
+    git_environment: dict[str, str],
+) -> None:
+    entries = _read_head_blobs(git_prefix, git_environment)
+    _require_untracked_source_layout(checkout, git_prefix, git_environment)
+    root_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    opened_root = os.fstat(root_fd)
+    try:
+        for mode, oid, relative, expected_payload in entries:
+            raw_parts = tuple(os.fsencode(part) for part in Path(relative).parts)
+            parent_fd = _open_checkout_parent(root_fd, raw_parts[:-1])
+            try:
+                leaf = raw_parts[-1]
+                if mode == b"120000":
+                    metadata = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                    if not stat.S_ISLNK(metadata.st_mode):
+                        raise ValueError
+                    target = os.readlink(leaf, dir_fd=parent_fd)
+                    target_bytes = target if type(target) is bytes else os.fsencode(target)
+                    if _git_blob_sha1(target_bytes) != oid.decode("ascii"):
+                        raise ValueError
+                    continue
+
+                descriptor = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                try:
+                    before = os.fstat(descriptor)
+                    if not stat.S_ISREG(before.st_mode) or bool(before.st_mode & 0o111) != (
+                        mode == b"100755"
+                    ):
+                        raise ValueError
+                    pointer = _parse_lfs_pointer(expected_payload)
+                    if pointer is None:
+                        digest = hashlib.sha1(usedforsecurity=False)
+                        digest.update(f"blob {before.st_size}\0".encode())
+                        expected_size = len(expected_payload)
+                    else:
+                        expected_digest, expected_size = pointer
+                        digest = hashlib.sha256()
+                    if before.st_size != expected_size:
+                        raise ValueError
+                    while chunk := os.read(descriptor, 1024 * 1024):
+                        digest.update(chunk)
+                    actual_digest = digest.hexdigest()
+                    if actual_digest != (
+                        oid.decode("ascii") if pointer is None else expected_digest
+                    ):
+                        raise ValueError
+                    after = os.fstat(descriptor)
+                    if (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_mode,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    ) != (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_mode,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    ):
+                        raise ValueError
+                finally:
+                    os.close(descriptor)
+            finally:
+                os.close(parent_fd)
+        current_root = checkout.lstat()
+        if (current_root.st_dev, current_root.st_ino) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ):
+            raise ValueError
+    finally:
+        os.close(root_fd)
+
+
 def _require_editable_appworld_checkout() -> Path:
     try:
         distribution = importlib.metadata.distribution("appworld")
@@ -864,26 +1648,108 @@ def _require_editable_appworld_checkout() -> Path:
         if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
             raise ValueError
         checkout = Path(unquote(parsed.path)).resolve(strict=True)
-        if not checkout.is_absolute() or not (checkout / ".git").exists():
+        git_directory = checkout / ".git"
+        git_directory_stat = git_directory.lstat()
+        if (
+            not checkout.is_absolute()
+            or stat.S_ISLNK(git_directory_stat.st_mode)
+            or not stat.S_ISDIR(git_directory_stat.st_mode)
+        ):
             raise ValueError
-        completed = subprocess.run(
-            ["git", "-C", os.fspath(checkout), "rev-parse", "HEAD"],
+        git_environment = {
+            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        }
+        git_prefix = [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            f"--git-dir={git_directory}",
+            f"--work-tree={checkout}",
+        ]
+        binding = subprocess.run(
+            [*git_prefix, "rev-parse", "--show-toplevel", "--absolute-git-dir"],
             check=True,
             capture_output=True,
+            env=git_environment,
+            text=True,
+            timeout=10,
+        )
+        binding_lines = binding.stdout.splitlines()
+        if (
+            len(binding_lines) != 2
+            or Path(binding_lines[0]).resolve(strict=True) != checkout
+            or Path(binding_lines[1]).resolve(strict=True) != git_directory
+        ):
+            raise ValueError
+        completed = subprocess.run(
+            [*git_prefix, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            env=git_environment,
             text=True,
             timeout=10,
         )
         if completed.stdout.strip() != PINNED_APPWORLD_COMMIT:
             raise ValueError
         symbolic = subprocess.run(
-            ["git", "-C", os.fspath(checkout), "symbolic-ref", "-q", "HEAD"],
+            [*git_prefix, "symbolic-ref", "-q", "HEAD"],
             check=False,
             capture_output=True,
+            env=git_environment,
             text=True,
             timeout=10,
         )
         if symbolic.returncode != 1:
             raise ValueError
+        object_format = subprocess.run(
+            [*git_prefix, "rev-parse", "--show-object-format"],
+            check=True,
+            capture_output=True,
+            env=git_environment,
+            text=True,
+            timeout=10,
+        )
+        if object_format.stdout.strip() != "sha1":
+            raise ValueError
+        index_flags = subprocess.run(
+            [*git_prefix, "ls-files", "-v", "-z"],
+            check=True,
+            capture_output=True,
+            env=git_environment,
+            text=True,
+            timeout=10,
+        )
+        for entry in index_flags.stdout.split("\0"):
+            if (
+                entry
+                and len(entry) >= 2
+                and entry[1] == " "
+                and (entry[0] == "S" or entry[0].islower())
+            ):
+                raise ValueError
+        staged = subprocess.run(
+            [
+                *git_prefix,
+                "diff-index",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                "--ignore-submodules=none",
+                "HEAD",
+                "--",
+            ],
+            check=False,
+            capture_output=True,
+            env=git_environment,
+            text=True,
+            timeout=30,
+        )
+        if staged.returncode != 0 or os.path.lexists(git_directory / "info" / "attributes"):
+            raise ValueError
+        _require_head_worktree_match(checkout, git_prefix, git_environment)
         return checkout
     except BaseException:
         raise RuntimeError(_PREFLIGHT_FAILURE) from None
@@ -898,6 +1764,7 @@ def require_pinned_appworld_runtime() -> None:
         if tuple(sys.version_info[:3]) != _PINNED_PYTHON_VERSION:
             raise ValueError
         root = _require_private_appworld_root()
+        _require_private_appworld_tree(root)
         checkout = _require_editable_appworld_checkout()
         package_module = importlib.import_module("appworld")
         constants_module = importlib.import_module("appworld.common.constants")
@@ -911,10 +1778,6 @@ def require_pinned_appworld_runtime() -> None:
         if (
             getattr(constants_module, "DATA_VERSION", None) != _PINNED_APPWORLD_DATA_VERSION
             or getattr(constants_module, "DB_VERSION", None) != _PINNED_APPWORLD_DB_VERSION
-            or (root / "data" / "version.txt").read_text(encoding="utf-8").strip()
-            != _PINNED_APPWORLD_DATA_VERSION
-            or (root / "data" / "base_dbs" / "version.txt").read_text(encoding="utf-8").strip()
-            != _PINNED_APPWORLD_DB_VERSION
         ):
             raise ValueError
     except BaseException:
@@ -1173,10 +2036,50 @@ def run_appworld_gate0_smoke(
     return accounting.summary(seed=seed, workers=workers)
 
 
+def write_appworld_gate0_summary(
+    path: str | Path,
+    summary: AppWorldGate0Summary,
+) -> None:
+    """Write one aggregate smoke result only beneath the validated private root."""
+
+    if type(summary) is not AppWorldGate0Summary:
+        raise ValueError("AppWorld Gate 0 summary is invalid") from None
+    summary._validate_integrity()
+    error_message = "output must be under the private AppWorld root"
+    try:
+        root = _require_private_appworld_root()
+        output = Path(path)
+        resolved_root = root.resolve(strict=True)
+        resolved_output = output.resolve(strict=False)
+        if (
+            not root.is_absolute()
+            or root != resolved_root
+            or root.is_symlink()
+            or not root.is_dir()
+            or stat.S_IMODE(root.stat().st_mode) != 0o700
+            or root.stat().st_uid != os.geteuid()
+            or any((parent / ".git").exists() for parent in (root, *root.parents))
+            or not output.is_absolute()
+            or output == root
+            or output.is_symlink()
+            or not resolved_output.is_relative_to(resolved_root)
+        ):
+            raise ValueError
+    except BaseException:
+        raise ValueError(error_message) from None
+    try:
+        write_private_json_beneath(root, output, summary.to_dict())
+    except BaseException:
+        raise ValueError("private AppWorld evidence write failed") from None
+
+
 __all__ = [
+    "APPWORLD_ADAPTER_ABI_SHA256",
+    "APPWORLD_GATE0_RUNNER_ABI_SHA256",
     "AppWorldGate0Summary",
     "AppWorldTransformSummary",
     "build_schema_probes",
     "require_pinned_appworld_runtime",
     "run_appworld_gate0_smoke",
+    "write_appworld_gate0_summary",
 ]
