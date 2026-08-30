@@ -199,6 +199,7 @@ def test_appworld_manifest_records_verified_uv_and_editable_resolution_scope() -
     assert manifest["installation"] == {
         "uv_version": "0.11.8",
         "dependency_resolution": "upstream_editable",
+        "dependency_overrides": {"python-dotenv": "1.2.2"},
         "project_training_dependency_lock": {
             "status": "not_completed",
             "checksum": None,
