@@ -78,7 +78,7 @@ Cover:
 
 Also reject schema properties that collide with pinned Requester control names:
 `_app_name`, `_api_name`, `client`, `raise_on_failure`, `show`, `track`, and
-`_system_datetime`.
+`_system_datetime`. Reject root `patternProperties` so a regex cannot re-admit those names.
 
 ### Step 2: Run RED
 
@@ -337,8 +337,8 @@ Add a private capture function used only by the runner. With fake `world.execute
 - public `get/post/put/patch/delete` guards reject direct entry, including `track=False`, while
   permitting calls reached from the wrapped high-level `request`; all guards restore in
   `finally`;
-- no `save()` occurs inside the requester callback; one `world.save()` follows successful
-  `world.execute` and precedes evaluation.
+- no `save()` occurs inside the requester callback and no redundant explicit save follows;
+  pinned `world.execute` performs its own terminal save before evaluation.
 
 ### Step 2: Run RED
 
@@ -484,7 +484,8 @@ Test an injected ordered train-task loader and world factory. Assert:
 - only `train` is passed to the task loader.
 - every reference/clean/candidate/reset factory call shares the frozen execution flags:
   `raise_on_failure=False`, `raise_on_extra_parameters=True`, `remote_apis_url=None`,
-  `remote_mcp_url=None`, `remote_docker=False`, `parse_datetimes=False`,
+  `remote_environment_url=None`, `remote_mcp_url=None`, `remote_docker=False`,
+  `parse_datetimes=False`,
   `wrap_response=False`, `unwrap_response=False`, and `munchify_response=False`; reference
   alone adds `ground_truth_mode=full`.
 
@@ -621,7 +622,8 @@ Document the verified install order for the pinned source:
 ```text
 git lfs install -> clone -> checkout --detach PIN -> git lfs pull
 -> Python 3.11 environment -> editable install -> appworld install --repo
--> download minimal data 0.2.0 into dedicated private APPWORLD_ROOT -> verify tests/tasks
+-> download minimal data 0.2.0 into dedicated private APPWORLD_ROOT
+-> verify tests against that root -> run the train-only lifecycle probe
 ```
 
 Document that uv cache/install staging must remain on node-local storage when the shared NFS
@@ -661,7 +663,7 @@ git commit -m "docs: add AppWorld Gate 0 smoke protocol"
 Run in the detached pinned checkout with all proxy variables unset:
 
 ```bash
-appworld verify tests
+appworld verify tests --root "$APPWORLD_ROOT"
 ```
 
 Redirect detailed logs to a mode-0600 private external directory. Retain only exit status and
@@ -678,7 +680,7 @@ Then, before selection/full smoke, run a private train-only live compatibility p
 - exact Requester/low-level guard replacement/restoration and tracker coverage, including a
   synthetic `track=False` bypass negative control;
 - I-JSON requester responses;
-- oracle capture with one post-execute save, followed by direct replay using
+- oracle capture relying on `world.execute`'s terminal save, followed by direct replay using
   `request -> save -> post-hash` with repeated saves;
 - unique experiment lifecycle and cleanup in the dedicated 0700 root.
 

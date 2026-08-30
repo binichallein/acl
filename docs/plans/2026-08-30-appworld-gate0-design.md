@@ -43,10 +43,11 @@ proxy.
 The reproducible installation order is fixed: install Git LFS; clone AppWorld; checkout the
 commit above in detached mode; pull LFS objects; create the Python 3.11 environment; install
 the checkout editable; run `appworld install --repo`; download minimal data version `0.2.0`
-into a dedicated private `APPWORLD_ROOT`; then run the official test and task verifiers. The
-checkout occurs before editable installation and data setup. Runner startup independently
-checks the installed distribution version, editable checkout revision, data version, and base
-DB version.
+into a dedicated private `APPWORLD_ROOT`; then run the official test verifier against that
+root and the M3A train-only lifecycle probe. The official task verifier is not used because it
+opens both train and dev at this revision. The checkout occurs before editable installation and
+data setup. Runner startup independently checks the installed distribution version, editable
+checkout revision, data version, and base DB version.
 
 ## 3. Data and license boundary
 
@@ -130,7 +131,9 @@ The schema policy is explicit:
 5. never apply JSON Schema defaults during parsing;
 6. validate calls using Draft 2020-12 plus `FormatChecker` and I-JSON-safe snapshots;
 7. reject any property colliding with Requester control parameters such as `_app_name`,
-   `_api_name`, `client`, `raise_on_failure`, `show`, `track`, or `_system_datetime`.
+   `_api_name`, `client`, `raise_on_failure`, `show`, `track`, or `_system_datetime`;
+8. reject root `patternProperties`, which could otherwise re-admit a Requester control name
+   despite the explicit-property check.
 
 Adding the closed-root constraint is recorded in the adapter manifest as a schema policy, not
 silently presented as raw upstream schema. `jsonschema` therefore becomes a ToolShift runtime
@@ -181,13 +184,15 @@ the exact order is `request -> world.save() -> post-call state inspection`; eval
 only after the last save. The pinned-runtime smoke must therefore exercise repeated `save()`
 calls. This ordering applies to direct clean/candidate replay, not inside the callback of
 `world.execute`: a pinned-runtime compatibility probe showed nested `save()` there is not a
-supported lifecycle. Oracle capture saves once after `execute` completes and supplies no
-state/effect evidence. The executor does not generate or execute Python code, expose
+supported lifecycle. Oracle capture relies on the terminal save performed by `world.execute`
+and supplies no state/effect evidence; it does not issue a redundant explicit save. The
+executor does not generate or execute Python code, expose
 `load_state`, or allow an agent to roll the world back. Each reset is a close followed by
 construction of a fresh `AppWorld` with the same complete initialization profile.
 
 All roles share `raise_on_failure=False`, `raise_on_extra_parameters=True`, the fixed seed,
-`remote_apis_url=None`, `remote_mcp_url=None`, `remote_docker=False`,
+`remote_apis_url=None`, `remote_environment_url=None`, `remote_mcp_url=None`,
+`remote_docker=False`,
 `parse_datetimes=False`, `wrap_response=False`, `unwrap_response=False`, and
 `munchify_response=False`; reference capture additionally uses `ground_truth_mode=full`.
 Every phase has a unique private experiment name, only one world is live in a process at a
