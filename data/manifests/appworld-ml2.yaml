@@ -80,6 +80,67 @@ official_verification:
     elapsed_seconds: 246
     passed: 147
     total: 147
+gate_0a:
+  observed_at: "2026-08-30"
+  run_label: formal-os-exit-c84049ad-20260829T212809Z
+  evidence:
+    path: data/evidence/appworld/gate0a/formal-2026-08-30.json
+    bytes: 741
+    sha256: 57508fde225276408238e745eb6cc932fabf6b06b3445f69961cebd865aa39a4
+  verifier_commit: c84049adaa4875c2ae4d06652e451db38d2cf588
+  appworld_commit: a072b7a86e7c1d5b1d7175659d750ebb9b79f10a
+  protocol:
+    splits:
+      - dev
+      - train
+    split_counts:
+      dev: 57
+      train: 90
+    task_count: 147
+    repetitions: 3
+    episode_count: 441
+    seed: 100
+    workers: 1
+  result:
+    initial_state_match_rate: 1.0
+    final_state_match_rate: 1.0
+    evaluator_match_rate: 1.0
+    trace_match_rate: 1.0
+    task_consistency_rate: 1.0
+    oracle_success_rate: 1.0
+    execution_failure_count: 0
+    exception_count: 0
+    failure_counts: {}
+    gate_evaluable: true
+    gate_passed: true
+    smoke_passed: false
+  os_exit:
+    code: 0
+    artifact_sha256: 9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa
+  runtime_log:
+    schema_version: 1
+    content_reviewed: false
+    log_nonempty: true
+    process_log_bytes: 135254
+    process_log_deleted: true
+    source_metadata_sha256: 7ecd7ee397db15811f067dc63965ea004e10b31a76a07e2c97ac1b27d4138b00
+  protected_content_included: false
+  raw_artifacts_committed: false
+  provenance_limitations:
+    summary_schema_version: 1
+    summary_binds:
+      - appworld_commit
+      - task_set_fingerprint
+      - fixed_protocol
+      - aggregate_results
+    summary_does_not_bind:
+      - toolshift_commit
+      - wrapper_version
+      - runtime_version
+      - command_digest
+      - timestamps
+    verifier_commit_source: audited_run_label_and_operational_chain
+    future_schema_requirement: atomic_completion_record
 warnings:
   - starlette_httpx_compatibility
   - cryptography_cfb_deprecation

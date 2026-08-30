@@ -1,0 +1,31 @@
+{
+  "episode_count": 441,
+  "evaluator_match_rate": 1.0,
+  "exception_count": 0,
+  "execution_failure_count": 0,
+  "failure_counts": {},
+  "final_state_match_rate": 1.0,
+  "gate_evaluable": true,
+  "gate_passed": true,
+  "initial_state_match_rate": 1.0,
+  "mode": "gate",
+  "oracle_success_rate": 1.0,
+  "pinned_appworld_commit": "a072b7a86e7c1d5b1d7175659d750ebb9b79f10a",
+  "repetitions": 3,
+  "schema_version": 1,
+  "seed": 100,
+  "smoke_passed": false,
+  "split_counts": {
+    "dev": 57,
+    "train": 90
+  },
+  "splits": [
+    "dev",
+    "train"
+  ],
+  "task_consistency_rate": 1.0,
+  "task_count": 147,
+  "task_set_sha256": "11a5fc9bb4ae1329a45fd0f7012b2b2432de539d01930f329740f012e4c30602",
+  "trace_match_rate": 1.0,
+  "workers": 1
+}

@@ -8,9 +8,10 @@ The project uses AppWorld as the primary stateful training and evaluation enviro
 
 The project is in the environment-validation and pilot-design phase. Results and model artifacts will be published only after reproducibility and data-license checks. Model training has not started.
 
-The local W1 scaffold and system-configuration layer are complete. On `ml2`, the pinned AppWorld checkout has completed the official test and task verification commands. The reproducibility records and approved plans are:
+The local W1 scaffold and system-configuration layer are complete. On `ml2`, the pinned AppWorld checkout has completed the official test and task verification commands. The fixed Gate 0a replay protocol also passed over all 90 train and 57 dev tasks: 147 tasks × 3 repetitions = 441 episodes; all six aggregate rates were `1.0`, with zero execution failures and zero exceptions. This is environment evidence only, not a model result or a held-out evaluation. The reproducibility records and approved plans are:
 
 - [AppWorld `ml2` manifest](data/manifests/appworld-ml2.yaml)
+- [Gate 0a aggregate environment evidence](data/evidence/appworld/gate0a/formal-2026-08-30.json)
 - [BFCL v4 manifest](data/manifests/bfcl-v4.yaml)
 - [Research design](docs/plans/2026-08-29-tool-interface-tail-rl-design.md)
 - [Implementation plan](docs/plans/2026-08-29-tool-interface-tail-rl-implementation-plan.md)

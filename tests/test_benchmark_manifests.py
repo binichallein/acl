@@ -1,19 +1,134 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
+
+from toolshift.benchmarks.appworld_replay import ReplayMode, ReplaySummary
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 APPWORLD_RUNBOOK = REPOSITORY_ROOT / "docs/environment/ml2-appworld.md"
+README = REPOSITORY_ROOT / "README.md"
+GATE_0A_EVIDENCE_RELATIVE_PATH = Path(
+    "data/evidence/appworld/gate0a/formal-2026-08-30.json"
+)
+GATE_0A_EVIDENCE = REPOSITORY_ROOT / GATE_0A_EVIDENCE_RELATIVE_PATH
 FULL_GIT_OBJECT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
 APPWORLD_COMMIT = "a072b7a86e7c1d5b1d7175659d750ebb9b79f10a"
 BFCL_COMPARABLE_COMMIT = "f7cf7359b7ac615a0b294831c5ba2bc95ee4a000"
 BFCL_OBSERVED_HEAD = "6ea57973c7a6097fd7c5915698c54c17c5b1b6c8"
+GATE_0A_EVIDENCE_BYTES = 741
+GATE_0A_EVIDENCE_SHA256 = (
+    "57508fde225276408238e745eb6cc932fabf6b06b3445f69961cebd865aa39a4"
+)
+GATE_0A_TASK_SET_SHA256 = (
+    "11a5fc9bb4ae1329a45fd0f7012b2b2432de539d01930f329740f012e4c30602"
+)
+GATE_0A_PRIVACY_ALLOWLIST = frozenset(
+    {
+        "schema_version",
+        "mode",
+        "pinned_appworld_commit",
+        "splits",
+        "split_counts",
+        "task_set_sha256",
+        "task_count",
+        "repetitions",
+        "episode_count",
+        "seed",
+        "workers",
+        "initial_state_match_rate",
+        "final_state_match_rate",
+        "evaluator_match_rate",
+        "trace_match_rate",
+        "task_consistency_rate",
+        "oracle_success_rate",
+        "execution_failure_count",
+        "exception_count",
+        "failure_counts",
+        "gate_evaluable",
+        "gate_passed",
+        "smoke_passed",
+    }
+)
+GATE_0A_PAYLOAD: dict[str, Any] = {
+    "schema_version": 1,
+    "mode": "gate",
+    "pinned_appworld_commit": APPWORLD_COMMIT,
+    "splits": ["dev", "train"],
+    "split_counts": {"dev": 57, "train": 90},
+    "task_set_sha256": GATE_0A_TASK_SET_SHA256,
+    "task_count": 147,
+    "repetitions": 3,
+    "episode_count": 441,
+    "seed": 100,
+    "workers": 1,
+    "initial_state_match_rate": 1.0,
+    "final_state_match_rate": 1.0,
+    "evaluator_match_rate": 1.0,
+    "trace_match_rate": 1.0,
+    "task_consistency_rate": 1.0,
+    "oracle_success_rate": 1.0,
+    "execution_failure_count": 0,
+    "exception_count": 0,
+    "failure_counts": {},
+    "gate_evaluable": True,
+    "gate_passed": True,
+    "smoke_passed": False,
+}
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _load_unique_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _reconstruct_replay_summary(payload: dict[str, Any]) -> ReplaySummary:
+    assert payload["schema_version"] == 1
+    return ReplaySummary(
+        mode=ReplayMode(payload["mode"]),
+        pinned_appworld_commit=payload["pinned_appworld_commit"],
+        splits=tuple(payload["splits"]),
+        split_counts=tuple(payload["split_counts"].items()),
+        task_set_sha256=payload["task_set_sha256"],
+        task_count=payload["task_count"],
+        repetitions=payload["repetitions"],
+        episode_count=payload["episode_count"],
+        seed=payload["seed"],
+        workers=payload["workers"],
+        initial_state_match_rate=payload["initial_state_match_rate"],
+        final_state_match_rate=payload["final_state_match_rate"],
+        evaluator_match_rate=payload["evaluator_match_rate"],
+        trace_match_rate=payload["trace_match_rate"],
+        task_consistency_rate=payload["task_consistency_rate"],
+        oracle_success_rate=payload["oracle_success_rate"],
+        execution_failure_count=payload["execution_failure_count"],
+        exception_count=payload["exception_count"],
+        failure_counts=tuple(payload["failure_counts"].items()),
+        gate_evaluable=payload["gate_evaluable"],
+        gate_passed=payload["gate_passed"],
+        smoke_passed=payload["smoke_passed"],
+    )
 
 
 def _load_manifest(filename: str) -> dict[str, Any]:
@@ -249,6 +364,230 @@ def test_appworld_manifest_records_official_verification_results() -> None:
         "passed": 147,
         "total": 147,
     }
+
+
+def test_appworld_gate_0a_evidence_is_canonical_replay_summary() -> None:
+    encoded = GATE_0A_EVIDENCE.read_bytes()
+
+    assert len(encoded) == GATE_0A_EVIDENCE_BYTES
+    assert hashlib.sha256(encoded).hexdigest() == GATE_0A_EVIDENCE_SHA256
+
+    payload = _load_unique_json(GATE_0A_EVIDENCE)
+    assert len(payload) == 23
+    assert payload == GATE_0A_PAYLOAD
+
+    summary = _reconstruct_replay_summary(payload)
+    assert summary.to_dict() == payload
+    canonical = (
+        json.dumps(
+            summary.to_dict(),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert canonical == encoded
+
+
+def test_appworld_gate_0a_json_loader_rejects_duplicate_keys(tmp_path: Path) -> None:
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text('{"mode": "gate", "mode": "smoke"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON key: mode"):
+        _load_unique_json(duplicate)
+
+
+def test_appworld_gate_0a_evidence_uses_only_aggregate_privacy_fields() -> None:
+    payload = _load_unique_json(GATE_0A_EVIDENCE)
+
+    assert frozenset(payload) == GATE_0A_PRIVACY_ALLOWLIST
+    assert payload["splits"] == ["dev", "train"]
+    assert payload["failure_counts"] == {}
+
+    keys: set[str] = set()
+    string_values: list[str] = []
+    pending: list[Any] = [payload]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            keys.update(node)
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, str):
+            string_values.append(node)
+
+    forbidden_keys = {
+        "task_id",
+        "task_ids",
+        "checkout_path",
+        "shared_path",
+        "compiled_solution",
+        "compiled_solutions",
+        "trajectory",
+        "trajectories",
+        "request",
+        "requests",
+        "request_trace",
+        "request_traces",
+        "api_arguments",
+        "execution_output",
+        "evaluator_requirements",
+    }
+    assert keys.isdisjoint(forbidden_keys)
+    forbidden_text = re.compile(
+        r"https?://|(?:^|\s)/(?:home|mnt|tmp|var)/|"
+        r"proxy|credential|token|secret|trajectory|request[ _-]?trace|"
+        r"api[ _-]?arguments|execution[ _-]?output|evaluator[ _-]?requirements|"
+        r"task[ _-]?ids?",
+        flags=re.IGNORECASE,
+    )
+    assert all(forbidden_text.search(value) is None for value in string_values)
+
+
+def test_appworld_manifest_cross_binds_gate_0a_evidence_and_provenance() -> None:
+    manifest = _load_manifest("appworld-ml2.yaml")
+    gate = manifest["gate_0a"]
+
+    assert gate == {
+        "observed_at": "2026-08-30",
+        "run_label": "formal-os-exit-c84049ad-20260829T212809Z",
+        "evidence": {
+            "path": GATE_0A_EVIDENCE_RELATIVE_PATH.as_posix(),
+            "bytes": GATE_0A_EVIDENCE_BYTES,
+            "sha256": GATE_0A_EVIDENCE_SHA256,
+        },
+        "verifier_commit": "c84049adaa4875c2ae4d06652e451db38d2cf588",
+        "appworld_commit": APPWORLD_COMMIT,
+        "protocol": {
+            "splits": ["dev", "train"],
+            "split_counts": {"dev": 57, "train": 90},
+            "task_count": 147,
+            "repetitions": 3,
+            "episode_count": 441,
+            "seed": 100,
+            "workers": 1,
+        },
+        "result": {
+            "initial_state_match_rate": 1.0,
+            "final_state_match_rate": 1.0,
+            "evaluator_match_rate": 1.0,
+            "trace_match_rate": 1.0,
+            "task_consistency_rate": 1.0,
+            "oracle_success_rate": 1.0,
+            "execution_failure_count": 0,
+            "exception_count": 0,
+            "failure_counts": {},
+            "gate_evaluable": True,
+            "gate_passed": True,
+            "smoke_passed": False,
+        },
+        "os_exit": {
+            "code": 0,
+            "artifact_sha256": (
+                "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+            ),
+        },
+        "runtime_log": {
+            "schema_version": 1,
+            "content_reviewed": False,
+            "log_nonempty": True,
+            "process_log_bytes": 135254,
+            "process_log_deleted": True,
+            "source_metadata_sha256": (
+                "7ecd7ee397db15811f067dc63965ea004e10b31a76a07e2c97ac1b27d4138b00"
+            ),
+        },
+        "protected_content_included": False,
+        "raw_artifacts_committed": False,
+        "provenance_limitations": {
+            "summary_schema_version": 1,
+            "summary_binds": [
+                "appworld_commit",
+                "task_set_fingerprint",
+                "fixed_protocol",
+                "aggregate_results",
+            ],
+            "summary_does_not_bind": [
+                "toolshift_commit",
+                "wrapper_version",
+                "runtime_version",
+                "command_digest",
+                "timestamps",
+            ],
+            "verifier_commit_source": "audited_run_label_and_operational_chain",
+            "future_schema_requirement": "atomic_completion_record",
+        },
+    }
+
+    payload = _load_unique_json(REPOSITORY_ROOT / gate["evidence"]["path"])
+    assert gate["evidence"]["bytes"] == len(GATE_0A_EVIDENCE.read_bytes())
+    assert gate["evidence"]["sha256"] == hashlib.sha256(
+        GATE_0A_EVIDENCE.read_bytes()
+    ).hexdigest()
+    assert gate["appworld_commit"] == payload["pinned_appworld_commit"]
+    for field_name, value in gate["protocol"].items():
+        assert payload[field_name] == value
+    for field_name, value in gate["result"].items():
+        assert payload[field_name] == value
+
+
+def test_appworld_runbook_records_gate_0a_without_machine_paths_or_overclaiming() -> None:
+    runbook = _read_appworld_runbook()
+    normalized = " ".join(runbook.split())
+
+    assert "/home/" not in runbook
+    assert "/mnt/" not in runbook
+    assert "wait for the verifier to finish" in normalized
+    assert "atomically write a mode-0600 OS-exit record" in normalized
+    assert "validate exit code zero and the exact summary integrity and hash" in normalized
+    assert "capture only safe process-log byte metadata" in normalized
+    assert "delete the exact resolved private process-log path" in normalized
+    assert (
+        "atomically write aggregate runtime metadata with `process_log_deleted=true`"
+        in normalized
+    )
+    assert "promote the evidence and checksums" in normalized
+    wrapper_steps = [
+        "wait for the verifier to finish",
+        "atomically write a mode-0600 OS-exit record",
+        "validate exit code zero and the exact summary integrity and hash",
+        "capture only safe process-log byte metadata",
+        "delete the exact resolved private process-log path",
+        "atomically write aggregate runtime metadata with `process_log_deleted=true`",
+        "promote the evidence and checksums",
+    ]
+    assert [normalized.index(step) for step in wrapper_steps] == sorted(
+        normalized.index(step) for step in wrapper_steps
+    )
+
+    assert "Schema v1 binds" in normalized
+    assert "does not bind the ToolShift commit" in normalized
+    assert "wrapper version" in normalized
+    assert "runtime version" in normalized
+    assert "command digest" in normalized
+    assert "timestamps" in normalized
+    assert "atomic completion record" in normalized
+    assert "temporary or nonzero run retains its private process log" in normalized
+    assert "must not claim `process_log_deleted=true`" in normalized
+    assert "never a glob or symbolic link" in normalized
+
+
+def test_readme_scopes_gate_0a_as_train_dev_environment_evidence() -> None:
+    readme = README.read_text(encoding="utf-8")
+
+    assert (
+        "[Gate 0a aggregate environment evidence]"
+        f"({GATE_0A_EVIDENCE_RELATIVE_PATH.as_posix()})" in readme
+    )
+    assert "all 90 train and 57 dev tasks" in readme
+    assert "147 tasks \N{MULTIPLICATION SIGN} 3 repetitions = 441 episodes" in readme
+    assert "all six aggregate rates were `1.0`" in readme
+    assert "zero execution failures and zero exceptions" in readme
+    assert "environment evidence only" in readme
+    assert "not a model result or a held-out evaluation" in readme
 
 
 def test_appworld_runbook_freezes_replay_gate_runtime_safety() -> None:
