@@ -18,6 +18,15 @@ def _raw_adapter_variant(adapter: SemanticAdapter) -> object:
     return _ADAPTER_VARIANT_SLOT.__get__(adapter, SemanticAdapter)
 
 
+def _variant_has_interface_manifest(value: object, error_message: str) -> bool:
+    if type(value) is not SchemaVariant:
+        return False
+    try:
+        return value.manifest.get("kind") == "toolshift_interface_variant"
+    except Exception:
+        raise TransformValidationError(error_message) from None
+
+
 @dataclass(frozen=True, slots=True)
 class _MappingRootSeal:
     mapping: Mapping[str, JSONValue]

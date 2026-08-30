@@ -21,6 +21,7 @@ from toolshift.transforms._runtime import (
     _raw_adapter_variant,
     _schema_runtime_seal_matches,
     _SchemaRuntimeSeal,
+    _variant_has_interface_manifest,
 )
 from toolshift.transforms.base import (
     OperatorManifestEntry,
@@ -674,6 +675,14 @@ class RenameAdapter(SemanticAdapter):
             source_raw = _raw_adapter_variant(source_adapter)
         except Exception:
             raise TransformValidationError("source adapter binding validation failed") from None
+        if _variant_has_interface_manifest(
+            source_public,
+            "source adapter binding validation failed",
+        ) or _variant_has_interface_manifest(
+            source_raw,
+            "source adapter binding validation failed",
+        ):
+            raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
         if source_public is not source_variant or source_raw is not source_variant:
             raise TransformValidationError("source adapter binding does not match transform")
         try:
@@ -806,6 +815,11 @@ def apply_rename(
         raise TransformValidationError("source adapter binding validation failed") from None
     if type(source_variant) is not SchemaVariant:
         raise TransformValidationError("source adapter binding validation failed")
+    if _variant_has_interface_manifest(
+        source_variant,
+        "source adapter binding validation failed",
+    ):
+        raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
     transform = build_rename_transform(
         source_variant,
         tool_name_mapping=tool_name_mapping,

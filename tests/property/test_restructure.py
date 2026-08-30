@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+import toolshift.transforms.rename as rename_module
 import toolshift.transforms.restructure as restructure_module
 from toolshift.adapters.semantic import SemanticAdapter
 from toolshift.contracts.schema import schema_fingerprint
@@ -155,6 +156,49 @@ class _RecordingRestructureSource(SemanticAdapter):
     def canonicalize_trace(self, trace: ExecutionTrace) -> tuple[SemanticAction, ...]:
         self.trace_inputs.append(trace)
         return trace.semantic_actions
+
+
+class _IdentityArgumentShapeSource(_RecordingRestructureSource):
+    def surface_to_semantic(
+        self,
+        surface_call: Mapping[str, JSONValue],
+    ) -> tuple[SemanticAction, ...]:
+        self.parse_inputs.append(surface_call)
+        result = (SemanticAction("status", {}),)
+        self.parse_results.append(result)
+        return result
+
+    def base_observation_to_surface(
+        self,
+        surface_call: Mapping[str, JSONValue],
+        actions: tuple[SemanticAction, ...],
+        base_observation_groups: tuple[tuple[JSONValue, ...], ...],
+    ) -> JSONValue:
+        self.wrap_inputs.append((surface_call, actions, base_observation_groups))
+        return base_observation_groups[0][0]
+
+
+class _ExplodingManifestMapping(Mapping[str, JSONValue]):
+    def __getitem__(self, key: str) -> JSONValue:
+        raise RuntimeError("PRIVATE_MANIFEST_PAYLOAD")
+
+    def __iter__(self):
+        return iter(("kind",))
+
+    def __len__(self) -> int:
+        return 1
+
+
+class _ManifestPayloadPublicSource(_RecordingRestructureSource):
+    def __init__(self, variant: SchemaVariant) -> None:
+        super().__init__(variant)
+        public_variant = _base_variant()
+        object.__setattr__(public_variant, "manifest", _ExplodingManifestMapping())
+        self._public_variant = public_variant
+
+    @property
+    def variant(self) -> SchemaVariant:
+        return self._public_variant
 
 
 class _ExplodingCallMapping(dict[str, JSONValue]):
@@ -1409,6 +1453,101 @@ def test_identity_tool_calls_are_frozen_without_parameter_mode_classification() 
 
 
 @pytest.mark.parametrize(
+    "identity_call",
+    [
+        {"name": "status", "arguments": "ping", "metadata": {"attempt": 0}},
+        {"name": "status", "arguments": None, "metadata": {"attempt": 0}},
+        {"name": "status", "metadata": {"attempt": 0}},
+    ],
+)
+def test_identity_tool_preserves_scalar_null_and_missing_argument_shapes(
+    identity_call: dict[str, JSONValue],
+) -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    original = copy.deepcopy(identity_call)
+
+    canonical = transform.surface_call_to_canonical(identity_call)
+    surface = transform.canonical_call_to_surface(identity_call)
+
+    assert canonical_json_bytes(canonical) == canonical_json_bytes(identity_call)
+    assert canonical_json_bytes(surface) == canonical_json_bytes(identity_call)
+    assert canonical is not identity_call
+    assert surface is not identity_call
+    assert identity_call == original
+
+
+@pytest.mark.parametrize(
+    "identity_call",
+    [
+        {"name": "status", "arguments": "ping"},
+        {"name": "status"},
+    ],
+)
+def test_identity_argument_shapes_delegate_parse_and_wrap_exactly_once(
+    identity_call: dict[str, JSONValue],
+) -> None:
+    source = _IdentityArgumentShapeSource(_base_variant())
+    adapter = _apply_restructure(source)
+
+    actions = adapter.surface_to_semantic(identity_call)
+    assert actions is source.parse_results[0]
+    assert len(source.parse_inputs) == 1
+    assert canonical_json_bytes(source.parse_inputs[0]) == canonical_json_bytes(identity_call)
+
+    observation: JSONValue = {"status": "ok"}
+    groups = ((observation,),)
+    wrapped = adapter.base_observation_to_surface(identity_call, actions, groups)
+    delegated_call, delegated_actions, delegated_groups = source.wrap_inputs[0]
+    assert canonical_json_bytes(delegated_call) == canonical_json_bytes(identity_call)
+    assert delegated_actions is actions
+    assert delegated_groups is groups
+    assert wrapped is observation
+    assert len(source.wrap_inputs) == 1
+
+
+@pytest.mark.parametrize(
+    "identity_call",
+    [
+        {"name": "status", "arguments": "ping"},
+        {"name": "status"},
+    ],
+)
+def test_identity_argument_shapes_keep_neutral_trace_identity(
+    identity_call: dict[str, JSONValue],
+) -> None:
+    source = _IdentityArgumentShapeSource(_base_variant())
+    adapter = _apply_restructure(source)
+    trace = ExecutionTrace((identity_call,), (), ())
+
+    result = adapter.canonicalize_trace(trace)
+
+    assert result is trace.semantic_actions
+    assert len(source.trace_inputs) == 1
+    assert source.trace_inputs[0] is trace
+
+
+def test_identity_argument_shapes_still_reject_invalid_i_json() -> None:
+    transform = build_parameter_restructure_transform(
+        _base_variant(),
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    invalid_call = {"name": "status", "arguments": float("nan")}
+
+    for translate in (
+        transform.surface_call_to_canonical,
+        transform.canonical_call_to_surface,
+    ):
+        with pytest.raises(TransformValidationError) as caught:
+            translate(invalid_call)
+        assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
     "call",
     [
         {"name": "unknown", "arguments": {}},
@@ -1416,7 +1555,6 @@ def test_identity_tool_calls_are_frozen_without_parameter_mode_classification() 
         {"name": 7, "arguments": {}},
         {"name": "search"},
         {"name": "search", "arguments": "PRIVATE_ARGUMENTS"},
-        {"name": "status", "arguments": "PRIVATE_IDENTITY_ARGUMENTS"},
         {"name": "search", "arguments": {"query": "alpha", "locale": "en"}},
         {
             "name": "search",
@@ -1473,7 +1611,6 @@ def test_surface_call_translation_rejects_invalid_closed_shapes_without_payload(
         {"name": False, "arguments": {}},
         {"name": "search"},
         {"name": "search", "arguments": "PRIVATE_ARGUMENTS"},
-        {"name": "status", "arguments": "PRIVATE_IDENTITY_ARGUMENTS"},
         {
             "name": "search",
             "arguments": {"query": "alpha", "locale": "en", "request": {}},
@@ -1802,6 +1939,7 @@ def test_parameter_restructure_adapter_delegates_pipeline_objects_exactly_once()
 
     base_calls = adapter.semantic_to_base_calls(actions[0])
     assert source.compile_inputs == [actions[0]]
+    assert source.compile_inputs[0] is actions[0]
     assert base_calls is source.compile_results[0]
 
     observation: JSONValue = {"items": ["雪", False, None]}
@@ -2059,6 +2197,121 @@ def test_helper_and_direct_adapter_reject_implicit_composition() -> None:
         match=r"^parameter restructure composition requires the explicit compose transform$",
     ):
         restructure_module.ParameterRestructureAdapter(first, clean_transform)
+
+
+def test_rename_to_restructure_composition_is_classified_at_every_entry() -> None:
+    base = _base_variant()
+    rename_adapter = rename_module.apply_rename(
+        _RecordingRestructureSource(base),
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+    clean_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    composed_rule = ParameterGroupRule("lookup", "request", ("query", "limit"))
+    expected = r"^parameter restructure composition requires the explicit compose transform$"
+
+    with pytest.raises(TransformValidationError, match=expected):
+        build_parameter_restructure_transform(
+            rename_adapter.variant,
+            rules=(composed_rule,),
+            seed=7,
+        )
+    with pytest.raises(TransformValidationError, match=expected):
+        ParameterRestructureTransform(
+            rename_adapter.variant,
+            clean_transform.variant,
+            clean_transform.operator,
+            clean_transform.rules,
+        )
+    with pytest.raises(TransformValidationError, match=expected):
+        restructure_module.apply_parameter_restructure(
+            rename_adapter,
+            rules=(composed_rule,),
+            seed=7,
+        )
+    with pytest.raises(TransformValidationError, match=expected):
+        restructure_module.ParameterRestructureAdapter(rename_adapter, clean_transform)
+
+
+def test_restructure_to_rename_composition_is_classified_at_every_entry() -> None:
+    base = _base_variant()
+    restructure_adapter = _apply_restructure(_RecordingRestructureSource(base))
+    clean_transform = rename_module.build_rename_transform(
+        base,
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+    expected = r"^rename composition requires the explicit compose transform$"
+
+    with pytest.raises(TransformValidationError, match=expected):
+        rename_module.build_rename_transform(
+            restructure_adapter.variant,
+            tool_name_mapping={"search": "lookup"},
+            seed=13,
+        )
+    with pytest.raises(TransformValidationError, match=expected):
+        rename_module.RenameTransform(
+            restructure_adapter.variant,
+            clean_transform.variant,
+            clean_transform.operator,
+            clean_transform.canonical_to_surface,
+        )
+    with pytest.raises(TransformValidationError, match=expected):
+        rename_module.apply_rename(
+            restructure_adapter,
+            tool_name_mapping={"search": "lookup"},
+            seed=13,
+        )
+    with pytest.raises(TransformValidationError, match=expected):
+        rename_module.RenameAdapter(restructure_adapter, clean_transform)
+
+
+def test_cross_composition_manifest_probes_sanitize_public_callback_payloads() -> None:
+    base = _base_variant()
+    source = _ManifestPayloadPublicSource(base)
+    restructure_transform = build_parameter_restructure_transform(
+        base,
+        rules=(_search_rule(),),
+        seed=7,
+    )
+    rename_transform = rename_module.build_rename_transform(
+        base,
+        tool_name_mapping={"search": "lookup"},
+        seed=13,
+    )
+
+    for constructor, transform in (
+        (restructure_module.ParameterRestructureAdapter, restructure_transform),
+        (rename_module.RenameAdapter, rename_transform),
+    ):
+        with pytest.raises(TransformValidationError) as caught:
+            constructor(source, transform)
+        assert "PRIVATE_MANIFEST_PAYLOAD" not in str(caught.value)
+        assert caught.value.__cause__ is None
+
+
+def test_cross_composition_manifest_probes_sanitize_raw_callback_payloads() -> None:
+    raw_variant = _base_variant()
+    object.__setattr__(raw_variant, "manifest", _ExplodingManifestMapping())
+    source = _RecordingRestructureSource(raw_variant)
+
+    for apply in (
+        restructure_module.apply_parameter_restructure,
+        rename_module.apply_rename,
+    ):
+        kwargs: dict[str, object]
+        if apply is restructure_module.apply_parameter_restructure:
+            kwargs = {"rules": (_search_rule(),), "seed": 7}
+        else:
+            kwargs = {"tool_name_mapping": {"search": "lookup"}, "seed": 13}
+        with pytest.raises(TransformValidationError) as caught:
+            apply(source, **kwargs)
+        assert "PRIVATE_MANIFEST_PAYLOAD" not in str(caught.value)
+        assert caught.value.__cause__ is None
 
 
 def test_online_translation_uses_only_precomputed_plans_and_runtime_roots(

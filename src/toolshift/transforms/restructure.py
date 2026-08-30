@@ -21,6 +21,7 @@ from toolshift.transforms._runtime import (
     _raw_adapter_variant,
     _schema_runtime_seal_matches,
     _SchemaRuntimeSeal,
+    _variant_has_interface_manifest,
 )
 from toolshift.transforms.base import (
     OperatorManifestEntry,
@@ -722,16 +723,25 @@ def _transform_snapshot(
 def _freeze_call_snapshot(
     call: object,
     context: str,
-) -> tuple[Mapping[str, JSONValue], str, Mapping[str, JSONValue]]:
+) -> tuple[Mapping[str, JSONValue], str]:
     try:
         snapshot = _freeze_mapping(call, context)
     except Exception:
         raise TransformValidationError(f"{context} is invalid") from None
     name = snapshot.get("name")
-    arguments = snapshot.get("arguments")
-    if type(name) is not str or not isinstance(arguments, Mapping):
+    if type(name) is not str:
         raise TransformValidationError(f"{context} is invalid")
-    return snapshot, name, cast(Mapping[str, JSONValue], arguments)
+    return snapshot, name
+
+
+def _changed_call_arguments(
+    call: Mapping[str, JSONValue],
+    context: str,
+) -> Mapping[str, JSONValue]:
+    arguments = call.get("arguments")
+    if not isinstance(arguments, Mapping):
+        raise TransformValidationError(f"{context} is invalid")
+    return cast(Mapping[str, JSONValue], arguments)
 
 
 def _call_with_arguments(
@@ -1008,13 +1018,17 @@ class ParameterRestructureTransform:
         """Translate one nested surface call into the flat source interface."""
 
         self._require_integrity()
-        snapshot, name, arguments = _freeze_call_snapshot(
+        snapshot, name = _freeze_call_snapshot(
             call,
             "parameter restructure surface call",
         )
         plan = self._plan_for_name(name)
         if plan is None:
             return snapshot
+        arguments = _changed_call_arguments(
+            snapshot,
+            "parameter restructure surface call",
+        )
         return _surface_snapshot_to_canonical(snapshot, arguments, plan)
 
     def canonical_call_to_surface(
@@ -1024,13 +1038,17 @@ class ParameterRestructureTransform:
         """Translate one flat source call into the nested final interface."""
 
         self._require_integrity()
-        snapshot, name, arguments = _freeze_call_snapshot(
+        snapshot, name = _freeze_call_snapshot(
             call,
             "parameter restructure canonical call",
         )
         plan = self._plan_for_name(name)
         if plan is None:
             return snapshot
+        arguments = _changed_call_arguments(
+            snapshot,
+            "parameter restructure canonical call",
+        )
         return _canonical_snapshot_to_surface(snapshot, arguments, plan)
 
     def _trace_for_source(self, trace: ExecutionTrace) -> ExecutionTrace:
@@ -1041,7 +1059,7 @@ class ParameterRestructureTransform:
             saw_canonical = False
             saw_surface = False
             for call in validated.surface_calls:
-                snapshot, name, arguments = _freeze_call_snapshot(
+                snapshot, name = _freeze_call_snapshot(
                     call,
                     "parameter restructure trace surface call",
                 )
@@ -1049,6 +1067,10 @@ class ParameterRestructureTransform:
                 if plan is None:
                     translated_calls.append(snapshot)
                     continue
+                arguments = _changed_call_arguments(
+                    snapshot,
+                    "parameter restructure trace surface call",
+                )
                 if plan.container_name in arguments:
                     if any(key in plan.moved for key in arguments):
                         raise TransformValidationError(
@@ -1160,12 +1182,12 @@ class ParameterRestructureAdapter(SemanticAdapter):
             source_raw = _raw_adapter_variant(source_adapter)
         except Exception:
             raise TransformValidationError("source adapter binding validation failed") from None
-        if (
-            type(source_public) is SchemaVariant
-            and source_public.manifest.get("kind") == "toolshift_interface_variant"
-        ) or (
-            type(source_raw) is SchemaVariant
-            and source_raw.manifest.get("kind") == "toolshift_interface_variant"
+        if _variant_has_interface_manifest(
+            source_public,
+            "source adapter binding validation failed",
+        ) or _variant_has_interface_manifest(
+            source_raw,
+            "source adapter binding validation failed",
         ):
             raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
         if source_public is not source_variant or source_raw is not source_variant:
@@ -1299,7 +1321,10 @@ def apply_parameter_restructure(
         raise TransformValidationError("source adapter binding validation failed") from None
     if type(source_variant) is not SchemaVariant:
         raise TransformValidationError("source adapter binding validation failed")
-    if source_variant.manifest.get("kind") == "toolshift_interface_variant":
+    if _variant_has_interface_manifest(
+        source_variant,
+        "source adapter binding validation failed",
+    ):
         raise TransformValidationError(_COMPOSITION_UNSUPPORTED_MESSAGE)
     transform = build_parameter_restructure_transform(
         source_variant,
