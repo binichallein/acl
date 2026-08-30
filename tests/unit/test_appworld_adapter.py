@@ -6,12 +6,14 @@ import copy
 import os
 import subprocess
 import sys
+import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
+from referencing import Registry
 
 import toolshift.adapters.appworld as appworld_adapter_module
 from toolshift.adapters import AppWorldSemanticAdapter, build_appworld_adapter
@@ -299,20 +301,13 @@ def test_catalog_construction_audits_formats_in_all_nested_schema_nodes(
 def test_catalog_construction_rejects_declared_format_without_registered_checker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delitem(Draft202012Validator.FORMAT_CHECKER.checkers, "email")
+    monkeypatch.delitem(Draft202012Validator.FORMAT_CHECKER.checkers, "duration")
 
     with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$"):
-        AppWorldSemanticAdapter(
-            [
-                _tool(
-                    "synthetic__validate_value",
-                    properties={"value": {"type": "string", "format": "email"}},
-                )
-            ]
-        )
+        AppWorldSemanticAdapter([_tool("synthetic__validate_value")])
 
 
-def test_catalog_construction_copies_only_declared_draft202012_format_checkers() -> None:
+def test_catalog_construction_copies_the_full_supported_draft202012_format_set() -> None:
     adapter = AppWorldSemanticAdapter(
         [
             _tool(
@@ -337,10 +332,242 @@ def test_catalog_construction_copies_only_declared_draft202012_format_checkers()
     assert email_checker.checkers is not regex_checker.checkers
     assert email_checker.checkers is not draft_checkers
     assert regex_checker.checkers is not draft_checkers
-    assert tuple(email_checker.checkers) == ("email",)
-    assert tuple(regex_checker.checkers) == ("regex",)
-    assert email_checker.checkers["email"] is draft_checkers["email"]
-    assert regex_checker.checkers["regex"] is draft_checkers["regex"]
+    expected_formats = (
+        "date",
+        "date-time",
+        "duration",
+        "email",
+        "hostname",
+        "idn-email",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "iri",
+        "iri-reference",
+        "json-pointer",
+        "regex",
+        "relative-json-pointer",
+        "time",
+        "uri",
+        "uri-reference",
+        "uri-template",
+        "uuid",
+    )
+    assert tuple(email_checker.checkers) == expected_formats
+    assert tuple(regex_checker.checkers) == expected_formats
+    assert all(
+        email_checker.checkers[name] is draft_checkers[name]
+        and regex_checker.checkers[name] is draft_checkers[name]
+        for name in expected_formats
+    )
+
+
+def test_catalog_construction_resolves_and_enforces_local_json_pointer_refs() -> None:
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": "#/$defs/timestamp"}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["$defs"] = {
+        "timestamp": {"type": "string", "format": "date-time"}
+    }
+
+    adapter = AppWorldSemanticAdapter([tool])
+
+    assert adapter.surface_to_semantic(
+        {
+            "name": "synthetic__validate_value",
+            "arguments": {"value": "2000-01-01T00:00:00Z"},
+        }
+    )
+    with pytest.raises(ValueError, match=r"^AppWorld surface call is invalid$"):
+        adapter.surface_to_semantic(
+            {
+                "name": "synthetic__validate_value",
+                "arguments": {"value": "PRIVATE_INVALID_DATETIME_CANARY"},
+            }
+        )
+
+
+def test_catalog_construction_audits_ref_targets_hidden_under_unknown_keys() -> None:
+    private_format = "PRIVATE_REFERENCED_FORMAT_CANARY"
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": "#/x-private/target"}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["x-private"] = {
+        "target": {"type": "string", "format": private_format}
+    }
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert private_format not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "#missing-anchor",
+        "relative-schema.json#/$defs/value",
+        "https://example.invalid/private-schema.json#/$defs/value",
+    ],
+    ids=["anchor", "relative", "remote"],
+)
+def test_catalog_construction_rejects_non_pointer_refs_without_retrieval(
+    reference: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retrievals: list[object] = []
+
+    def record_retrieval(*args: object, **kwargs: object) -> None:
+        retrievals.append((args, kwargs))
+        raise AssertionError("retrieval must not run")
+
+    monkeypatch.setattr(urllib.request, "urlopen", record_retrieval)
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": reference}},
+        required=["value"],
+    )
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert reference not in str(raised.value)
+    assert retrievals == []
+
+
+@pytest.mark.parametrize("keyword", ["$dynamicRef", "$recursiveRef"])
+def test_catalog_construction_rejects_dynamic_reference_keywords(
+    keyword: str,
+) -> None:
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {keyword: "#/$defs/value"}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["$defs"] = {"value": {"type": "string"}}
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert keyword not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["#/$defs/missing", "#/$defs/bad~2escape", "#/x-private-list/3"],
+    ids=["missing", "invalid-escape", "array-index-out-of-range"],
+)
+def test_catalog_construction_rejects_bad_local_json_pointers(reference: str) -> None:
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": reference}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["$defs"] = {
+        "present": {"type": "string"},
+        "bad~2escape": {"type": "string"},
+    }
+    parameters["x-private-list"] = [{"type": "string"}]
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$"):
+        AppWorldSemanticAdapter([tool])
+
+
+def test_catalog_construction_rejects_percent_encoded_pointer_fragments() -> None:
+    reference = "#/x%2Fprivate/target"
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": reference}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["x%2Fprivate"] = {"target": {"type": "string"}}
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert reference not in str(raised.value)
+
+
+@pytest.mark.parametrize("identifier_keyword", ["$id", "id"])
+def test_catalog_construction_rejects_nested_resource_identifiers(
+    identifier_keyword: str,
+) -> None:
+    private_identifier = "https://example.invalid/PRIVATE_RESOURCE_CANARY.json"
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={
+            "value": {
+                identifier_keyword: private_identifier,
+                "$defs": {"target": {"type": "string"}},
+                "$ref": "#/$defs/target",
+            }
+        },
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["$defs"] = {"target": {"type": "string"}}
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$") as raised:
+        AppWorldSemanticAdapter([tool])
+
+    assert private_identifier not in str(raised.value)
+
+
+def test_catalog_construction_rejects_cyclic_local_refs() -> None:
+    tool = _tool(
+        "synthetic__validate_value",
+        properties={"value": {"$ref": "#/$defs/cycle"}},
+        required=["value"],
+    )
+    function = tool["function"]
+    assert isinstance(function, dict)
+    parameters = function["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["$defs"] = {"cycle": {"$ref": "#/$defs/cycle"}}
+
+    with pytest.raises(ValueError, match=r"^AppWorld schema is invalid$"):
+        AppWorldSemanticAdapter([tool])
+
+
+def test_catalog_validators_use_independent_closed_registries() -> None:
+    adapter = AppWorldSemanticAdapter(
+        [_tool("alpha__empty"), _tool("beta__empty")]
+    )
+
+    validators = tuple(object.__getattribute__(adapter, "_validators").values())
+    registries = tuple(
+        object.__getattribute__(validator, "_registry") for validator in validators
+    )
+
+    assert all(type(registry) is Registry and len(registry) == 0 for registry in registries)
+    assert registries[0] is not registries[1]
 
 
 def test_importing_appworld_adapter_does_not_import_external_appworld() -> None:

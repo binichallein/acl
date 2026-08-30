@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import TypeVar, cast
 
 from jsonschema import Draft202012Validator, FormatChecker
+from referencing import Registry
 
 from toolshift.adapters.semantic import SemanticAdapter
 from toolshift.types import (
@@ -244,10 +245,55 @@ def _split_native_name(value: object) -> tuple[str, str]:
     return app_name, api_name
 
 
-def _declared_format_entries(
+def _decode_json_pointer_token(value: str) -> str:
+    decoded: list[str] = []
+    position = 0
+    while position < len(value):
+        character = value[position]
+        if character != "~":
+            decoded.append(character)
+            position += 1
+            continue
+        if position + 1 >= len(value) or value[position + 1] not in {"0", "1"}:
+            raise _SchemaSnapshotError
+        decoded.append("~" if value[position + 1] == "0" else "/")
+        position += 2
+    return "".join(decoded)
+
+
+def _resolve_local_json_pointer(root: object, reference: object) -> object:
+    if type(reference) is not str or (
+        reference != "#" and not reference.startswith("#/")
+    ) or "%" in reference:
+        raise _SchemaSnapshotError
+    current = root
+    if reference == "#":
+        return current
+    for encoded_token in reference[2:].split("/"):
+        pointer_segment = _decode_json_pointer_token(encoded_token)
+        if type(current) is dict:
+            if pointer_segment not in current:
+                raise _SchemaSnapshotError
+            current = current[pointer_segment]
+        elif type(current) is list:
+            if (
+                not pointer_segment.isascii()
+                or not pointer_segment.isdecimal()
+                or (len(pointer_segment) > 1 and pointer_segment.startswith("0"))
+            ):
+                raise _SchemaSnapshotError
+            index = int(pointer_segment)
+            if index >= len(current):
+                raise _SchemaSnapshotError
+            current = current[index]
+        else:
+            raise _SchemaSnapshotError
+    return current
+
+
+def _schema_format_entries(
     schema: dict[str, object],
 ) -> tuple[tuple[str, _FormatCheckerEntry], ...]:
-    declared: set[str] = set()
 
     def visit(node: object, active: set[int]) -> None:
         if type(node) is bool:
@@ -266,7 +312,15 @@ def _declared_format_entries(
                     or format_name not in _SUPPORTED_DRAFT202012_FORMATS
                 ):
                     raise _SchemaSnapshotError
-                declared.add(format_name)
+            if "$id" in node or "id" in node:
+                raise _SchemaSnapshotError
+            if "$dynamicRef" in node or "$recursiveRef" in node:
+                raise _SchemaSnapshotError
+            if "$ref" in node:
+                target = _resolve_local_json_pointer(schema, node["$ref"])
+                if type(target) not in (bool, dict):
+                    raise _SchemaSnapshotError
+                visit(target, active)
 
             for keyword in _SINGLE_SUBSCHEMA_KEYS:
                 if keyword in node:
@@ -308,7 +362,7 @@ def _declared_format_entries(
         if type(registry) is not dict:
             raise _SchemaSnapshotError
         entries: list[tuple[str, _FormatCheckerEntry]] = []
-        for format_name in sorted(declared):
+        for format_name in sorted(_SUPPORTED_DRAFT202012_FORMATS):
             entry = registry.get(format_name)
             if (
                 type(entry) is not tuple
@@ -363,7 +417,7 @@ def _closed_schema(
         else:
             schema["additionalProperties"] = False
         Draft202012Validator.check_schema(schema)
-        return schema, _declared_format_entries(schema)
+        return schema, _schema_format_entries(schema)
     except _SchemaSnapshotError:
         raise ValueError(_SCHEMA_ERROR) from None
     except Exception:
@@ -628,6 +682,7 @@ class AppWorldSemanticAdapter(SemanticAdapter):
                 validator = Draft202012Validator(
                     tool.input_schema,
                     format_checker=_new_format_checker(format_entries),
+                    registry=Registry(),
                 )
                 tools.append(tool)
                 validators[name] = validator
