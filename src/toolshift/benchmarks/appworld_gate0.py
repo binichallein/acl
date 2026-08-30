@@ -791,7 +791,7 @@ class _SmokeWorldContexts:
             )
             if cleanup_failed:
                 self._accounting.cleanup_exception_count += 1
-            if body_failed or not cleanup_failed:
+            if body_failed or not cleanup_failed or not entered:
                 self._accounting.execution_exception_count += 1
             raise
 

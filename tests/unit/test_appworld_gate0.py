@@ -1328,6 +1328,37 @@ def test_smoke_cleanup_failure_is_counted_and_payload_free() -> None:
     assert "PRIVATE" not in repr(summary)
 
 
+class _ConstructorAndCleanupFailingContextFactory:
+    @contextmanager
+    def __call__(self, **kwargs: object) -> Iterator[object]:
+        del kwargs
+        from toolshift.benchmarks.appworld_replay import _AppWorldCleanupMarker
+
+        marker = _AppWorldCleanupMarker(
+            "constructor_close_all",
+            "RuntimeError",
+            fatal=False,
+        )
+        raise RuntimeError("PRIVATE_CONSTRUCTOR_CANARY") from marker
+        yield  # pragma: no cover
+
+
+def test_constructor_failure_with_cleanup_marker_counts_both_failures() -> None:
+    import toolshift.benchmarks.appworld_gate0 as gate0_module
+
+    summary = gate0_module.run_appworld_gate0_smoke(
+        task_loader=lambda split: ("PRIVATE_CONSTRUCTOR",),
+        world_context_factory=_ConstructorAndCleanupFailingContextFactory(),
+        pin_checker=lambda: None,
+    )
+
+    assert summary.smoke_passed is False
+    assert summary.execution_exception_count == 1
+    assert summary.cleanup_exception_count == 1
+    assert summary.diagnostic_counts == (("smoke.world_lifecycle_failure", 1),)
+    assert "PRIVATE" not in repr(summary)
+
+
 def test_private_appworld_root_requires_absolute_owned_0700_non_git_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
