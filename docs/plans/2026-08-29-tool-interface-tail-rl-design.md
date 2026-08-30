@@ -13,7 +13,9 @@
 ## 2. 核心假设
 
 - H1：相同 AppWorld 任务在行为等价接口下存在显著且可重复的成功率波动。
-- H2：任务条件化的 paired worst-variant 目标优于等预算的 clean GRPO、uniform domain randomization、global CVaR 和 canonical wrapper。
+- H2a：在相同训练与推理信息、rollout 和计算预算下，任务条件化的 paired worst-variant 目标优于 clean GRPO、uniform domain randomization、global CVaR、transform-group DRO 和 paired mean-GRPO。
+- H2b：相对于只能访问部署时 surface schema/docs、不能访问 clean schema、transform manifest 或 exact inverse 的 generic normalizer，本文方法提高 held-out TC-Worst，同时满足 clean 非劣约束。
+- 对拥有 clean schema 和 exact inverse 的 privileged oracle canonicalizer 不提出超越假设。对确定性双射 L1/L2，它是可消除性上界和实现正确性检查；主要 wrapper-residual 主张只针对等信息 generic baseline，以及后续带协议状态或动作粒度变化的 L3。
 - H3：收益能迁移到 held-out L2/L3 组合及 BFCL-Shift，且 clean success 基本不下降。
 
 ## 3. 技术设计
@@ -70,7 +72,8 @@ TC-Worst = mean_x min_e p_hat(x,e)
 - Base/SFT
 - Clean-GRPO
 - Uniform DR-GRPO
-- Canonical wrapper + GRPO
+- Generic non-privileged schema normalizer + GRPO（只看当前 surface schema/docs）
+- Privileged oracle canonicalizer + GRPO（看 clean schema 和 exact inverse；仅作 L1/双射 L2 ceiling）
 - Global-CVaR-GRPO
 - Transform-group DRO
 - Paired mean-GRPO
@@ -81,7 +84,9 @@ TC-Worst = mean_x min_e p_hat(x,e)
 ## 8. Go/No-Go 条件
 
 - 若两个模型的接口 worst-variant drop 均低于约 5 个百分点，H1 不成立。
-- 若 canonical wrapper 恢复超过 90% 的损失，停止简单 L1/L2 路线并升级到 L3。
+- 若 privileged oracle 未恢复到 clean 水平，优先视为 canonicalizer、prompt 或 contract 实现问题。
+- 若 generic normalizer 恢复超过 90% 的损失，将对应 L1/L2 family 标记为 wrapper-eliminable，保留作 H1/机制控制并升级到 L3；这不单独构成算法失败。
+- 只有当本文方法未超过最强等信息、等预算 generic normalizer、DR 或 CVaR 时，才判定 H2 失败。
 - 若等预算 DR-GRPO 或 global CVaR 与本文方法持平，算法贡献不成立。
 - 若收益只出现在 seen/L1 变换，未见组合泛化主张不成立。
 - 若 clean success 下降超过预注册非劣界，或成本/副作用显著恶化，只能报告 Pareto 而不能声称全面改进。
