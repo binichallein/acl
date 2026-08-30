@@ -25,6 +25,9 @@ types, L1/L2 transforms, and four-layer contracts.
 
 - AppWorld remains an opt-in external runtime; no import of `appworld` at package import time.
 - Only the `train` split may be opened in M3A. No held-out split is loaded or enumerated.
+- JSON Schema documents preserve exact built-in integers under a schema-only canonicalization
+  domain; calls, actions, traces, observations, manifests, and generic JSON serialization keep
+  the existing I-JSON safe-integer boundary.
 - No task ID, instruction, schema, tool name, arguments, observation, trace, state, evaluator
   requirement, protected-derived fingerprint, aggregate runtime result, proxy setting, or
   machine path may be committed. Actual M3A records remain private/encrypted pending written
@@ -69,7 +72,8 @@ Cover:
 - split at the first `__` into two non-empty ASCII identifier segments;
 - unique names and deterministic lexical tool order;
 - root `type: object`, mapping `properties`, exact unique declared `required` members;
-- preserve property schemas, annotations, and `default` exactly;
+- preserve property schemas, annotations, and `default` exactly, including integers outside
+  the I-JSON safe range, without floating-point conversion or normalization;
 - add only missing root `additionalProperties: false`;
 - reject any conflicting `additionalProperties` value;
 - callback-bearing catalog mappings are exhausted into snapshots before validation;

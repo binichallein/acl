@@ -122,14 +122,15 @@ before the `SchemaVariant` is built.
 
 The schema policy is explicit:
 
-1. preserve every AppWorld property schema, `required` member, annotation, and `default`;
+1. preserve every AppWorld property schema, `required` member, annotation, and `default`,
+   including exact built-in integers outside the I-JSON safe range;
 2. require a root object with a properties mapping and a unique list of declared required
    names, preserving its order exactly;
 3. add only `additionalProperties: false` when absent, matching AppWorld construction with
    `raise_on_extra_parameters=True`;
 4. reject a conflicting non-false `additionalProperties` value;
 5. never apply JSON Schema defaults during parsing;
-6. validate calls using Draft 2020-12 plus `FormatChecker` and I-JSON-safe snapshots;
+6. validate calls using Draft 2020-12 plus `FormatChecker` and I-JSON-safe runtime snapshots;
 7. reject any property colliding with Requester control parameters such as `_app_name`,
    `_api_name`, `client`, `raise_on_failure`, `show`, `track`, or `_system_datetime`;
 8. reject root `patternProperties`, which could otherwise re-admit a Requester control name
@@ -140,6 +141,12 @@ silently presented as raw upstream schema. `jsonschema` therefore becomes a Tool
 dependency rather than a test-only dependency. JSON Schema validation remains a conservative
 surface check; execution through AppWorld/Pydantic is the final runtime admission boundary.
 The preserved `required` order is an integrity/canonicalization rule, not JSON Schema meaning.
+Schema documents use a dedicated immutable canonicalization domain because JSON Schema permits
+arbitrary-precision integers in annotations and numeric assertions. Agent calls, semantic
+actions, traces, observations, manifests, and generic ToolShift JSON serialization remain in
+the stricter I-JSON-safe runtime domain. Schema integers are never rounded, converted to
+floating point, clamped, deleted, or copied into a runtime call unless that call independently
+satisfies the runtime boundary.
 
 L2 eligibility is stricter than adapter ingestion. A tool may be restructured only when the
 existing transform's conservative grammar accepts the preserved schema. In particular,
