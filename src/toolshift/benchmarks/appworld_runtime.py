@@ -50,6 +50,8 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _EFFECT_DOMAIN = b"toolshift.appworld.effect.v1\0"
 _TRANSITION_DOMAIN = b"toolshift.appworld.transition.v1\0"
 _INTEGRITY_TOKEN = object()
+_ENTRY_LATCH_TOKEN = object()
+_TUPLE_ITERATOR_TYPE = type(iter(()))
 _READY = "ready"
 _RUNNING = "running"
 _CONSUMED = "consumed"
@@ -297,6 +299,8 @@ class AppWorldEpisodeExecutor:
         "_binding_seals_seal",
         "_callable_seal_entries",
         "_callable_seal_entries_seal",
+        "_entry_latch",
+        "_entry_latch_seal",
         "_evaluate_seal",
         "_evaluator_hasher",
         "_evaluator_hasher_seal",
@@ -306,6 +310,7 @@ class AppWorldEpisodeExecutor:
         "_request_seal",
         "_requester_seal",
         "_save_seal",
+        "_started",
         "_state_hasher",
         "_state_hasher_seal",
         "_world",
@@ -377,6 +382,10 @@ class AppWorldEpisodeExecutor:
         )
         self._callable_seal_entries = callable_seal_entries
         self._callable_seal_entries_seal = callable_seal_entries
+        entry_latch = iter((_ENTRY_LATCH_TOKEN,))
+        self._entry_latch = entry_latch
+        self._entry_latch_seal = entry_latch
+        self._started = False
         self._phase = _READY
         self._integrity_token = _INTEGRITY_TOKEN
         try:
@@ -398,6 +407,13 @@ class AppWorldEpisodeExecutor:
                 self,
                 "_callable_seal_entries",
             )
+            started = object.__getattribute__(self, "_started")
+            phase = object.__getattribute__(self, "_phase")
+            entry_latch = object.__getattribute__(self, "_entry_latch")
+            entry_latch_seal = object.__getattribute__(self, "_entry_latch_seal")
+            if entry_latch is not entry_latch_seal or type(entry_latch) is not _TUPLE_ITERATOR_TYPE:
+                raise _ExecutorIntegrityError
+            entry_latch_length = entry_latch.__length_hint__()
             if (
                 object.__getattribute__(self, "_integrity_token") is not _INTEGRITY_TOKEN
                 or world is not object.__getattribute__(self, "_world_seal")
@@ -437,7 +453,14 @@ class AppWorldEpisodeExecutor:
                 is not object.__getattribute__(self, "_state_hasher_seal").callback
                 or object.__getattribute__(self, "_evaluator_hasher")
                 is not object.__getattribute__(self, "_evaluator_hasher_seal").callback
-                or object.__getattribute__(self, "_phase") not in {_READY, _RUNNING, _CONSUMED}
+                or type(entry_latch_length) is not int
+                or type(started) is not bool
+                or (phase, started, entry_latch_length)
+                not in {
+                    (_READY, False, 1),
+                    (_RUNNING, True, 0),
+                    (_CONSUMED, True, 0),
+                }
             ):
                 raise _ExecutorIntegrityError
             current_callable_seals = (
@@ -669,10 +692,20 @@ class AppWorldEpisodeExecutor:
         try:
             self._require_integrity()
         except _ExecutorIntegrityError:
+            consumed_latch = iter(())
+            object.__setattr__(self, "_entry_latch", consumed_latch)
+            object.__setattr__(self, "_entry_latch_seal", consumed_latch)
+            object.__setattr__(self, "_started", True)
             object.__setattr__(self, "_phase", _CONSUMED)
             raise ValueError(_INTEGRITY_ERROR) from None
         if object.__getattribute__(self, "_phase") != _READY:
             raise ValueError(_EXECUTION_ERROR)
+        entry_latch = object.__getattribute__(self, "_entry_latch")
+        if next(entry_latch, None) is not _ENTRY_LATCH_TOKEN:
+            object.__setattr__(self, "_started", True)
+            object.__setattr__(self, "_phase", _CONSUMED)
+            raise ValueError(_INTEGRITY_ERROR) from None
+        object.__setattr__(self, "_started", True)
         object.__setattr__(self, "_phase", _RUNNING)
         try:
             try:
@@ -684,14 +717,17 @@ class AppWorldEpisodeExecutor:
         finally:
             try:
                 phase_was_running = object.__getattribute__(self, "_phase") == _RUNNING
+                started_was_true = object.__getattribute__(self, "_started") is True
             except BaseException:
                 phase_was_running = False
+                started_was_true = False
+            object.__setattr__(self, "_started", True)
             object.__setattr__(self, "_phase", _CONSUMED)
             try:
                 self._require_integrity()
             except _ExecutorIntegrityError:
                 raise ValueError(_INTEGRITY_ERROR) from None
-            if not phase_was_running:
+            if not phase_was_running or not started_was_true:
                 raise ValueError(_INTEGRITY_ERROR) from None
 
 

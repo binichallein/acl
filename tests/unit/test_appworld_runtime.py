@@ -575,6 +575,30 @@ class _PhaseMutatingSequence(Sequence[Mapping[str, JSONValue]]):
         raise RuntimeError("PRIVATE_SEQUENCE_CALLBACK")
 
 
+class _CountingExecutableSequence(Sequence[Mapping[str, JSONValue]]):
+    def __init__(self) -> None:
+        self.touches = 0
+
+    def __getitem__(self, index: int) -> Mapping[str, JSONValue]:
+        self.touches += 1
+        if index == 0:
+            return _surface_call(77)
+        raise IndexError(index)
+
+    def __len__(self) -> int:
+        self.touches += 1
+        return 1
+
+
+class _LengthHintTrap:
+    def __init__(self) -> None:
+        self.touches = 0
+
+    def __length_hint__(self) -> int:
+        self.touches += 1
+        raise RuntimeError("PRIVATE_LENGTH_HINT")
+
+
 @pytest.mark.parametrize("failure", ["empty", "compile", "save", "evaluate"])
 def test_second_call_after_any_failure_does_not_touch_new_sequence(failure: str) -> None:
     events: list[str] = []
@@ -636,6 +660,121 @@ def test_execute_plan_rejects_reentrancy() -> None:
     with pytest.raises(ValueError, match=f"^{_EXECUTION_ERROR}$"):
         executor.execute_plan([_surface_call(1)])
     assert world.save_calls == 0
+
+
+def test_coordinated_state_forgery_cannot_reenter_before_plan_inspection() -> None:
+    events: list[str] = []
+    world = _World(events, [{"ok": True}, {"ok": True}])
+    adapter = _Adapter(events)
+    executor = _executor(world, adapter, events)
+    inner_plan = _CountingExecutableSequence()
+    inner_completed = False
+    inner_error: ValueError | None = None
+
+    def forge_state_and_reenter() -> None:
+        nonlocal inner_completed, inner_error
+        world.requester.hook = None
+        object.__setattr__(executor, "_started", False)
+        object.__setattr__(executor, "_phase", "ready")
+        try:
+            executor.execute_plan(inner_plan)
+        except ValueError as error:
+            inner_error = error
+        else:
+            inner_completed = True
+
+    world.requester.hook = forge_state_and_reenter
+
+    with pytest.raises(ValueError, match=f"^{_INTEGRITY_ERROR}$"):
+        executor.execute_plan([_surface_call(1)])
+
+    assert inner_completed is False
+    assert inner_error is not None
+    assert str(inner_error) == _INTEGRITY_ERROR
+    assert inner_plan.touches == 0
+    assert len(world.requester.calls) == 1
+    assert world.save_calls == 0
+    assert world.evaluate_calls == []
+
+
+@pytest.mark.parametrize(
+    ("started", "phase"),
+    [(True, "ready"), (1, "ready"), (False, "running")],
+)
+def test_started_phase_pair_rejects_type_spoofs_and_single_slot_changes(
+    started: object,
+    phase: str,
+) -> None:
+    events: list[str] = []
+    executor = _executor(_World(events, [{"ok": True}]), _Adapter(events), events)
+    object.__setattr__(executor, "_started", started)
+    object.__setattr__(executor, "_phase", phase)
+
+    with pytest.raises(ValueError, match=f"^{_INTEGRITY_ERROR}$"):
+        executor.execute_plan([_surface_call(1)])
+
+    second_plan = _ExplodingSequence()
+    with pytest.raises(ValueError, match=f"^{_EXECUTION_ERROR}$"):
+        executor.execute_plan(second_plan)
+    assert second_plan.touches == 0
+
+
+@pytest.mark.parametrize("slot", ["_entry_latch", "_entry_latch_seal"])
+def test_entry_latch_single_slot_identity_tampering_is_consumed(slot: str) -> None:
+    events: list[str] = []
+    executor = _executor(_World(events, [{"ok": True}]), _Adapter(events), events)
+    object.__setattr__(executor, slot, iter((object(),)))
+
+    with pytest.raises(ValueError, match=f"^{_INTEGRITY_ERROR}$"):
+        executor.execute_plan([_surface_call(1)])
+
+    second_plan = _ExplodingSequence()
+    with pytest.raises(ValueError, match=f"^{_EXECUTION_ERROR}$"):
+        executor.execute_plan(second_plan)
+    assert second_plan.touches == 0
+
+
+def test_entry_latch_rejects_a_type_spoof_without_invoking_it() -> None:
+    events: list[str] = []
+    executor = _executor(_World(events, [{"ok": True}]), _Adapter(events), events)
+    trap = _LengthHintTrap()
+    object.__setattr__(executor, "_entry_latch", trap)
+
+    with pytest.raises(ValueError, match=f"^{_INTEGRITY_ERROR}$") as raised:
+        executor.execute_plan([_surface_call(1)])
+
+    assert "PRIVATE_LENGTH_HINT" not in str(raised.value)
+    assert trap.touches == 0
+
+
+def test_preconsumed_entry_latch_rejects_before_plan_inspection() -> None:
+    events: list[str] = []
+    executor = _executor(_World(events, [{"ok": True}]), _Adapter(events), events)
+    entry_latch = object.__getattribute__(executor, "_entry_latch")
+    next(entry_latch)
+    plan = _ExplodingSequence()
+
+    with pytest.raises(ValueError, match=f"^{_INTEGRITY_ERROR}$"):
+        executor.execute_plan(plan)
+
+    assert plan.touches == 0
+
+
+def test_started_slot_mutation_during_request_has_integrity_priority() -> None:
+    events: list[str] = []
+    world = _World(events, [{"ok": True}])
+    executor = _executor(world, _Adapter(events), events)
+
+    def clear_started() -> None:
+        object.__setattr__(executor, "_started", False)
+
+    world.requester.hook = clear_started
+
+    with pytest.raises(ValueError, match=f"^{_INTEGRITY_ERROR}$"):
+        executor.execute_plan([_surface_call(1)])
+
+    assert world.save_calls == 0
+    assert world.evaluate_calls == []
 
 
 @pytest.mark.parametrize("action_count", [0, 2])
